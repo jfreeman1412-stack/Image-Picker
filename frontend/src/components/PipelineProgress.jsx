@@ -14,6 +14,14 @@ const STAGE_LABELS = {
   error:       'Pipeline error',
 };
 
+function fmtDuration(secs) {
+  if (secs == null) return null;
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+
 export default function PipelineProgress({ session, compact = false }) {
   if (!session || session.status !== 'running') return null;
 
@@ -23,6 +31,8 @@ export default function PipelineProgress({ session, compact = false }) {
   const label = STAGE_LABELS[stage] || stage;
   const determinate = total > 0;
   const pct = determinate ? Math.round((current / total) * 100) : 0;
+  const elapsed = fmtDuration(session.progress_elapsed_seconds);
+  const eta = fmtDuration(session.progress_stage_eta_seconds);
 
   return (
     <div className={`pipeline-progress ${compact ? 'compact' : ''}`}>
@@ -37,6 +47,14 @@ export default function PipelineProgress({ session, compact = false }) {
           ? <div className="progress-fill" style={{ width: `${pct}%` }} />
           : <div className="progress-fill indeterminate" />}
       </div>
+      {(elapsed || eta) && (
+        <div className="pipeline-progress-meta muted">
+          {elapsed && <span>elapsed {elapsed}</span>}
+          {eta
+            ? <span> · ~{eta} left in this step</span>
+            : determinate && <span> · estimating…</span>}
+        </div>
+      )}
     </div>
   );
 }

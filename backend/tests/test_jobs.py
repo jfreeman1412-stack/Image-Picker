@@ -64,7 +64,7 @@ def test_create_returns_immediately_with_total(client, tmp_path):
     root = _make_job_tree(tmp_path, ["TeamA", "TeamB", "TeamC"])
     r = client.post("/api/jobs", json={
         "name": "J", "root_path": str(root),
-        "has_lines": False, "image_subfolder_name": None,
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
     })
     assert r.status_code == 200
     body = r.json()
@@ -76,7 +76,7 @@ def test_ingest_completes_with_full_progress(client, tmp_path):
     root = _make_job_tree(tmp_path, ["TeamA", "TeamB"])
     jid = client.post("/api/jobs", json={
         "name": "J", "root_path": str(root),
-        "has_lines": False, "image_subfolder_name": None,
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
     }).json()["job_id"]
 
     # TestClient ran the background task already.
@@ -102,7 +102,7 @@ def test_ingest_records_skipped_teams_when_subfolder_missing(client, tmp_path):
 
     jid = client.post("/api/jobs", json={
         "name": "J", "root_path": str(root),
-        "has_lines": False, "image_subfolder_name": "JPG",
+        "has_lines": False, "image_subfolder_name": "JPG", "auto_run": False,
     }).json()["job_id"]
 
     s = client.get(f"/api/jobs/{jid}/ingest-status").json()
@@ -120,6 +120,42 @@ def test_ingest_status_404_for_missing_job(client):
 def test_create_400_for_missing_root(client):
     r = client.post("/api/jobs", json={
         "name": "J", "root_path": r"Z:\does\not\exist",
-        "has_lines": False, "image_subfolder_name": None,
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
     })
     assert r.status_code == 400
+
+
+def test_auto_run_chains_pipeline_per_session(client, tmp_path, monkeypatch):
+    """auto_run=True (the default) runs the pipeline for every ingested team
+    once import finishes. We stub run_pipeline to record calls — exercising
+    the wiring without loading InsightFace."""
+    called = []
+    monkeypatch.setattr(
+        jobs_module, "run_pipeline",
+        lambda bg_db, sid: called.append(sid),
+    )
+    root = _make_job_tree(tmp_path, ["TeamA", "TeamB"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": True,
+    }).json()["job_id"]
+
+    # TestClient already ran the ingest + chained pipeline background task.
+    detail = client.get(f"/api/jobs/{jid}").json()
+    session_ids = sorted(s["id"] for s in detail["sessions"])
+    assert sorted(called) == session_ids   # pipeline invoked once per team
+    assert client.get(f"/api/jobs/{jid}/ingest-status").json()["status"] == "done"
+
+
+def test_auto_run_false_does_not_chain_pipeline(client, tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        jobs_module, "run_pipeline",
+        lambda bg_db, sid: called.append(sid),
+    )
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    })
+    assert called == []

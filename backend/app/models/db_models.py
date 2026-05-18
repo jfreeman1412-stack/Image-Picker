@@ -25,6 +25,14 @@ class Job(Base):
     ingest_total = Column(Integer, default=0)               # total teams to ingest
     ingest_current_team = Column(String, nullable=True)     # team currently being processed
     ingest_error = Column(String, nullable=True)
+    # Export progress (async, polled by the export modal).
+    export_status = Column(String, default="idle")          # idle | exporting | done | error
+    export_progress = Column(Integer, default=0)            # files copied so far
+    export_total = Column(Integer, default=0)               # files to copy
+    export_current_team = Column(String, nullable=True)
+    export_started_at = Column(DateTime, nullable=True)     # for ETA
+    export_error = Column(String, nullable=True)
+    export_result = Column(String, nullable=True)           # JSON: final stats
 
     sessions = relationship("Session", back_populates="job", cascade="all, delete-orphan")
 
@@ -46,6 +54,8 @@ class Session(Base):
     progress_stage = Column(String, nullable=True)   # "detecting" | "clustering" | "classifying" | "sorting" | None
     progress_current = Column(Integer, default=0)
     progress_total = Column(Integer, default=0)      # 0 → indeterminate (just show stage name)
+    progress_started_at = Column(DateTime, nullable=True)        # whole-pipeline start (for elapsed)
+    progress_stage_started_at = Column(DateTime, nullable=True)  # current-stage start (for ETA)
 
     job = relationship("Job", back_populates="sessions")
     images = relationship("Image", back_populates="session", cascade="all, delete-orphan")

@@ -27,6 +27,7 @@ export default function JobWizard() {
   const [error, setError] = useState(null);
   const [creatingJobId, setCreatingJobId] = useState(null);
   const [ingest, setIngest] = useState(null); // {status,progress,total,current_team,error,skipped_teams}
+  const [autoRun, setAutoRun] = useState(true); // run the pipeline once import finishes
 
   const reset = () => setError(null);
 
@@ -136,6 +137,7 @@ export default function JobWizard() {
           root_path: rootPath,
           has_lines: hasLines === true,
           image_subfolder_name: imageSubfolder,
+          auto_run: autoRun,
         }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -290,6 +292,17 @@ export default function JobWizard() {
                 <li>Teams: <b>{teamFolders.length}</b></li>
                 <li>Images found in: {imageSubfolder ? <code>{imageSubfolder}/</code> : 'team folder root'}</li>
               </ul>
+              <label className="auto-run-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoRun}
+                  onChange={(e) => setAutoRun(e.target.checked)}
+                />
+                Start processing automatically when import finishes
+                <span className="muted">
+                  {' '}— uncheck to review the detected structure first
+                </span>
+              </label>
               <div className="actions">
                 <button className="ghost" onClick={() => setStep(3)}>← Back</button>
                 <button disabled={busy} onClick={create}>

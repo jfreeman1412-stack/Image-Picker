@@ -881,6 +881,19 @@ button.primary-cta:hover:not(:disabled) {
   font-size: 13px;
   gap: 12px;
 }
+.pipeline-progress-meta {
+  font-size: 12px;
+  margin-top: 4px;
+}
+.auto-run-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 4px 0 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.auto-run-toggle input { flex: none; }
 .pipeline-progress .stage-label {
   font-weight: 600;
   color: var(--text);

@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 def _set_progress(db: DbSession, session: Session, stage: str, current: int, total: int) -> None:
     """Stamp progress on the session row. Committed so a separate read DB
-    session in the API path sees the update mid-pipeline."""
+    session in the API path sees the update mid-pipeline. Resets the
+    stage-start clock whenever the stage label changes (used for per-stage
+    ETA)."""
+    if session.progress_stage != stage:
+        session.progress_stage_started_at = datetime.utcnow()
     session.progress_stage = stage
     session.progress_current = current
     session.progress_total = total
@@ -49,6 +53,8 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
         raise ValueError(f"Session {session_id} not found")
 
     session.status = "running"
+    session.progress_started_at = datetime.utcnow()
+    session.progress_stage_started_at = None  # _set_progress will stamp it
     _set_progress(db, session, "starting", 0, 0)
 
     try:
@@ -215,6 +221,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
         session.progress_stage = None
         session.progress_current = 0
         session.progress_total = 0
+        session.progress_stage_started_at = None
         db.commit()
 
     except Exception:

@@ -176,7 +176,10 @@ def test_export_skips_archived_sessions(ctx, tmp_path):
 
     r = client.post(f"/api/jobs/{jid}/export", json={"mode": "copy", "overwrite": True})
     assert r.status_code == 200
-    skipped = {x["name"]: x["reason"] for x in r.json()["sessions_skipped"]}
+    # Export is async now — skipped sessions land in the polled status result
+    # (TestClient already ran the background task).
+    res = client.get(f"/api/jobs/{jid}/export-status").json()["result"]
+    skipped = {x["name"]: x["reason"] for x in res["sessions_skipped"]}
     assert skipped.get("Arch") == "archived"
 
 

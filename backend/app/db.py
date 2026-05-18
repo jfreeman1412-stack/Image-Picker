@@ -49,6 +49,8 @@ _PHASE2_COLUMNS = {
         ("progress_total", "INTEGER DEFAULT 0"),
         ("archived", "INTEGER DEFAULT 0"),
         ("archived_at", "DATETIME"),
+        ("progress_started_at", "DATETIME"),
+        ("progress_stage_started_at", "DATETIME"),
     ],
     # Soft-archive flag for jobs that should drop off the default home view.
     # Phase 4.5: async ingest status/progress fields.
@@ -60,6 +62,13 @@ _PHASE2_COLUMNS = {
         ("ingest_total", "INTEGER DEFAULT 0"),
         ("ingest_current_team", "VARCHAR"),
         ("ingest_error", "VARCHAR"),
+        ("export_status", "VARCHAR DEFAULT 'idle'"),
+        ("export_progress", "INTEGER DEFAULT 0"),
+        ("export_total", "INTEGER DEFAULT 0"),
+        ("export_current_team", "VARCHAR"),
+        ("export_started_at", "DATETIME"),
+        ("export_error", "VARCHAR"),
+        ("export_result", "VARCHAR"),
     ],
 }
 

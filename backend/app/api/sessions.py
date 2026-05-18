@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db, SessionLocal
 from app.models.db_models import Cluster, ImageRole, Session
+from app.services.eta import eta_seconds
 from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
 
@@ -110,6 +111,30 @@ def list_sessions(db: DbSession = Depends(get_db), legacy_only: bool = False):
     ]
 
 
+def pipeline_progress_fields(s: Session) -> dict:
+    """Progress block shared by session detail + job detail. elapsed is
+    whole-pipeline; eta is for the *current* stage (stages run at very
+    different speeds, so a per-stage estimate is the honest one)."""
+    now = datetime.utcnow()
+    elapsed = (
+        int((now - s.progress_started_at).total_seconds())
+        if s.progress_started_at else 0
+    )
+    stage_eta = None
+    if s.progress_stage_started_at and (s.progress_total or 0) > 0:
+        stage_elapsed = (now - s.progress_stage_started_at).total_seconds()
+        stage_eta = eta_seconds(
+            s.progress_current or 0, s.progress_total or 0, stage_elapsed
+        )
+    return {
+        "progress_stage": s.progress_stage,
+        "progress_current": s.progress_current or 0,
+        "progress_total": s.progress_total or 0,
+        "progress_elapsed_seconds": elapsed,
+        "progress_stage_eta_seconds": stage_eta,
+    }
+
+
 @router.get("/{session_id}")
 def get_session(session_id: int, db: DbSession = Depends(get_db)):
     s = db.query(Session).get(session_id)
@@ -129,9 +154,7 @@ def get_session(session_id: int, db: DbSession = Depends(get_db)):
         "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
         "archived": bool(s.archived),
         "archived_at": s.archived_at.isoformat() if s.archived_at else None,
-        "progress_stage": s.progress_stage,
-        "progress_current": s.progress_current or 0,
-        "progress_total": s.progress_total or 0,
+        **pipeline_progress_fields(s),
     }
 
 
