@@ -6,12 +6,13 @@ answered the walkthrough questions.
 
 POST   /api/jobs/peek                  inspect folder contents
 POST   /api/jobs                       create a job + sessions from confirmed structure
-GET    /api/jobs                       list jobs (default: non-archived; ?archived=true for archived)
-GET    /api/jobs/{id}                  job detail + session summaries
-POST   /api/jobs/{id}/run-all          kick off pipeline for every session in this job
-POST   /api/jobs/{id}/export           export sorted files (see Section 4)
-POST   /api/jobs/{id}/archived         soft-hide/restore from default listing
-DELETE /api/jobs/{id}                  hard-delete job + cascade sessions
+GET    /api/jobs                       list jobs (?include_archived=true to show archived)
+GET    /api/jobs/{id}                  job detail (?include_archived=true for archived sessions)
+POST   /api/jobs/{id}/run-all          kick off pipeline for non-archived sessions
+POST   /api/jobs/{id}/export           export sorted files (archived sessions skipped)
+POST   /api/jobs/{id}/archive          soft-hide a job
+POST   /api/jobs/{id}/unarchive        restore an archived job
+DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 """
 import json
 import logging
@@ -23,12 +24,14 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
-from app.db import SessionLocal, get_db
+from app.db import DATA_DIR, SessionLocal, get_db
 from app.models.db_models import Cluster, ImageRole, Image, Job, Session
 from app.services.face_pipeline import run_pipeline
 from app.services.ingest import RAW_EXTS, SUPPORTED_EXTS, ingest_folder
 
 logger = logging.getLogger(__name__)
+
+THUMB_DIR = DATA_DIR / "thumbs"
 
 router = APIRouter()
 
@@ -249,22 +252,22 @@ def ingest_status(job_id: int, db: DbSession = Depends(get_db)):
 
 
 @router.get("")
-def list_jobs(db: DbSession = Depends(get_db), archived: bool = False):
-    """List jobs. By default returns non-archived; pass `?archived=true` to
-    get the archived ones instead."""
+def list_jobs(db: DbSession = Depends(get_db), include_archived: bool = False):
+    """List jobs. Archived jobs are excluded unless ?include_archived=true."""
     q = db.query(Job)
-    if archived:
-        q = q.filter(Job.archived == 1)
-    else:
+    if not include_archived:
         q = q.filter((Job.archived == 0) | (Job.archived.is_(None)))
     jobs = q.order_by(Job.created_at.desc()).all()
     out = []
     for j in jobs:
+        # Stats reflect non-archived sessions only — an archived team
+        # shouldn't inflate counts or block the "ready" banner.
+        active = [s for s in j.sessions if not s.archived]
         image_count = 0
         reviewed_count = 0
         needs_review_count = 0
         any_unprocessed = False
-        for s in j.sessions:
+        for s in active:
             image_count += len(s.images)
             if s.reviewed:
                 reviewed_count += 1
@@ -276,7 +279,7 @@ def list_jobs(db: DbSession = Depends(get_db), archived: bool = False):
             "name": j.name,
             "root_path": j.root_path,
             "created_at": j.created_at.isoformat() if j.created_at else None,
-            "session_count": len(j.sessions),
+            "session_count": len(active),
             "image_count": image_count,
             "reviewed_count": reviewed_count,
             "needs_review_count": needs_review_count,
@@ -287,42 +290,46 @@ def list_jobs(db: DbSession = Depends(get_db), archived: bool = False):
     return out
 
 
-class SetArchivedRequest(BaseModel):
-    archived: bool
-
-
-@router.post("/{job_id}/archived")
-def set_archived(
-    job_id: int, payload: SetArchivedRequest,
-    db: DbSession = Depends(get_db),
-):
-    """Toggle the soft-archive flag on a job. Doesn't delete anything; just
-    hides it from the default home listing."""
+@router.post("/{job_id}/archive")
+def archive_job(job_id: int, db: DbSession = Depends(get_db)):
+    """Soft-hide a job from the default home listing. Idempotent."""
     from datetime import datetime as _dt
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if payload.archived:
+    if not job.archived:
         job.archived = 1
         job.archived_at = _dt.utcnow()
-    else:
-        job.archived = 0
-        job.archived_at = None
+        db.commit()
+    return {"status": "archived", "archived": True,
+            "archived_at": job.archived_at.isoformat() if job.archived_at else None}
+
+
+@router.post("/{job_id}/unarchive")
+def unarchive_job(job_id: int, db: DbSession = Depends(get_db)):
+    """Restore an archived job. Idempotent."""
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    job.archived = 0
+    job.archived_at = None
     db.commit()
-    return {
-        "archived": bool(job.archived),
-        "archived_at": job.archived_at.isoformat() if job.archived_at else None,
-    }
+    return {"status": "unarchived", "archived": False}
 
 
 @router.get("/{job_id}")
-def get_job(job_id: int, db: DbSession = Depends(get_db)):
+def get_job(
+    job_id: int, db: DbSession = Depends(get_db),
+    include_archived: bool = False,
+):
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
 
     sessions_out = []
     for s in sorted(job.sessions, key=lambda x: x.id):
+        if s.archived and not include_archived:
+            continue
         needs_review_count = sum(1 for c in s.clusters if c.needs_review)
         sessions_out.append({
             "id": s.id,
@@ -333,6 +340,8 @@ def get_job(job_id: int, db: DbSession = Depends(get_db)):
             "needs_review_count": needs_review_count,
             "reviewed": bool(s.reviewed),
             "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
+            "archived": bool(s.archived),
+            "archived_at": s.archived_at.isoformat() if s.archived_at else None,
             "progress_stage": s.progress_stage,
             "progress_current": s.progress_current or 0,
             "progress_total": s.progress_total or 0,
@@ -351,12 +360,37 @@ def get_job(job_id: int, db: DbSession = Depends(get_db)):
     }
 
 
+def _delete_thumbs(image_ids: list[int]) -> None:
+    """Best-effort removal of cached thumbnail files. Missing files are fine."""
+    for iid in image_ids:
+        try:
+            (THUMB_DIR / f"{iid}.jpg").unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove thumb for image %s: %s", iid, exc)
+
+
+def _purge_session_rows(db: DbSession, session) -> None:
+    """ImageRole has no ORM relationship, so cascade won't reach it. Delete
+    those rows + cached thumbs explicitly before the ORM cascade handles
+    images/faces/clusters."""
+    image_ids = [i.id for i in session.images]
+    if image_ids:
+        db.query(ImageRole).filter(
+            ImageRole.image_id.in_(image_ids)
+        ).delete(synchronize_session=False)
+    _delete_thumbs(image_ids)
+
+
 @router.delete("/{job_id}")
 def delete_job(job_id: int, db: DbSession = Depends(get_db)):
+    """Permanently delete a job: cascades to sessions, images, faces,
+    clusters, image_roles, and cached thumbnails."""
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    db.delete(job)
+    for s in list(job.sessions):
+        _purge_session_rows(db, s)
+    db.delete(job)  # ORM cascade: sessions → images/faces, clusters
     db.commit()
     return {"status": "deleted"}
 
@@ -370,7 +404,8 @@ def run_all(job_id: int, background: BackgroundTasks, db: DbSession = Depends(ge
     if job is None:
         raise HTTPException(404, "Job not found")
 
-    session_ids = [s.id for s in job.sessions]
+    # Archived sessions are skipped entirely — not run, not counted.
+    session_ids = [s.id for s in job.sessions if not s.archived]
 
     def _run_all():
         for sid in session_ids:
@@ -383,7 +418,7 @@ def run_all(job_id: int, background: BackgroundTasks, db: DbSession = Depends(ge
     background.add_task(_run_all)
 
     for s in job.sessions:
-        if s.status not in ("running",):
+        if not s.archived and s.status not in ("running",):
             s.status = "running"
     db.commit()
 
@@ -453,6 +488,11 @@ def export_job(
     team_count = 0
 
     for session in job.sessions:
+        if session.archived:
+            sessions_skipped.append({
+                "name": session.name, "reason": "archived",
+            })
+            continue
         if session.status != "done":
             sessions_skipped.append({
                 "name": session.name, "reason": "pipeline_not_complete",

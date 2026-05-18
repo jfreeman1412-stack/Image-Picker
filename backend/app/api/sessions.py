@@ -4,10 +4,15 @@ POST   /api/sessions                       create a session from a folder path
 POST   /api/sessions/{id}/run              kick off pipeline (background task)
 GET    /api/sessions                       list sessions
 GET    /api/sessions/{id}                  session detail + status
-POST   /api/sessions/{id}/reviewed         toggle the reviewed flag
+POST   /api/sessions/{id}/reviewed         toggle the reviewed flag (gated; force=true to override)
+GET    /api/sessions/{id}/review-readiness  per-cluster team/pano completeness
 GET    /api/sessions/{id}/next-unreviewed  next unreviewed team in same job
 GET    /api/sessions/{id}/siblings         previous/next teams in same job
+POST   /api/sessions/{id}/archive          soft-hide a team
+POST   /api/sessions/{id}/unarchive        restore an archived team
+DELETE /api/sessions/{id}                  hard-delete team + cascade (incl. thumbs)
 """
+import logging
 from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -15,11 +20,40 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db, SessionLocal
-from app.models.db_models import Session
+from app.models.db_models import Cluster, ImageRole, Session
 from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+def _compute_review_readiness(db: DbSession, session: Session) -> dict:
+    """Per cluster: a coach needs a 'team' role; a player needs both 'team'
+    and 'panoramic'. Returns {ready, incomplete_clusters:[{cluster_id,label,
+    missing:[...]}]}."""
+    incomplete: list[dict] = []
+    for c in session.clusters:
+        roles = {
+            r.role for r in db.query(ImageRole).filter_by(cluster_id=c.id).all()
+        }
+        if c.is_coach_for_sort():
+            required = ["team"]
+        else:
+            required = ["team", "pano"]
+        missing = []
+        if "team" not in roles:
+            missing.append("team")
+        if "pano" in required and "panoramic" not in roles:
+            missing.append("pano")
+        if missing:
+            incomplete.append({
+                "cluster_id": c.id,
+                "label": c.display_label(),
+                "missing": missing,
+            })
+    return {"ready": not incomplete, "incomplete_clusters": incomplete}
 
 
 class CreateSessionRequest(BaseModel):
@@ -93,6 +127,8 @@ def get_session(session_id: int, db: DbSession = Depends(get_db)):
         "job_name": s.job.name if s.job is not None else None,
         "reviewed": bool(s.reviewed),
         "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
+        "archived": bool(s.archived),
+        "archived_at": s.archived_at.isoformat() if s.archived_at else None,
         "progress_stage": s.progress_stage,
         "progress_current": s.progress_current or 0,
         "progress_total": s.progress_total or 0,
@@ -104,6 +140,17 @@ def get_session(session_id: int, db: DbSession = Depends(get_db)):
 
 class SetReviewedRequest(BaseModel):
     reviewed: bool
+    force: bool = False
+
+
+@router.get("/{session_id}/review-readiness")
+def review_readiness(session_id: int, db: DbSession = Depends(get_db)):
+    """Whether every cluster has its required role(s): coach → team;
+    player → team + panoramic. ready=true iff nothing is incomplete."""
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    return _compute_review_readiness(db, s)
 
 
 @router.post("/{session_id}/reviewed")
@@ -111,12 +158,30 @@ def set_reviewed(
     session_id: int, payload: SetReviewedRequest,
     db: DbSession = Depends(get_db),
 ):
-    """Flip the reviewed flag. Setting True also stamps reviewed_at; setting
-    False clears it."""
+    """Flip the reviewed flag. Marking reviewed=True is gated by
+    review-readiness unless force=True (logged for audit). Unmarking is
+    never gated."""
     s = db.query(Session).get(session_id)
     if s is None:
         raise HTTPException(404, "Session not found")
+
     if payload.reviewed:
+        readiness = _compute_review_readiness(db, s)
+        if not readiness["ready"] and not payload.force:
+            raise HTTPException(400, detail={
+                "error": "session_not_ready",
+                "incomplete_clusters": readiness["incomplete_clusters"],
+            })
+        if not readiness["ready"] and payload.force:
+            summary = "; ".join(
+                f"'{c['label']}' (missing {', '.join(c['missing'])})"
+                for c in readiness["incomplete_clusters"]
+            )
+            logger.warning(
+                "[review] Session %s marked reviewed with force=true. "
+                "%d incomplete cluster(s): %s",
+                session_id, len(readiness["incomplete_clusters"]), summary,
+            )
         s.reviewed = 1
         s.reviewed_at = datetime.utcnow()
     else:
@@ -157,11 +222,14 @@ def next_unreviewed(session_id: int, db: DbSession = Depends(get_db)):
     if not siblings_list:
         return {"session_id": None}
 
-    forward = [t for t in siblings_list if t.id > session_id and not t.reviewed]
+    # Archived sessions are out of the review rotation.
+    forward = [t for t in siblings_list
+               if t.id > session_id and not t.reviewed and not t.archived]
     if forward:
         return {"session_id": forward[0].id}
 
-    wrapped = [t for t in siblings_list if t.id < session_id and not t.reviewed]
+    wrapped = [t for t in siblings_list
+               if t.id < session_id and not t.reviewed and not t.archived]
     if wrapped:
         return {"session_id": wrapped[0].id}
 
@@ -185,3 +253,52 @@ def siblings(session_id: int, db: DbSession = Depends(get_db)):
     prev_id = ids[idx - 1] if idx > 0 else None
     next_id = ids[idx + 1] if idx + 1 < len(ids) else None
     return {"previous_session_id": prev_id, "next_session_id": next_id}
+
+
+# ── Archive / delete ──────────────────────────────────────────────────────────
+
+
+@router.post("/{session_id}/archive")
+def archive_session(session_id: int, db: DbSession = Depends(get_db)):
+    """Soft-hide a team from the job detail grid. Idempotent."""
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    if not s.archived:
+        s.archived = 1
+        s.archived_at = datetime.utcnow()
+        db.commit()
+    return {"status": "archived", "archived": True,
+            "archived_at": s.archived_at.isoformat() if s.archived_at else None}
+
+
+@router.post("/{session_id}/unarchive")
+def unarchive_session(session_id: int, db: DbSession = Depends(get_db)):
+    """Restore an archived team. Idempotent."""
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    s.archived = 0
+    s.archived_at = None
+    db.commit()
+    return {"status": "unarchived", "archived": False}
+
+
+@router.delete("/{session_id}")
+def delete_session(session_id: int, db: DbSession = Depends(get_db)):
+    """Permanently delete one team: cascades to its images, faces, clusters,
+    image_roles, and cached thumbnails. Parent job is left intact."""
+    from app.api.jobs import _delete_thumbs  # local import avoids import cycle
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+
+    image_ids = [i.id for i in s.images]
+    if image_ids:
+        db.query(ImageRole).filter(
+            ImageRole.image_id.in_(image_ids)
+        ).delete(synchronize_session=False)
+    _delete_thumbs(image_ids)
+    db.delete(s)  # ORM cascade: images → faces, clusters
+    db.commit()
+    return {"status": "deleted"}

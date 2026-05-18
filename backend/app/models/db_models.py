@@ -41,6 +41,8 @@ class Session(Base):
     pipeline_finished_at = Column(DateTime, nullable=True)
     reviewed = Column(Integer, default=0)       # 0 | 1; user-facing "I'm done with this team"
     reviewed_at = Column(DateTime, nullable=True)
+    archived = Column(Integer, default=0)            # 0 | 1; soft-hide from job detail
+    archived_at = Column(DateTime, nullable=True)
     progress_stage = Column(String, nullable=True)   # "detecting" | "clustering" | "classifying" | "sorting" | None
     progress_current = Column(Integer, default=0)
     progress_total = Column(Integer, default=0)      # 0 → indeterminate (just show stage name)

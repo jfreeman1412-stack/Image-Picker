@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import CardMenu from '../components/CardMenu.jsx';
+import Toast from '../components/Toast.jsx';
+import ConfirmModal from '../components/ConfirmModal.jsx';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -13,15 +16,43 @@ function formatDate(iso) {
 }
 
 export default function JobList() {
+  const nav = useNavigate();
   const [jobs, setJobs] = useState(null);
-  const [view, setView] = useState('active'); // 'active' | 'archived'
+  const [showArchived, setShowArchived] = useState(false);
+  const [toast, setToast] = useState(null);     // {message, actionLabel, onAction}
+  const [confirm, setConfirm] = useState(null); // {job}
 
   const load = async () => {
-    const q = view === 'archived' ? '?archived=true' : '';
+    const q = showArchived ? '?include_archived=true' : '';
     const j = await fetch(`/api/jobs${q}`).then(r => r.json());
     setJobs(j);
   };
-  useEffect(() => { setJobs(null); load(); }, [view]);
+  useEffect(() => { setJobs(null); load(); }, [showArchived]);
+
+  const archiveJob = async (job) => {
+    await fetch(`/api/jobs/${job.id}/archive`, { method: 'POST' });
+    await load();
+    setToast({
+      message: `Job "${job.name}" archived.`,
+      actionLabel: 'Undo',
+      onAction: async () => {
+        await fetch(`/api/jobs/${job.id}/unarchive`, { method: 'POST' });
+        load();
+      },
+    });
+  };
+
+  const unarchiveJob = async (job) => {
+    await fetch(`/api/jobs/${job.id}/unarchive`, { method: 'POST' });
+    load();
+  };
+
+  const deleteJob = async (job) => {
+    await fetch(`/api/jobs/${job.id}`, { method: 'DELETE' });
+    setConfirm(null);
+    await load();
+    setToast({ message: `Job "${job.name}" deleted.` });
+  };
 
   return (
     <div className="page">
@@ -36,33 +67,24 @@ export default function JobList() {
         </div>
       </header>
 
-      <div className="view-tabs">
-        <button
-          className={`tab ${view === 'active' ? 'active' : ''}`}
-          onClick={() => setView('active')}
-        >Active</button>
-        <button
-          className={`tab ${view === 'archived' ? 'active' : ''}`}
-          onClick={() => setView('archived')}
-        >Archived</button>
-      </div>
+      <label className="show-archived-toggle">
+        <input
+          type="checkbox"
+          checked={showArchived}
+          onChange={(e) => setShowArchived(e.target.checked)}
+        />
+        Show archived
+      </label>
 
       {jobs === null && <p className="muted">Loading…</p>}
 
-      {jobs && jobs.length === 0 && view === 'active' && (
+      {jobs && jobs.length === 0 && (
         <section className="empty-state">
-          <h2>No jobs yet</h2>
+          <h2>{showArchived ? 'No jobs' : 'No jobs yet'}</h2>
           <p className="muted">
-            Click <b>New job</b> to walk through importing a shoot folder.
-          </p>
-        </section>
-      )}
-
-      {jobs && jobs.length === 0 && view === 'archived' && (
-        <section className="empty-state">
-          <h2>No archived jobs</h2>
-          <p className="muted">
-            Archived jobs land here. They keep working — just out of sight.
+            {showArchived
+              ? 'Nothing here. Archived jobs would show faded with an Unarchive action.'
+              : <>Click <b>New job</b> to walk through importing a shoot folder.</>}
           </p>
         </section>
       )}
@@ -75,6 +97,13 @@ export default function JobList() {
             const pct = teams > 0 ? Math.round((reviewedCount / teams) * 100) : 0;
             const allReviewed = teams > 0 && reviewedCount === teams;
             const isFresh = teams === 0;
+            const menuItems = [
+              { label: 'Open', onClick: () => nav(`/job/${j.id}`) },
+              j.archived
+                ? { label: 'Unarchive', onClick: () => unarchiveJob(j) }
+                : { label: 'Archive', onClick: () => archiveJob(j) },
+              { label: 'Delete', danger: true, onClick: () => setConfirm({ job: j }) },
+            ];
             return (
               <Link
                 key={j.id}
@@ -88,6 +117,7 @@ export default function JobList() {
                   {j.any_unprocessed && !isFresh && !j.archived && (
                     <span className="pending-pill">pipeline pending</span>
                   )}
+                  <CardMenu items={menuItems} />
                 </div>
                 <p className="job-path muted" title={j.root_path}>{j.root_path}</p>
 
@@ -131,6 +161,29 @@ export default function JobList() {
             );
           })}
         </div>
+      )}
+
+      {confirm && (
+        <ConfirmModal
+          title={`Delete "${confirm.job.name}"?`}
+          lines={[
+            `${confirm.job.session_count || 0} teams`,
+            `${confirm.job.image_count || 0} images`,
+            'All cluster assignments and manual overrides',
+            'Cached thumbnails',
+          ]}
+          onConfirm={() => deleteJob(confirm.job)}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+
+      {toast && (
+        <Toast
+          message={toast.message}
+          actionLabel={toast.actionLabel}
+          onAction={toast.onAction || (() => {})}
+          onClose={() => setToast(null)}
+        />
       )}
     </div>
   );

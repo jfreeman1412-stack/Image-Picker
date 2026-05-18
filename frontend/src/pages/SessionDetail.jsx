@@ -15,6 +15,12 @@ export default function SessionDetail() {
   const [job, setJob] = useState(null);        // for header progress
   const [siblingIds, setSiblingIds] = useState({ previous_session_id: null, next_session_id: null });
   const [navBusy, setNavBusy] = useState(false);
+  const [readiness, setReadiness] = useState({ ready: true, incomplete_clusters: [] });
+  const [showGate, setShowGate] = useState(false); // validation-gate modal
+  const [dragFrom, setDragFrom] = useState(null);  // source cluster_id of active thumbnail drag
+  const incompleteClusterIds = new Set(
+    (readiness.incomplete_clusters || []).map(c => c.cluster_id)
+  );
 
   const load = async () => {
     const s = await fetch(`/api/sessions/${id}`).then(r => r.json());
@@ -23,6 +29,8 @@ export default function SessionDetail() {
     setClusters(c);
     const sib = await fetch(`/api/sessions/${id}/siblings`).then(r => r.json());
     setSiblingIds(sib);
+    const rr = await fetch(`/api/sessions/${id}/review-readiness`).then(r => r.json());
+    setReadiness(rr);
     if (s.job_id) {
       const j = await fetch(`/api/jobs/${s.job_id}`).then(r => r.json());
       setJob(j);
@@ -116,18 +124,27 @@ export default function SessionDetail() {
     load();
   };
 
-  const markAndNext = useCallback(async () => {
+  const markAndNext = useCallback(async (force = false) => {
     if (!session) return;
+    const nextReviewed = !session.reviewed;
+    // Gate only applies when MARKING reviewed (not when un-marking).
+    if (nextReviewed && !readiness.ready && !force) {
+      setShowGate(true);
+      return;
+    }
     setNavBusy(true);
     try {
-      const nextReviewed = !session.reviewed;
-      await fetch(`/api/sessions/${id}/reviewed`, {
+      const res = await fetch(`/api/sessions/${id}/reviewed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reviewed: nextReviewed }),
+        body: JSON.stringify({ reviewed: nextReviewed, force }),
       });
-      // Only chase the next unreviewed when we just MARKED reviewed.
-      // When un-marking, just refresh.
+      if (!res.ok) {
+        // Backend guard tripped (e.g. raced past the pre-check) — surface it.
+        setShowGate(true);
+        return;
+      }
+      setShowGate(false);
       if (nextReviewed) {
         const r = await fetch(`/api/sessions/${id}/next-unreviewed`).then(r => r.json());
         if (r.session_id) nav(`/session/${r.session_id}`);
@@ -139,7 +156,7 @@ export default function SessionDetail() {
     } finally {
       setNavBusy(false);
     }
-  }, [session, id, nav]);
+  }, [session, id, nav, readiness]);
 
   const skipNext = () => {
     if (siblingIds.next_session_id) nav(`/session/${siblingIds.next_session_id}`);
@@ -147,6 +164,43 @@ export default function SessionDetail() {
   const goPrev = () => {
     if (siblingIds.previous_session_id) nav(`/session/${siblingIds.previous_session_id}`);
   };
+
+  // ── Drag-to-reassign: track the active drag so cards can highlight, and
+  // auto-scroll the page when the pointer nears the top/bottom edge (native
+  // HTML5 DnD doesn't scroll on its own). ────────────────────────────────────
+  const onThumbDragStart = useCallback((from_cluster_id) => {
+    setDragFrom(from_cluster_id);
+  }, []);
+  const onThumbDragEnd = useCallback(() => setDragFrom(null), []);
+
+  useEffect(() => {
+    if (dragFrom == null) return;
+    const EDGE = 90;        // px from a viewport edge that triggers scrolling
+    const MAX_SPEED = 22;   // px per tick at the very edge
+    let pointerY = null;
+    let raf = null;
+
+    const onDragOver = (e) => { pointerY = e.clientY; };
+    const tick = () => {
+      if (pointerY != null) {
+        const h = window.innerHeight;
+        if (pointerY < EDGE) {
+          const f = (EDGE - pointerY) / EDGE;
+          window.scrollBy(0, -Math.ceil(MAX_SPEED * f));
+        } else if (pointerY > h - EDGE) {
+          const f = (pointerY - (h - EDGE)) / EDGE;
+          window.scrollBy(0, Math.ceil(MAX_SPEED * f));
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    window.addEventListener('dragover', onDragOver);
+    raf = requestAnimationFrame(tick);
+    return () => {
+      window.removeEventListener('dragover', onDragOver);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [dragFrom]);
 
   // Keyboard: R triggers mark-and-next. Skip when typing in an input.
   useEffect(() => {
@@ -164,8 +218,20 @@ export default function SessionDetail() {
 
   if (!session) return <div className="page">Loading…</div>;
 
+  // A cluster "needs attention" if it has any visible (non-hidden) review
+  // flags OR it's incomplete per review-readiness (missing team/pano —
+  // populated by the Section 6 readiness fetch). This matches "would this
+  // block Mark reviewed & next?" rather than the raw needs_review flag,
+  // which is true for almost everything and ignores flag-visibility.
+  const clusterNeedsAttention = (c) => {
+    const reasons = c.visible_review_reasons
+      ?? (c.review_reason || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (reasons.length > 0) return true;
+    return incompleteClusterIds.has(c.cluster_id);
+  };
+
   const visible = filter === 'review'
-    ? clusters.filter(c => c.needs_review)
+    ? clusters.filter(clusterNeedsAttention)
     : clusters;
 
   // Progress indicator: team N of M · X reviewed
@@ -183,12 +249,13 @@ export default function SessionDetail() {
 
   const actionBarProps = {
     reviewed: session.reviewed,
-    onMarkAndNext: markAndNext,
+    onMarkAndNext: () => markAndNext(false),
     onSkipNext: skipNext,
     onPrev: goPrev,
     prevDisabled: !siblingIds.previous_session_id,
     nextDisabled: !siblingIds.next_session_id,
     busy: navBusy,
+    markGated: !readiness.ready,
   };
 
   return (
@@ -248,6 +315,9 @@ export default function SessionDetail() {
             onSetRole={setRole}
             onClearOverride={clearOverride}
             onSetCoachOverride={setCoachOverride}
+            dragFrom={dragFrom}
+            onDragStart={onThumbDragStart}
+            onDragEnd={onThumbDragEnd}
           />
         ))}
       </div>
@@ -266,6 +336,36 @@ export default function SessionDetail() {
 
       {session.job_id && (
         <ReviewActionBar variant="sticky" hint {...actionBarProps} />
+      )}
+
+      {showGate && (
+        <div className="modal-backdrop" onClick={() => setShowGate(false)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <h2>Can't mark reviewed yet</h2>
+            <p className="muted">
+              {readiness.incomplete_clusters.length} cluster
+              {readiness.incomplete_clusters.length === 1 ? '' : 's'} still
+              need a team/pano pick:
+            </p>
+            <ul className="confirm-impact">
+              {readiness.incomplete_clusters.map((c) => (
+                <li key={c.cluster_id}>
+                  <b>{c.label}</b> — missing {c.missing.join(' and ')}
+                </li>
+              ))}
+            </ul>
+            <div className="actions" style={{ justifyContent: 'space-between' }}>
+              <button
+                className="ghost"
+                onClick={() => markAndNext(true)}
+                disabled={navBusy}
+              >
+                Skip validation and mark reviewed anyway
+              </button>
+              <button onClick={() => setShowGate(false)}>Keep reviewing</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

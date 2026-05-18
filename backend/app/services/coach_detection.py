@@ -4,10 +4,20 @@ Two complementary auto-detection signals (logical OR — either alone suffices):
 
   1. Age + low photo count (original) — catches coaches who DO have a few
      solo photos with visible age cues.
-  2. Photo composition (Phase 4.5, new) — catches coaches whose primary
-     signal is "appears in buddy shots, has few/no individual portraits."
-     More reliable than FER age estimation, but requires the cluster to have
-     at least 2 buddy shots.
+  2. Photo composition — catches coaches whose primary signal is "appears in
+     buddy shots, has few/no individual portraits." More reliable than FER
+     age estimation; requires the cluster to have at least 2 buddy shots.
+
+Phase 4.6: rule 2 originally had a third condition,
+`image_count < session_median * 0.7`. It was meant to stop a player with a
+short session from being flagged, but in practice it caught legitimate
+coaches: the real "Nash-Hauer" coach cluster had 2 single + 5 buddy = 7
+images, and 7 < 9*0.7 (6.3) is false, so the coach was MISSED. The combined
+(few single) + (multiple buddy) signal is already strong on its own —
+players always have a real individual-portrait sequence (6-12 solo shots),
+so they never look like this. The total-count gate is dropped. The rare
+genuine false positive (a player who only got 2-3 solo shots AND has 2+
+buddy shots) is handled by the manual coach dropdown (Phase 4.5 §3).
 
 Manual override (`Cluster.manual_coach_override`, resolved via
 `Cluster.is_coach_for_sort()`) always wins over whatever this sets — this
@@ -29,7 +39,6 @@ COUNT_FRACTION_OF_MEDIAN = 0.5
 # Rule 2 (composition) thresholds.
 MAX_SINGLE_FACE_FOR_COACH = 3      # a player has 6-12 solo portraits
 MIN_MULTI_FACE_FOR_COACH = 2       # confirm they're actually in buddy shots
-COMPOSITION_COUNT_FRACTION = 0.7   # total must be well under session median
 
 
 def detect_coaches(
@@ -50,10 +59,8 @@ def detect_coaches(
     A cluster is a coach if EITHER:
       A) median(ages) >= 25 AND image_count <= max(3, session_median * 0.5)
       B) single_face_count <= 3 AND multi_face_count >= 2
-         AND image_count < session_median * 0.7
     """
     count_threshold = max(MIN_COUNT_FLOOR, session_median_count * COUNT_FRACTION_OF_MEDIAN)
-    composition_total_cap = session_median_count * COMPOSITION_COUNT_FRACTION
 
     out: dict[int, bool] = {}
     for c in clusters_data:
@@ -65,14 +72,13 @@ def detect_coaches(
         rule_a = bool(ages) and statistics.median(ages) >= AGE_THRESHOLD \
             and count <= count_threshold
 
-        # Rule B — photo composition
+        # Rule B — photo composition (no total-count gate; see module docstring)
         single = c.get("single_face_count")
         multi = c.get("multi_face_count")
         rule_b = (
             single is not None and multi is not None
             and single <= MAX_SINGLE_FACE_FOR_COACH
             and multi >= MIN_MULTI_FACE_FOR_COACH
-            and count < composition_total_cap
         )
 
         out[cid] = bool(rule_a or rule_b)

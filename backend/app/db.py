@@ -47,6 +47,8 @@ _PHASE2_COLUMNS = {
         ("progress_stage", "VARCHAR"),
         ("progress_current", "INTEGER DEFAULT 0"),
         ("progress_total", "INTEGER DEFAULT 0"),
+        ("archived", "INTEGER DEFAULT 0"),
+        ("archived_at", "DATETIME"),
     ],
     # Soft-archive flag for jobs that should drop off the default home view.
     # Phase 4.5: async ingest status/progress fields.

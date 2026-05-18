@@ -25,10 +25,18 @@ export default function ClusterCard({
   onSetRole,
   onClearOverride,
   onSetCoachOverride,
+  dragFrom,        // cluster_id an image is currently being dragged from (or null)
+  onDragStart,     // (from_cluster_id) → parent tracks the active drag
+  onDragEnd,       // () → parent clears the active drag
 }) {
   const [editing, setEditing] = useState(false);
   const [label, setLabel] = useState(cluster.label);
   const [openPopover, setOpenPopover] = useState(null); // image_id
+  const [dropHover, setDropHover] = useState(false);
+
+  // This card is a valid drop target only while an image from a *different*
+  // cluster is being dragged.
+  const isDropCandidate = dragFrom != null && dragFrom !== cluster.cluster_id;
 
   useEffect(() => { setLabel(cluster.label); }, [cluster.label]);
 
@@ -41,6 +49,42 @@ export default function ClusterCard({
     if (target_cluster_id && target_cluster_id !== cluster.cluster_id) {
       onReassign(image_id, cluster.cluster_id, Number(target_cluster_id));
     }
+  };
+
+  // ── Drag source (a thumbnail) ──────────────────────────────────────────
+  const handleThumbDragStart = (e, image_id) => {
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/json', JSON.stringify({
+      image_id, from_cluster_id: cluster.cluster_id,
+    }));
+    onDragStart && onDragStart(cluster.cluster_id);
+  };
+  const handleThumbDragEnd = () => { onDragEnd && onDragEnd(); };
+
+  // ── Drop target (this card) ────────────────────────────────────────────
+  const handleCardDragOver = (e) => {
+    if (!isDropCandidate) return;
+    e.preventDefault();                 // required to allow a drop
+    e.dataTransfer.dropEffect = 'move';
+    if (!dropHover) setDropHover(true);
+  };
+  const handleCardDragLeave = (e) => {
+    // Ignore leaves into child elements — only clear when truly leaving.
+    if (e.currentTarget.contains(e.relatedTarget)) return;
+    setDropHover(false);
+  };
+  const handleCardDrop = (e) => {
+    setDropHover(false);
+    if (!isDropCandidate) return;
+    e.preventDefault();
+    let payload;
+    try {
+      payload = JSON.parse(e.dataTransfer.getData('application/json'));
+    } catch {
+      return;
+    }
+    if (!payload || payload.from_cluster_id === cluster.cluster_id) return;
+    onReassign(payload.image_id, payload.from_cluster_id, cluster.cluster_id);
   };
 
   const popoverRef = useRef(null);
@@ -64,7 +108,12 @@ export default function ClusterCard({
   const coachManual = (cluster.manual_coach_override ?? 0) !== 0;
 
   return (
-    <div className={`cluster-card ${showReview ? 'review' : ''}`}>
+    <div
+      className={`cluster-card ${showReview ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
+      onDragOver={handleCardDragOver}
+      onDragLeave={handleCardDragLeave}
+      onDrop={handleCardDrop}
+    >
       <div className="cluster-header">
         {editing ? (
           <input
@@ -113,7 +162,11 @@ export default function ClusterCard({
               <img
                 src={img.thumb_url}
                 alt={img.filename}
+                draggable
+                onDragStart={(e) => handleThumbDragStart(e, img.image_id)}
+                onDragEnd={handleThumbDragEnd}
                 onClick={() => onPreview && onPreview(img)}
+                title="Drag to another player, or click to enlarge"
               />
               <span
                 className={badge.className}

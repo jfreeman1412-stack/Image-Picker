@@ -15,8 +15,12 @@ export default function ReviewActionBar({
   prevDisabled,
   nextDisabled,
   busy,
+  markGated,       // true → mute the primary button; click opens the gate modal
 }) {
   const label = reviewed ? 'Unmark reviewed & next' : 'Mark reviewed & next';
+  // When gated we keep the button clickable (so the explanation modal can
+  // open) but visually muted — never silently removed.
+  const gated = markGated && !reviewed;
   return (
     <div className={`review-actionbar ${variant}`}>
       <button
@@ -34,11 +38,12 @@ export default function ReviewActionBar({
       >Skip to next →</button>
 
       <button
-        className={`primary ${reviewed ? 'undo' : ''}`}
+        className={`primary ${reviewed ? 'undo' : ''} ${gated ? 'gated' : ''}`}
         onClick={onMarkAndNext}
         disabled={busy}
+        title={gated ? 'Some clusters are missing a team or pano pick' : undefined}
       >
-        {reviewed ? '↺' : '✓'} {label}
+        {reviewed ? '↺' : gated ? '⚠' : '✓'} {label}
         {hint && <span className="hint">press R</span>}
       </button>
     </div>

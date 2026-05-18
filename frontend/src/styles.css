@@ -193,6 +193,19 @@ label { color: var(--text); }
   background: linear-gradient(180deg, rgba(245, 176, 86, 0.04), var(--bg-elev-1));
 }
 
+/* Drag-to-reassign: every other card is a candidate target while a thumbnail
+ * is being dragged; the one under the pointer gets a strong accent ring. */
+.cluster-card.drop-candidate {
+  border-style: dashed;
+  border-color: var(--border-strong);
+}
+.cluster-card.drop-hover {
+  border-style: dashed;
+  border-color: var(--accent);
+  background: linear-gradient(180deg, rgba(110, 168, 254, 0.10), var(--bg-elev-1));
+  box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.35) inset;
+}
+
 .cluster-header {
   display: flex;
   align-items: center;
@@ -243,11 +256,12 @@ label { color: var(--text); }
   object-fit: cover;
   border-radius: var(--radius);
   display: block;
-  cursor: zoom-in;
+  cursor: grab;            /* draggable to another player; still click-to-enlarge */
   background: var(--bg-elev-2);
   border: 1px solid var(--border);
   transition: border-color 0.12s, transform 0.08s;
 }
+.thumb img:active { cursor: grabbing; }
 .thumb img:hover { border-color: var(--accent); }
 .thumb.rejected img { opacity: 0.35; filter: grayscale(0.5); }
 .thumb.rejected .filename {
@@ -547,6 +561,15 @@ label { color: var(--text); }
 }
 .review-actionbar button.primary.undo:hover:not(:disabled) {
   background: linear-gradient(180deg, #535d6b, #404856);
+}
+.review-actionbar button.primary.gated {
+  background: linear-gradient(180deg, #4b4536, #3a3528);
+  border-color: var(--warn);
+  color: var(--warn-text);
+  opacity: 0.85;
+}
+.review-actionbar button.primary.gated:hover:not(:disabled) {
+  opacity: 1;
 }
 .review-actionbar .hint {
   background: rgba(255, 255, 255, 0.12);
@@ -988,3 +1011,136 @@ button.primary-cta:hover:not(:disabled) {
   padding: 8px 0;
 }
 .ingest-progress .progress-bar { height: 8px; }
+
+/* ── Phase 4.6: archive/delete UI ───────────────────────────────────────── */
+.job-card { position: relative; }
+
+.show-archived-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.card-menu {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+}
+.card-menu-btn {
+  padding: 2px 8px;
+  font-size: 16px;
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+.card-menu-btn:hover:not(:disabled) {
+  background: var(--bg-elev-3);
+  color: var(--text);
+}
+.card-menu-pop {
+  position: absolute;
+  top: 28px;
+  right: 0;
+  min-width: 130px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  gap: 2px;
+}
+.card-menu-item {
+  text-align: left;
+  font-size: 13px;
+  padding: 6px 10px;
+  background: transparent;
+  border-color: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+.card-menu-item:hover:not(:disabled) { background: var(--bg-elev-3); }
+.card-menu-item.danger { color: #f87171; }
+.card-menu-item.danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.12);
+}
+
+/* Confirm modal impact list + danger button */
+.confirm-impact {
+  margin: 10px 0;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: 14px;
+}
+.confirm-impact li { margin: 3px 0; }
+button.danger-btn {
+  background: #b91c1c;
+  border-color: #991b1b;
+  color: #fff;
+  font-weight: 600;
+}
+button.danger-btn:hover:not(:disabled) { background: #dc2626; }
+
+/* Toast */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elev-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-3);
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 14px;
+  z-index: 200;
+  max-width: 90vw;
+}
+.toast-action {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  padding: 4px 8px;
+}
+.toast-action:hover:not(:disabled) { background: rgba(110, 168, 254, 0.12); }
+.toast-close {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  padding: 2px 6px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* Archived team cards fade like archived job cards */
+.team-card.archived { opacity: 0.55; }
+.team-card.archived:hover { opacity: 0.85; }
+
+/* ── Drag-to-reassign ───────────────────────────────────────────────────── */
+/* The thumbnail being dragged dims so it reads as "in flight". Native DnD
+ * also renders its own drag-image ghost (the thumbnail itself). */
+.thumb img:active { opacity: 0.5; }
+
+/* Every other cluster card is a candidate target while a drag is active. */
+.cluster-card.drop-candidate {
+  border-style: dashed;
+  border-color: var(--border-strong);
+}
+/* The card the pointer is currently over: clear accept affordance. */
+.cluster-card.drop-hover {
+  border-style: dashed;
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.18);
+}
