@@ -19,6 +19,8 @@ const ROLE_OPTIONS = [
 export default function ClusterCard({
   cluster,
   allClusters,
+  incomplete,      // true | false (needs team/pano) | undefined (readiness not loaded yet)
+  missing,         // e.g. ["pano"] — only when incomplete
   onReassign,
   onRename,
   onPreview,
@@ -107,9 +109,16 @@ export default function ClusterCard({
   const isCoach = cluster.is_coach_for_sort ?? cluster.is_likely_coach;
   const coachManual = (cluster.manual_coach_override ?? 0) !== 0;
 
+  // Per-cluster completeness (distinct from the per-team `reviewed` pill):
+  // player needs team+pano, coach needs team. `incomplete` is computed by the
+  // parent from review-readiness; undefined until that first fetch lands so we
+  // don't flash a green ✓ on everything before the data arrives.
+  const completeClass =
+    incomplete === undefined ? '' : incomplete ? 'incomplete' : 'complete';
+
   return (
     <div
-      className={`cluster-card ${showReview ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
+      className={`cluster-card ${completeClass} ${showReview ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
       onDragOver={handleCardDragOver}
       onDragLeave={handleCardDragLeave}
       onDrop={handleCardDrop}
@@ -146,6 +155,17 @@ export default function ClusterCard({
           </select>
         )}
         <span className="cluster-count">{cluster.image_count} images</span>
+        {incomplete === false && (
+          <span className="complete-chip" title="Team + pano assigned">✓ complete</span>
+        )}
+        {incomplete === true && (
+          <span
+            className="incomplete-chip"
+            title={`Missing ${(missing || []).join(' and ')}`}
+          >
+            ▲ needs {(missing || []).join(' + ')}
+          </span>
+        )}
         {visibleReasons.map(reason => (
           <span key={reason} className="review-badge" title={reason}>
             ⚠ {reason}
@@ -154,7 +174,7 @@ export default function ClusterCard({
       </div>
 
       <div className="thumb-strip">
-        {cluster.images.map(img => {
+        {cluster.images.map((img, idx) => {
           const badge = ROLE_BADGES[img.role] || { label: '·', className: 'badge badge-empty' };
           const isRejected = img.role === 'rejected';
           return (
@@ -165,7 +185,7 @@ export default function ClusterCard({
                 draggable
                 onDragStart={(e) => handleThumbDragStart(e, img.image_id)}
                 onDragEnd={handleThumbDragEnd}
-                onClick={() => onPreview && onPreview(img)}
+                onClick={() => onPreview && onPreview(cluster.cluster_id, idx)}
                 title="Drag to another player, or click to enlarge"
               />
               <span

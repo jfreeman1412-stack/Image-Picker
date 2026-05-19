@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import ClusterCard from '../components/ClusterCard.jsx';
 import ImageModal from '../components/ImageModal.jsx';
@@ -11,35 +11,67 @@ export default function SessionDetail() {
   const [session, setSession] = useState(null);
   const [clusters, setClusters] = useState([]);
   const [filter, setFilter] = useState('all'); // all | review
-  const [previewImage, setPreviewImage] = useState(null);
+  // Modal preview is tracked as { cluster_id, index }, NOT a snapshot image
+  // list: the images shown are always re-derived from the freshly-loaded
+  // `clusters` by cluster_id below, so a role change → load() refetch can't
+  // desync the modal. index is clamped on read in case the cluster shrank.
+  const [preview, setPreview] = useState(null);
   const [job, setJob] = useState(null);        // for header progress
   const [siblingIds, setSiblingIds] = useState({ previous_session_id: null, next_session_id: null });
   const [navBusy, setNavBusy] = useState(false);
   const [readiness, setReadiness] = useState({ ready: true, incomplete_clusters: [] });
+  const [readinessLoaded, setReadinessLoaded] = useState(false);
   const [showGate, setShowGate] = useState(false); // validation-gate modal
   const [dragFrom, setDragFrom] = useState(null);  // source cluster_id of active thumbnail drag
-  const incompleteClusterIds = new Set(
-    (readiness.incomplete_clusters || []).map(c => c.cluster_id)
+  const [loadError, setLoadError] = useState(null); // HTTP status if the session failed to load
+  // cluster_id → missing roles (e.g. ["pano"]); absent ⇒ complete. Same source
+  // as the validation gate, so the card's complete/incomplete badge can never
+  // disagree with "would this block Mark reviewed?".
+  const incompleteById = new Map(
+    (readiness.incomplete_clusters || []).map(c => [c.cluster_id, c.missing])
   );
+  const incompleteClusterIds = new Set(incompleteById.keys());
+  // Read in the window keydown handler so R is ignored while the modal is
+  // open (modal owns the keyboard then) without re-subscribing every arrow.
+  const previewOpenRef = useRef(false);
+  previewOpenRef.current = preview != null;
 
+  // A failed fetch must NOT poison state (e.g. a 404 body becoming `clusters`,
+  // then `clusters.map` throwing and blanking the whole app). The session GET
+  // is the gate: if it fails we surface a recoverable error screen and bail;
+  // every other response is shape-checked before it lands in state.
   const load = async () => {
-    const s = await fetch(`/api/sessions/${id}`).then(r => r.json());
+    const sRes = await fetch(`/api/sessions/${id}`);
+    if (!sRes.ok) { setLoadError(sRes.status); return; }
+    const s = await sRes.json();
+    setLoadError(null);
     setSession(s);
-    const c = await fetch(`/api/sessions/${id}/clusters`).then(r => r.json());
-    setClusters(c);
-    const sib = await fetch(`/api/sessions/${id}/siblings`).then(r => r.json());
-    setSiblingIds(sib);
-    const rr = await fetch(`/api/sessions/${id}/review-readiness`).then(r => r.json());
-    setReadiness(rr);
+
+    const cRes = await fetch(`/api/sessions/${id}/clusters`);
+    const c = cRes.ok ? await cRes.json() : [];
+    setClusters(Array.isArray(c) ? c : []);
+
+    const sibRes = await fetch(`/api/sessions/${id}/siblings`);
+    setSiblingIds(sibRes.ok
+      ? await sibRes.json()
+      : { previous_session_id: null, next_session_id: null });
+
+    const rrRes = await fetch(`/api/sessions/${id}/review-readiness`);
+    if (rrRes.ok) {
+      setReadiness(await rrRes.json());
+      setReadinessLoaded(true);
+    }
+
     if (s.job_id) {
-      const j = await fetch(`/api/jobs/${s.job_id}`).then(r => r.json());
-      setJob(j);
+      const jRes = await fetch(`/api/jobs/${s.job_id}`);
+      setJob(jRes.ok ? await jRes.json() : null);
     } else {
       setJob(null);
     }
   };
   useEffect(() => {
     window.scrollTo(0, 0);
+    setLoadError(null);   // don't flash the previous session's error screen
     load();
   }, [id]);
 
@@ -206,6 +238,7 @@ export default function SessionDetail() {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key !== 'r' && e.key !== 'R') return;
+      if (previewOpenRef.current) return; // modal keys take precedence while open
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const tag = (e.target?.tagName || '').toLowerCase();
       if (tag === 'input' || tag === 'textarea' || e.target?.isContentEditable) return;
@@ -216,7 +249,46 @@ export default function SessionDetail() {
     return () => window.removeEventListener('keydown', onKey);
   }, [markAndNext]);
 
+  // Close the modal if its cluster vanished (deleted/merged) or emptied out.
+  useEffect(() => {
+    if (!preview) return;
+    const c = clusters.find(c => c.cluster_id === preview.cluster_id);
+    if (!c || !c.images?.length) setPreview(null);
+  }, [preview, clusters]);
+
+  if (loadError) return (
+    <div className="page">
+      <p><Link to="/">← All jobs</Link></p>
+      <h1>Couldn't load this team</h1>
+      <p className="muted">
+        The server returned{' '}
+        {loadError === 404
+          ? 'a 404 — this session id was not found.'
+          : `an error (HTTP ${loadError}).`}{' '}
+        This usually means the backend is running against a different database
+        than the one that has this team (e.g. a second copy of the project, or
+        a backend that needs restarting). Pick a team from the list, or retry.
+      </p>
+      <div className="actions">
+        <button onClick={() => { setLoadError(null); load(); }}>Retry</button>
+        {session?.job_id && (
+          <Link to={`/job/${session.job_id}`}>
+            <button className="ghost">Back to job</button>
+          </Link>
+        )}
+      </div>
+    </div>
+  );
+
   if (!session) return <div className="page">Loading…</div>;
+
+  const previewCluster = preview
+    ? clusters.find(c => c.cluster_id === preview.cluster_id)
+    : null;
+  const previewImages = previewCluster?.images ?? [];
+  const previewIndex = previewImages.length
+    ? Math.min(preview.index, previewImages.length - 1)
+    : 0;
 
   // A cluster "needs attention" if it has any visible (non-hidden) review
   // flags OR it's incomplete per review-readiness (missing team/pano —
@@ -309,9 +381,11 @@ export default function SessionDetail() {
             key={c.cluster_id}
             cluster={c}
             allClusters={clusters}
+            incomplete={readinessLoaded ? incompleteClusterIds.has(c.cluster_id) : undefined}
+            missing={incompleteById.get(c.cluster_id)}
             onReassign={reassign}
             onRename={rename}
-            onPreview={setPreviewImage}
+            onPreview={(cluster_id, index) => setPreview({ cluster_id, index })}
             onSetRole={setRole}
             onClearOverride={clearOverride}
             onSetCoachOverride={setCoachOverride}
@@ -329,9 +403,13 @@ export default function SessionDetail() {
       )}
 
       <ImageModal
-        src={previewImage?.full_url || previewImage?.thumb_url}
-        alt={previewImage?.filename}
-        onClose={() => setPreviewImage(null)}
+        images={previewImages}
+        index={previewIndex}
+        clusterId={preview?.cluster_id}
+        onIndexChange={(i) => setPreview(p => (p ? { ...p, index: i } : p))}
+        onClose={() => setPreview(null)}
+        onSetRole={setRole}
+        onClearOverride={clearOverride}
       />
 
       {session.job_id && (

@@ -206,6 +206,47 @@ label { color: var(--text); }
   box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.35) inset;
 }
 
+/* Per-cluster completeness rail — a left bar via ::before so it never fights
+ * the .review border or the .drop-hover box-shadow. Distinct from the
+ * per-team "Reviewed ✓" pill: this is "does THIS cluster have its picks". */
+.cluster-card { position: relative; }
+.cluster-card.complete,
+.cluster-card.incomplete { padding-left: 18px; }
+.cluster-card.complete::before,
+.cluster-card.incomplete::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+}
+.cluster-card.complete::before { background: var(--success); }
+.cluster-card.incomplete::before { background: var(--warn); }
+.cluster-card.complete {
+  background: linear-gradient(180deg, rgba(52, 211, 153, 0.05), var(--bg-elev-1));
+}
+
+.complete-chip,
+.incomplete-chip {
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.complete-chip {
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid var(--success-border);
+}
+.incomplete-chip {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border: 1px solid rgba(245, 176, 86, 0.3);
+}
+
 .cluster-header {
   display: flex;
   align-items: center;
@@ -393,6 +434,53 @@ label { color: var(--text); }
   cursor: pointer;
 }
 .modal-close:hover { background: rgba(255, 255, 255, 0.15); }
+
+/* Position/filename bar + role tag above the full-size image. */
+.modal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.modal-pos {
+  font-size: 13px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.modal-roletag {
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: var(--radius-sm);
+  color: #fff;
+}
+.modal-roletag .lock { font-size: 9px; }
+.modal-keys {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.modal-keys:hover { background: rgba(255, 255, 255, 0.15); }
+.modal-help {
+  margin-top: 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+.modal-help b { color: var(--text); }
 
 /* ── Wizard ─────────────────────────────────────────────────────────────── */
 .wizard-steps {

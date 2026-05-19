@@ -44,6 +44,42 @@ Currently the reassign and merge endpoints update `cluster_id` on Faces but don'
 
 Currently serves the full file for thumbnails. Add PIL-based thumbnailing to 256px max edge, cache to `backend/data/thumbs/{image_id}.jpg`.
 
+## Phase 5 (Tier 1 review-speed bundle) — done, with one deferral
+
+Delivered per `PHASE5_HANDOFF.md`:
+
+- **Modal arrow-key nav** (1.1): `ImageModal` now takes `images`/`index`/
+  `clusterId`/`onIndexChange`; `←`/`→` move within the cluster and clamp at
+  the ends (no wrap); title bar shows `Image N of M · filename` + the current
+  role tag; ESC still closes; prev/next images are preloaded.
+- **Single-key roles in the modal** (1.2): `T/P/I/B/X` set the role and
+  auto-advance, `U` clears the override, `Shift+key` sets without advancing.
+  A `? keys` button + `?` key toggle a shortcut legend. `SessionDetail` keeps
+  modal state as `{cluster_id, index}` and re-derives the image list from the
+  freshly-loaded `clusters` by `cluster_id` after each role change, so the
+  load() refetch can't desync the modal. The `R` shortcut is suppressed while
+  the modal is open (modal owns the keyboard then).
+- **Per-cluster complete/incomplete state** (1.3): `SessionDetail` passes an
+  `incomplete` bool + `missing` list to each `ClusterCard` from the existing
+  review-readiness set. Complete = green left rail + tint + "✓ complete" chip;
+  incomplete = amber left rail + "▲ needs …" chip. Rendered via a `::before`
+  rail so it doesn't fight the `.review` border or `.drop-hover` shadow, and
+  withheld until the first readiness fetch lands (no green-everything flash).
+
+**Deferred — grid-selection single-key roles.** The wishlist's stretch idea of
+selecting a thumbnail on the grid (without opening the modal) and assigning
+roles by key was intentionally not built: it needs a new selection model
+(focus/outline state, arrow traversal across cards, not colliding with native
+drag) that the handoff explicitly allowed deferring rather than half-building.
+The modal is the primary fast-review flow and fully covers the key bindings.
+
+**Backend `complete` field — intentionally skipped (no backend change).** The
+optional `/clusters` `complete` boolean was not added: `_compute_review_
+readiness()` already computes exactly player=team+pano / coach=team, and
+`SessionDetail` already fetches it. A duplicate field would only add a second
+code path that could drift from the validation gate. So Phase 5 is
+frontend-only; the 172 backend tests are untouched and still green.
+
 ## Phase 4 known limitation: wizard assumes one JPG-location pattern per job
 
 The walkthrough sets one `image_subfolder_name` (or None) and applies it to every
