@@ -31,6 +31,14 @@ KNOWN_FLAGS = [
     # differs from this session's team. Computed at read time in
     # /clusters (not stored on Cluster.review_reason).
     "roster_mismatch",
+    # Phase 9: two or more clusters in the same session share the same
+    # normalized auto_label — usually means the copyright was wrong on
+    # some shots OR face clustering split one player across two clusters.
+    # Computed at read time in /clusters (not stored). When this flag is
+    # *visible* per flag-visibility settings, the review-readiness gate
+    # also blocks "Mark reviewed & next" — toggle visibility to make it
+    # informational-only.
+    "duplicate_auto_label",
 ]
 
 _FLAG_VIS_KEY = "flag_visibility"

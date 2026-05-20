@@ -17,7 +17,8 @@ from app.services.face_pipeline import _sort_cluster
 from app.services.outliers import flag_outliers
 from app.services.roster import build_lookup
 from app.services.roster_check import (
-    add_roster_flag, cluster_is_mismatched, session_norm_team,
+    add_duplicate_label_flag, add_roster_flag, cluster_is_mismatched,
+    find_duplicate_label_cluster_ids, session_norm_team,
 )
 from app.api.settings import get_flag_visibility_map, filter_visible_reasons
 
@@ -52,6 +53,8 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
     # check is a no-op (see roster_check.cluster_is_mismatched).
     roster_lookup = build_lookup(db, s.job_id) if s.job_id else {}
     sess_norm = session_norm_team(s)
+    # Phase 9: cross-cluster duplicate-auto-label set. Read-time only.
+    dup_cluster_ids = find_duplicate_label_cluster_ids(s.clusters)
 
     out = []
     for c in s.clusters:
@@ -81,6 +84,10 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
         # re-running the pipeline.
         mismatched = cluster_is_mismatched(c, sess_norm, roster_lookup)
         combined_reason = add_roster_flag(c.review_reason, mismatched)
+        # Phase 9: cross-cluster duplicate_auto_label splice (also read-time).
+        combined_reason = add_duplicate_label_flag(
+            combined_reason, c.id in dup_cluster_ids,
+        )
         visible_reasons = filter_visible_reasons(combined_reason, flag_vis)
         out.append({
             "cluster_id": c.id,

@@ -34,9 +34,19 @@ router = APIRouter()
 
 def _compute_review_readiness(db: DbSession, session: Session) -> dict:
     """Per cluster: a coach needs a 'team' role; a player needs both 'team'
-    and 'panoramic'. Returns {ready, incomplete_clusters:[{cluster_id,label,
-    missing:[...]}]}."""
+    and 'panoramic'. Phase 9: also blocks when the `duplicate_auto_label`
+    flag is currently visible AND there are duplicate-labeled clusters in
+    this session.
+
+    Returns {ready, incomplete_clusters:[{cluster_id,label,missing:[...]}]}.
+    """
+    from app.api.settings import get_flag_visibility_map  # avoid circular
+    from app.services.roster_check import (
+        DUPLICATE_AUTO_LABEL, find_duplicate_label_cluster_ids,
+    )
+
     incomplete: list[dict] = []
+    by_cluster: dict[int, dict] = {}        # so we can merge multiple reasons
     for c in session.clusters:
         roles = {
             r.role for r in db.query(ImageRole).filter_by(cluster_id=c.id).all()
@@ -51,11 +61,28 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
         if "pano" in required and "panoramic" not in roles:
             missing.append("pano")
         if missing:
-            incomplete.append({
-                "cluster_id": c.id,
-                "label": c.display_label(),
-                "missing": missing,
-            })
+            row = {"cluster_id": c.id, "label": c.display_label(), "missing": missing}
+            incomplete.append(row)
+            by_cluster[c.id] = row
+
+    # Phase 9: cross-cluster duplicate auto_label, only when visible.
+    flag_vis = get_flag_visibility_map(db)
+    if flag_vis.get(DUPLICATE_AUTO_LABEL, True):
+        dup_ids = find_duplicate_label_cluster_ids(session.clusters)
+        labels_by_id = {c.id: c.display_label() for c in session.clusters}
+        for cid in dup_ids:
+            if cid in by_cluster:
+                if DUPLICATE_AUTO_LABEL not in by_cluster[cid]["missing"]:
+                    by_cluster[cid]["missing"].append(DUPLICATE_AUTO_LABEL)
+            else:
+                row = {
+                    "cluster_id": cid,
+                    "label": labels_by_id.get(cid, f"Cluster {cid}"),
+                    "missing": [DUPLICATE_AUTO_LABEL],
+                }
+                incomplete.append(row)
+                by_cluster[cid] = row
+
     return {"ready": not incomplete, "incomplete_clusters": incomplete}
 
 

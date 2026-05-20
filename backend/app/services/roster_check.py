@@ -23,6 +23,34 @@ from app.services.roster import normalize_name
 
 
 ROSTER_MISMATCH = "roster_mismatch"
+DUPLICATE_AUTO_LABEL = "duplicate_auto_label"
+
+
+def find_duplicate_label_cluster_ids(clusters) -> set[int]:
+    """Phase 9: cross-cluster duplicate detection.
+
+    Group clusters in the same session by normalized auto_label. Any
+    group with size >= 2 means every cluster in that group claims the
+    same player by name — flag all of them. Clusters with no auto_label
+    are not grouped (they go through the existing `ambiguous_copyright`
+    flow instead).
+    """
+    by_norm: dict[str, list[int]] = {}
+    for c in clusters:
+        norm = normalize_name(c.auto_label)
+        if norm:
+            by_norm.setdefault(norm, []).append(c.id)
+    return {cid for cids in by_norm.values() if len(cids) > 1 for cid in cids}
+
+
+def add_duplicate_label_flag(
+    review_reason: str | None, is_duplicate: bool,
+) -> str | None:
+    """Same shape as `add_roster_flag` but for the duplicate-label case."""
+    existing = [r.strip() for r in (review_reason or "").split(",") if r.strip()]
+    if is_duplicate and DUPLICATE_AUTO_LABEL not in existing:
+        existing.append(DUPLICATE_AUTO_LABEL)
+    return ",".join(existing) if existing else None
 
 
 def cluster_is_mismatched(
