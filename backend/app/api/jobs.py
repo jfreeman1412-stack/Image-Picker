@@ -18,6 +18,7 @@ DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 import json
 import logging
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -496,6 +497,27 @@ def _best_role(db: DbSession, image_id: int) -> Optional[str]:
     return min(roles, key=lambda r: _ROLE_PRIORITY.get(r.role, 99)).role
 
 
+def _best_role_map(db: DbSession, image_ids: list[int]) -> dict[int, str]:
+    """Bulk version of _best_role: one SQL fetch for all ImageRole rows,
+    then resolve the priority winner per image in Python. Replaces N+1
+    queries during export — for ~2,000 images that's a ~4,000× cut in
+    serial DB latency."""
+    if not image_ids:
+        return {}
+    rows = (
+        db.query(ImageRole.image_id, ImageRole.role)
+        .filter(ImageRole.image_id.in_(image_ids))
+        .all()
+    )
+    by_image: dict[int, list[str]] = {}
+    for image_id, role in rows:
+        by_image.setdefault(image_id, []).append(role)
+    return {
+        image_id: min(roles, key=lambda r: _ROLE_PRIORITY.get(r, 99))
+        for image_id, roles in by_image.items()
+    }
+
+
 def _exportable_sessions(job: Job):
     """(sessions_to_export, sessions_skipped[]) — archived / not-done skipped."""
     to_export, skipped = [], []
@@ -512,13 +534,52 @@ def _exportable_sessions(job: Job):
 def _count_export_files(db: DbSession, sessions) -> int:
     """Non-rejected images across the given sessions — the progress
     denominator (one primary copy/move op per image)."""
-    total = 0
-    for s in sessions:
-        for image in s.images:
-            role = _best_role(db, image.id)
-            if role is not None and role != "rejected":
-                total += 1
-    return total
+    all_ids = [img.id for s in sessions for img in s.images]
+    role_map = _best_role_map(db, all_ids)
+    return sum(
+        1 for r in role_map.values() if r is not None and r != "rejected"
+    )
+
+
+# Phase 7: copy workers for the export. UNC writes are I/O-bound — threads
+# saturate the share with much less wall-clock time than the prior serial
+# loop. Per-image work (website + optional team/pano secondary) stays in a
+# single worker so progress accounting (one image = one tick) is unchanged.
+_EXPORT_WORKERS = 8
+
+
+def _allocate_dests(srcs: list[Path], target_dir: Path) -> list[Path]:
+    """Reserve non-colliding destination paths under target_dir for each
+    src.name. Resolved in the main thread so parallel copy workers can
+    write to distinct paths without racing each other on _unique_path."""
+    reserved: set[Path] = set()
+    out: list[Path] = []
+    for src in srcs:
+        candidate = target_dir / src.name
+        if candidate in reserved or candidate.exists():
+            stem, suffix = candidate.stem, candidate.suffix
+            n = 2
+            while True:
+                candidate = target_dir / f"{stem}_{n}{suffix}"
+                if candidate not in reserved and not candidate.exists():
+                    break
+                n += 1
+        reserved.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _copy_one(src: Path, website_dst: Path, secondary_dst: Optional[Path],
+              mode: str) -> None:
+    """One image's full export. The TEAM/PANO secondary copy reads from
+    website_dst rather than src, which is required for mode='move' since
+    src no longer exists by then."""
+    if mode == "move":
+        shutil.move(str(src), str(website_dst))
+    else:
+        shutil.copy2(str(src), str(website_dst))
+    if secondary_dst is not None:
+        shutil.copy2(str(website_dst), str(secondary_dst))
 
 
 def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
@@ -543,6 +604,12 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
                 d.mkdir(parents=True, exist_ok=True)
 
             to_export, sessions_skipped = _exportable_sessions(job)
+
+            # One bulk SQL fetch for every image's best role — replaces the
+            # per-image _best_role calls that turned into N+1 queries.
+            role_map = _best_role_map(
+                db, [img.id for s in to_export for img in s.images],
+            )
             files_copied = 0
             files_skipped_rejected = 0
 
@@ -556,8 +623,12 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
                 for d in (website_team, team_team, pano_team):
                     d.mkdir(parents=True, exist_ok=True)
 
+                # Build copy plans on the main thread so destination paths are
+                # reserved sequentially (no race between workers on _unique_path).
+                srcs: list[Path] = []
+                roles: list[str] = []
                 for image in session.images:
-                    role = _best_role(db, image.id)
+                    role = role_map.get(image.id)
                     if role is None:
                         continue
                     if role == "rejected":
@@ -567,24 +638,40 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
                     if not src.exists():
                         logger.warning("Source missing for export: %s", src)
                         continue
+                    srcs.append(src)
+                    roles.append(role)
 
-                    website_dst = _unique_path(website_team / src.name)
-                    if mode == "move":
-                        shutil.move(str(src), str(website_dst))
-                    else:
-                        shutil.copy2(str(src), str(website_dst))
-                    files_copied += 1
-                    if role == "team":
-                        shutil.copy2(str(website_dst),
-                                     str(_unique_path(team_team / src.name)))
-                    elif role == "panoramic":
-                        shutil.copy2(str(website_dst),
-                                     str(_unique_path(pano_team / src.name)))
+                website_dsts = _allocate_dests(srcs, website_team)
+                team_srcs = [s for s, r in zip(srcs, roles) if r == "team"]
+                pano_srcs = [s for s, r in zip(srcs, roles) if r == "panoramic"]
+                team_dsts = dict(zip(
+                    [str(s) for s in team_srcs],
+                    _allocate_dests(team_srcs, team_team),
+                ))
+                pano_dsts = dict(zip(
+                    [str(s) for s in pano_srcs],
+                    _allocate_dests(pano_srcs, pano_team),
+                ))
 
-                    # Commit progress every 10 files (network commits aren't free).
-                    if files_copied % 10 == 0:
-                        job.export_progress = files_copied
-                        db.commit()
+                # Parallel copy fan-out, sequential progress accounting.
+                with ThreadPoolExecutor(max_workers=_EXPORT_WORKERS) as ex:
+                    futures = []
+                    for src, role, website_dst in zip(srcs, roles, website_dsts):
+                        secondary = None
+                        if role == "team":
+                            secondary = team_dsts.get(str(src))
+                        elif role == "panoramic":
+                            secondary = pano_dsts.get(str(src))
+                        futures.append(
+                            ex.submit(_copy_one, src, website_dst, secondary, mode)
+                        )
+                    for fut in as_completed(futures):
+                        fut.result()  # re-raise any worker exception
+                        files_copied += 1
+                        # Commit progress every 10 files (network commits aren't free).
+                        if files_copied % 10 == 0:
+                            job.export_progress = files_copied
+                            db.commit()
 
                 job.export_progress = files_copied
                 db.commit()
