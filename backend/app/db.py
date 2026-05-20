@@ -51,6 +51,8 @@ _PHASE2_COLUMNS = {
         ("archived_at", "DATETIME"),
         ("progress_started_at", "DATETIME"),
         ("progress_stage_started_at", "DATETIME"),
+        # Phase 6.1: per-session CSV-team override (folder->roster mapping).
+        ("roster_team_alias", "VARCHAR"),
     ],
     # Soft-archive flag for jobs that should drop off the default home view.
     # Phase 4.5: async ingest status/progress fields.

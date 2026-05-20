@@ -278,6 +278,33 @@ def siblings(session_id: int, db: DbSession = Depends(get_db)):
     return {"previous_session_id": prev_id, "next_session_id": next_id}
 
 
+# ── Phase 6.1: roster-team alias (folder ↔ CSV-team mapping) ──────────────────
+
+
+class RosterMappingRequest(BaseModel):
+    roster_team_alias: str | None  # null clears the mapping
+
+
+@router.post("/{session_id}/roster-mapping")
+def set_roster_mapping(
+    session_id: int, payload: RosterMappingRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Set or clear the CSV-team string this session's folder maps to.
+
+    Stored raw (e.g. "10U-Black-Softball"); compared after normalize_name
+    against the roster. Passing null clears the mapping so the folder name
+    itself is used again. Survives roster re-uploads.
+    """
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    alias = (payload.roster_team_alias or "").strip() or None
+    s.roster_team_alias = alias
+    db.commit()
+    return {"session_id": s.id, "roster_team_alias": s.roster_team_alias}
+
+
 # ── Archive / delete ──────────────────────────────────────────────────────────
 
 

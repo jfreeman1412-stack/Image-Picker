@@ -59,6 +59,11 @@ class Session(Base):
     progress_total = Column(Integer, default=0)      # 0 → indeterminate (just show stage name)
     progress_started_at = Column(DateTime, nullable=True)        # whole-pipeline start (for elapsed)
     progress_stage_started_at = Column(DateTime, nullable=True)  # current-stage start (for ETA)
+    # Phase 6.1: explicit "this folder = this CSV team" override.
+    # When set, normalize_name(roster_team_alias) is used in place of
+    # normalize_name(name) for roster mismatch comparison. Survives roster
+    # re-uploads — the user keeps their mappings.
+    roster_team_alias = Column(String, nullable=True)
 
     job = relationship("Job", back_populates="sessions")
     images = relationship("Image", back_populates="session", cascade="all, delete-orphan")

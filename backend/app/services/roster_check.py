@@ -53,6 +53,11 @@ def add_roster_flag(review_reason: str | None, mismatched: bool) -> str | None:
 
 
 def session_norm_team(session: Session) -> str:
-    """Convenience wrapper so callers don't have to import normalize_name
-    too. Equivalent to normalize_name(session.name)."""
-    return normalize_name(session.name)
+    """Effective normalized team key for this session.
+
+    Phase 6.1: if the user has set a roster_team_alias (folder->CSV-team
+    mapping), use that instead of the folder name. Lets the app accept
+    folders like "10U Black" when the roster CSV calls the team
+    "10U-Black-Softball" without renaming either side.
+    """
+    return normalize_name(session.roster_team_alias or session.name)

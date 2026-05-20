@@ -19,6 +19,8 @@ import { useEffect, useRef, useState } from 'react';
 export default function RosterModal({ job, onClose, onChanged }) {
   const [roster, setRoster] = useState(null);          // GET /roster body | null
   const [mismatches, setMismatches] = useState([]);    // items array
+  const [suggestions, setSuggestions] = useState({ items: [], available_teams: [] });
+  const [savingSessionId, setSavingSessionId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploadResult, setUploadResult] = useState(null); // last POST response
@@ -39,6 +41,10 @@ export default function RosterModal({ job, onClose, onChanged }) {
       const r2 = await fetch(`/api/jobs/${job.id}/roster-mismatches`);
       if (!r2.ok) throw new Error(`Couldn't load mismatches (HTTP ${r2.status}).`);
       setMismatches((await r2.json()).items || []);
+
+      const r3 = await fetch(`/api/jobs/${job.id}/roster-folder-suggestions`);
+      if (!r3.ok) throw new Error(`Couldn't load folder suggestions (HTTP ${r3.status}).`);
+      setSuggestions(await r3.json());
     } catch (e) {
       setError(e.message || String(e));
     } finally {
@@ -150,6 +156,26 @@ export default function RosterModal({ job, onClose, onChanged }) {
     }
   };
 
+  // ── Folder ↔ CSV-team mapping ────────────────────────────────────────
+  const saveMapping = async (sessionId, alias) => {
+    setSavingSessionId(sessionId);
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/roster-mapping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roster_team_alias: alias }),
+      });
+      if (!res.ok) {
+        alert(`Couldn't save mapping (HTTP ${res.status}).`);
+        return;
+      }
+      await load();
+      onChanged && onChanged();
+    } finally {
+      setSavingSessionId(null);
+    }
+  };
+
   // ── Render ────────────────────────────────────────────────────────────
   const hasRoster = roster && roster.entries_loaded > 0;
   const warnings = roster?.warnings || {};
@@ -232,6 +258,83 @@ export default function RosterModal({ job, onClose, onChanged }) {
                 )}
               </ul>
             )}
+          </section>
+        )}
+
+        {/* ── Map team folders ───────────────────────────────────────── */}
+        {hasRoster && suggestions.items.length > 0 && (
+          <section style={{ marginBottom: 16 }}>
+            <h3 style={{ marginBottom: 8 }}>
+              Map team folders ({suggestions.items.length})
+            </h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Folder names that don't match the CSV's team column. Map each
+              one to its CSV team and the mismatch flags for that folder
+              clear. Mappings survive roster re-uploads.
+            </p>
+            {suggestions.items.map((it) => {
+              const sug = it.suggestion;
+              const busy = savingSessionId === it.session_id;
+              return (
+                <div key={it.session_id} className="roster-row">
+                  <div className="row-between" style={{ alignItems: 'baseline' }}>
+                    <div>
+                      <b>{it.session_name}</b>
+                      {it.current_alias && (
+                        <>
+                          {' '}→{' '}
+                          <span className="muted">currently mapped to</span>{' '}
+                          <b>{it.current_alias}</b>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {sug && !it.current_alias && (
+                    <p className="muted" style={{ marginTop: 4 }}>
+                      Suggested: <b>{sug.suggested_team_name}</b>{' '}
+                      ({sug.winning_clusters}/{sug.mapped_clusters} player
+                      {sug.mapped_clusters === 1 ? '' : 's'} in this folder
+                      belong to that team){' '}
+                      <button
+                        className="primary"
+                        disabled={busy}
+                        onClick={() => saveMapping(it.session_id, sug.suggested_team_name)}
+                      >
+                        Accept
+                      </button>
+                    </p>
+                  )}
+                  <div className="actions" style={{ gap: 8, marginTop: 6 }}>
+                    <select
+                      defaultValue={it.current_alias || ''}
+                      disabled={busy}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === '') return;
+                        saveMapping(it.session_id, v);
+                      }}
+                    >
+                      <option value="">
+                        {it.current_alias ? 'Change to…' : 'Pick a CSV team…'}
+                      </option>
+                      {suggestions.available_teams.map((t) => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                    {it.current_alias && (
+                      <button
+                        className="ghost"
+                        disabled={busy}
+                        onClick={() => saveMapping(it.session_id, null)}
+                      >
+                        Clear mapping
+                      </button>
+                    )}
+                    {busy && <span className="muted">Saving…</span>}
+                  </div>
+                </div>
+              );
+            })}
           </section>
         )}
 

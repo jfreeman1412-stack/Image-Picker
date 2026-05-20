@@ -37,8 +37,11 @@ def _warnings_for(db: DbSession, job_id: int) -> dict:
         .distinct()
         .all()
     )
+    # Effective norm: respect roster_team_alias (Phase 6.1 mapping) so a
+    # session the user has already mapped to a CSV team isn't flagged as
+    # "missing from roster" — it isn't, it's just named differently.
     session_pairs = [
-        (s.name, normalize_name(s.name))
+        (s.name, normalize_name(s.roster_team_alias or s.name))
         for s in db.query(Session).filter_by(job_id=job_id).all()
     ]
     session_norms = {n for _, n in session_pairs}
@@ -108,6 +111,28 @@ def get_roster(job_id: int, db: DbSession = Depends(get_db)):
         .order_by(RosterEntry.id.asc())
         .all()
     )
+    # CSV teams (raw, deduped + sorted) — drive the mapping dropdown.
+    seen: set[str] = set()
+    csv_teams: list[str] = []
+    for e in entries:
+        if e.norm_team not in seen:
+            seen.add(e.norm_team)
+            csv_teams.append(e.team_name)
+    csv_teams.sort(key=str.lower)
+
+    sessions_out = [
+        {
+            "id": s.id,
+            "name": s.name,
+            "archived": bool(s.archived),
+            "roster_team_alias": s.roster_team_alias,
+        }
+        for s in db.query(Session)
+            .filter_by(job_id=job_id)
+            .order_by(Session.id.asc())
+            .all()
+    ]
+
     return {
         "entries_loaded": len(entries),
         "entries": [
@@ -115,6 +140,8 @@ def get_roster(job_id: int, db: DbSession = Depends(get_db)):
             for e in entries
         ],
         "distinct_teams": len({e.norm_team for e in entries}),
+        "csv_teams": csv_teams,         # for mapping dropdown
+        "sessions": sessions_out,        # id, name, archived, current alias
         "warnings": _warnings_for(db, job_id) if entries else {
             "unmatched_csv_teams": [],
             "sessions_missing_from_roster": [],
@@ -198,6 +225,92 @@ def list_mismatches(job_id: int, db: DbSession = Depends(get_db)):
                 "target_session_reviewed": bool(target_sess.reviewed) if target_sess else False,
             })
     return {"items": items}
+
+
+# ── Phase 6.1: folder ↔ CSV-team suggestions ────────────────────────────────
+
+
+def _suggest_alias_for_session(
+    session: Session, lookup: dict[str, str], raw_team_by_norm: dict[str, str],
+) -> dict | None:
+    """Vote-tally suggestion for a session whose folder doesn't match any
+    roster team. For each cluster, look up its auto_label in the roster
+    and tally the CSV team it maps to. If one team wins ≥60% of mapped
+    clusters AND there are ≥3 mapped clusters, return a suggestion dict.
+
+    Returns None when the signal isn't strong enough (no mapped clusters,
+    tied vote, weak majority). The user maps manually in that case.
+    """
+    votes: dict[str, int] = {}
+    total = 0
+    for c in session.clusters:
+        total += 1
+        if not c.auto_label:
+            continue
+        norm = normalize_name(c.auto_label)
+        if not norm:
+            continue
+        expected = lookup.get(norm)
+        if expected is None:
+            continue  # unknown name OR ambiguous (dup) — abstain
+        votes[expected] = votes.get(expected, 0) + 1
+    mapped = sum(votes.values())
+    if mapped < 3:
+        return None
+    winner, win_count = max(votes.items(), key=lambda kv: kv[1])
+    share = win_count / mapped
+    if share < 0.6:
+        return None
+    return {
+        "suggested_team_name": raw_team_by_norm.get(winner, winner),
+        "suggested_norm_team": winner,
+        "confidence": round(share, 3),
+        "winning_clusters": win_count,
+        "mapped_clusters": mapped,
+        "total_clusters": total,
+    }
+
+
+@router.get("/{job_id}/roster-folder-suggestions")
+def folder_suggestions(job_id: int, db: DbSession = Depends(get_db)):
+    """For each session whose folder doesn't normalize-match any roster
+    team and isn't already mapped via roster_team_alias, propose the best
+    CSV team based on content-vote across its clusters' auto_labels.
+
+    Sessions whose folder ALREADY matches the roster (or are aliased to
+    something that matches) are omitted — no mapping is needed.
+    """
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    lookup = build_lookup(db, job_id)
+    if not lookup:
+        return {"items": [], "available_teams": []}
+
+    raw_team_by_norm: dict[str, str] = {}
+    for r in db.query(RosterEntry.team_name, RosterEntry.norm_team).filter_by(
+        job_id=job_id,
+    ).all():
+        raw_team_by_norm.setdefault(r.norm_team, r.team_name)
+
+    available = sorted(raw_team_by_norm.values())
+    roster_norms = set(raw_team_by_norm.keys())
+
+    items = []
+    for s in db.query(Session).filter_by(job_id=job_id).all():
+        if s.archived:
+            continue
+        effective = session_norm_team(s)  # honors existing alias
+        if effective in roster_norms:
+            continue  # already covered (by folder name OR existing alias)
+        suggestion = _suggest_alias_for_session(s, lookup, raw_team_by_norm)
+        items.append({
+            "session_id": s.id,
+            "session_name": s.name,
+            "current_alias": s.roster_team_alias,
+            "suggestion": suggestion,   # None if no strong signal
+        })
+    return {"items": items, "available_teams": available}
 
 
 @router.delete("/{job_id}/roster")

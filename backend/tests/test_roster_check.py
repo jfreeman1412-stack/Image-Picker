@@ -108,6 +108,49 @@ def test_player_on_wrong_team_flagged(db):
     assert cluster_is_mismatched(c, session_norm_team(s), lookup) is True
 
 
+def test_alias_overrides_folder_name_when_set(db):
+    """Phase 6.1: with an alias, a folder named '10U Black' counts as the
+    CSV's '10U-Black-Softball' for the mismatch check."""
+    c, s, lookup = _setup(
+        db, session_team="10U Black",   # short folder name
+        cluster_auto_label="Eleanor-Pederson",
+        roster=[("Eleanor-Pederson", "10U-Black-Softball")],
+    )
+    # Without alias, the names disagree → cluster would be flagged.
+    assert cluster_is_mismatched(c, session_norm_team(s), lookup) is True
+    # With alias set to the CSV's long-form team, they agree → no flag.
+    s.roster_team_alias = "10U-Black-Softball"
+    db.commit()
+    assert cluster_is_mismatched(c, session_norm_team(s), lookup) is False
+
+
+def test_alias_normalized_same_way_as_folder(db):
+    """Alias goes through normalize_name just like Session.name does."""
+    c, s, lookup = _setup(
+        db, session_team="10U Black",
+        cluster_auto_label="Eleanor-Pederson",
+        roster=[("Eleanor-Pederson", "10U-Black-Softball")],
+    )
+    # Spaces/punctuation in the stored alias don't matter — same norm.
+    s.roster_team_alias = "10u black softball"
+    db.commit()
+    assert cluster_is_mismatched(c, session_norm_team(s), lookup) is False
+
+
+def test_alias_cleared_falls_back_to_folder_name(db):
+    c, s, lookup = _setup(
+        db, session_team="10U Black",
+        cluster_auto_label="Eleanor-Pederson",
+        roster=[("Eleanor-Pederson", "10U-Black-Softball")],
+    )
+    s.roster_team_alias = "10U-Black-Softball"
+    db.commit()
+    assert cluster_is_mismatched(c, session_norm_team(s), lookup) is False
+    s.roster_team_alias = None     # clear
+    db.commit()
+    assert cluster_is_mismatched(c, session_norm_team(s), lookup) is True
+
+
 def test_team_normalization_accepts_format_differences(db):
     """Folder name and CSV team can differ in punctuation/case — same norm."""
     c, s, lookup = _setup(

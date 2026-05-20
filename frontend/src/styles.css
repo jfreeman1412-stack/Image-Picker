@@ -1247,6 +1247,12 @@ button.danger-btn:hover:not(:disabled) { background: #dc2626; }
 }
 
 /* ── Roster modal: one row per cross-team mismatch ────────────────────── */
+.roster-modal {
+  /* Long mismatch lists overflow the viewport. Cap height and scroll
+   * inside the panel so the close button stays reachable. */
+  max-height: 88vh;
+  overflow-y: auto;
+}
 .roster-modal h3 {
   margin: 14px 0 8px;
   font-size: 14px;
