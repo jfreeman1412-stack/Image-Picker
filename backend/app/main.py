@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import sessions, clusters, images, jobs, roster, settings
+from app.api import sessions, clusters, cluster_move, images, jobs, roster, settings
 from app.db import init_db
 
 
@@ -59,6 +59,7 @@ app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
 app.include_router(roster.router, prefix="/api/jobs", tags=["roster"])
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(clusters.router, prefix="/api/sessions", tags=["clusters"])
+app.include_router(cluster_move.router, prefix="/api/clusters", tags=["cluster-move"])
 app.include_router(images.router, prefix="/api/images", tags=["images"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
