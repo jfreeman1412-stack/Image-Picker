@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models. Schema is the source of truth in ARCHITECTURE.md."""
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Float, ForeignKey, LargeBinary,
+    Column, Integer, String, DateTime, Float, ForeignKey, Index, LargeBinary,
     PrimaryKeyConstraint,
 )
 from sqlalchemy.orm import relationship
@@ -35,6 +35,9 @@ class Job(Base):
     export_result = Column(String, nullable=True)           # JSON: final stats
 
     sessions = relationship("Session", back_populates="job", cascade="all, delete-orphan")
+    roster_entries = relationship(
+        "RosterEntry", back_populates="job", cascade="all, delete-orphan"
+    )
 
 
 class Session(Base):
@@ -135,6 +138,26 @@ class ImageRole(Base):
     cluster_id = Column(Integer, ForeignKey("clusters.id"))
     role = Column(String)  # team | panoramic | individual | buddy | rejected
     manual_override = Column(Integer, default=0)  # 0 | 1; if 1, pipeline must not overwrite
+
+
+class RosterEntry(Base):
+    """One row per (job, player) from the per-job roster CSV. Same CSV the
+    photographer used to write copyright tags into the camera, so matching
+    Cluster.auto_label against norm_name is strict equality after
+    normalize_name(). norm_team matches normalize_name(Session.name)."""
+    __tablename__ = "roster_entries"
+    __table_args__ = (
+        Index("ix_roster_entries_job_norm_name", "job_id", "norm_name"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    raw_name = Column(String, nullable=False)    # "Eleanor-Pederson" — as in CSV
+    norm_name = Column(String, nullable=False)   # "eleanorpederson" — lookup key
+    team_name = Column(String, nullable=False)   # "10U-Black-Softball" — as in CSV
+    norm_team = Column(String, nullable=False)   # "10ublacksoftball" — matches norm(session.name)
+
+    job = relationship("Job", back_populates="roster_entries")
 
 
 class Setting(Base):
