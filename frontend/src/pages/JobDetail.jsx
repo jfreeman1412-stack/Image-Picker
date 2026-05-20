@@ -18,6 +18,11 @@ export default function JobDetail() {
   const [showArchived, setShowArchived] = useState(false);
   const [toast, setToast] = useState(null);
   const [confirm, setConfirm] = useState(null); // {session}
+  // Destructive-action gate for "Run pipeline on all teams" (Phase 9 safety).
+  // Populated when the backend returns 409 with the impact dict; cleared
+  // when the user cancels or confirms.
+  const [runAllImpact, setRunAllImpact] = useState(null);
+  const [runAllConfirmText, setRunAllConfirmText] = useState('');
 
   const load = () => {
     const q = showArchived ? '?include_archived=true' : '';
@@ -50,11 +55,52 @@ export default function JobDetail() {
 
   if (!job) return <div className="page">Loading…</div>;
 
+  const postRunAll = async (force) => {
+    const res = await fetch(`/api/jobs/${id}/run-all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: !!force }),
+    });
+    return res;
+  };
+
   const runAll = async () => {
     setRunning(true);
-    await fetch(`/api/jobs/${id}/run-all`, { method: 'POST' });
-    setRunning(false);
-    load();
+    try {
+      const res = await postRunAll(false);
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        const detail = body?.detail;
+        if (detail?.error === 'destructive_run_all') {
+          setRunAllImpact(detail);
+          setRunAllConfirmText('');
+          return;     // wait for the confirm dialog
+        }
+      }
+      if (!res.ok) {
+        alert(`Couldn't start (HTTP ${res.status}).`);
+        return;
+      }
+      load();
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const confirmRunAllForce = async () => {
+    setRunning(true);
+    try {
+      const res = await postRunAll(true);
+      if (!res.ok) {
+        alert(`Couldn't start (HTTP ${res.status}).`);
+        return;
+      }
+      setRunAllImpact(null);
+      setRunAllConfirmText('');
+      load();
+    } finally {
+      setRunning(false);
+    }
   };
 
   const archiveJob = async () => {
@@ -223,6 +269,70 @@ export default function JobDetail() {
           onAction={toast.onAction || (() => {})}
           onClose={() => setToast(null)}
         />
+      )}
+
+      {runAllImpact && (
+        <div className="modal-backdrop" onClick={() => setRunAllImpact(null)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <h2>Re-run pipeline on every team?</h2>
+            <p className="muted">
+              This deletes existing clusters, role decisions, and manual
+              labels for every team in <b>{runAllImpact.job_name}</b>.
+              {' '}<b>This cannot be undone.</b>
+            </p>
+            <ul className="confirm-impact">
+              {runAllImpact.impact.reviewed_teams > 0 && (
+                <li>
+                  <b>{runAllImpact.impact.reviewed_teams}</b> team
+                  {runAllImpact.impact.reviewed_teams === 1 ? '' : 's'} marked
+                  reviewed
+                </li>
+              )}
+              {runAllImpact.impact.manual_labels > 0 && (
+                <li>
+                  <b>{runAllImpact.impact.manual_labels}</b> manually-renamed
+                  cluster{runAllImpact.impact.manual_labels === 1 ? '' : 's'}
+                </li>
+              )}
+              {runAllImpact.impact.manual_coach_overrides > 0 && (
+                <li>
+                  <b>{runAllImpact.impact.manual_coach_overrides}</b> manual
+                  coach/player override
+                  {runAllImpact.impact.manual_coach_overrides === 1 ? '' : 's'}
+                </li>
+              )}
+              {runAllImpact.impact.manual_role_decisions > 0 && (
+                <li>
+                  <b>{runAllImpact.impact.manual_role_decisions}</b> manual
+                  TEAM/PANO/role pick
+                  {runAllImpact.impact.manual_role_decisions === 1 ? '' : 's'}
+                </li>
+              )}
+            </ul>
+            <p className="muted">
+              Type the job name <code>{runAllImpact.job_name}</code> to confirm:
+            </p>
+            <input
+              autoFocus
+              value={runAllConfirmText}
+              onChange={(e) => setRunAllConfirmText(e.target.value)}
+              placeholder={runAllImpact.job_name}
+              style={{ width: '100%', marginBottom: 8 }}
+            />
+            <div className="actions" style={{ justifyContent: 'flex-end' }}>
+              <button onClick={() => { setRunAllImpact(null); setRunAllConfirmText(''); }}>
+                Cancel
+              </button>
+              <button
+                className="danger-btn"
+                disabled={runAllConfirmText !== runAllImpact.job_name || running}
+                onClick={confirmRunAllForce}
+              >
+                {running ? 'Starting…' : 'Re-run all teams'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

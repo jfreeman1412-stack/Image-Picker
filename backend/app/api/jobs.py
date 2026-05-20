@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
@@ -426,14 +426,89 @@ def delete_job(job_id: int, db: DbSession = Depends(get_db)):
 # ── Run all sessions in a job ─────────────────────────────────────────────────
 
 
+class RunAllRequest(BaseModel):
+    # Phase 9 follow-up safety guard: `run-all` calls `_clear_prior_results`
+    # for every session, which deletes Faces, Clusters, and ImageRoles —
+    # including manual_override=1 picks the user made by hand. To prevent
+    # accidental wipes, callers must pass force=true if the job has any
+    # existing review work (manual labels, role decisions, coach overrides,
+    # or reviewed-status). The frontend hits the endpoint without force
+    # first, gets a 409 + impact summary back, shows a type-the-job-name
+    # confirm dialog, and only then retries with force=true.
+    force: bool = False
+
+
+def _runall_impact(db: DbSession, session_ids: list[int]) -> dict:
+    """Count the manual review work in scope of a run-all wipe.
+    Each non-zero counter is real work the user did that would be lost."""
+    if not session_ids:
+        return {
+            "reviewed_teams": 0, "manual_labels": 0,
+            "manual_coach_overrides": 0, "manual_role_decisions": 0,
+        }
+    reviewed_teams = (
+        db.query(Session)
+        .filter(Session.id.in_(session_ids), Session.reviewed == 1)
+        .count()
+    )
+    manual_labels = (
+        db.query(Cluster)
+        .filter(Cluster.session_id.in_(session_ids),
+                Cluster.manual_label.isnot(None))
+        .count()
+    )
+    manual_coach = (
+        db.query(Cluster)
+        .filter(Cluster.session_id.in_(session_ids),
+                Cluster.manual_coach_override != 0)
+        .count()
+    )
+    manual_roles = (
+        db.query(ImageRole)
+        .join(Image, ImageRole.image_id == Image.id)
+        .filter(Image.session_id.in_(session_ids),
+                ImageRole.manual_override == 1)
+        .count()
+    )
+    return {
+        "reviewed_teams": reviewed_teams,
+        "manual_labels": manual_labels,
+        "manual_coach_overrides": manual_coach,
+        "manual_role_decisions": manual_roles,
+    }
+
+
 @router.post("/{job_id}/run-all")
-def run_all(job_id: int, background: BackgroundTasks, db: DbSession = Depends(get_db)):
+def run_all(
+    job_id: int,
+    background: BackgroundTasks,
+    payload: RunAllRequest | None = Body(default=None),
+    db: DbSession = Depends(get_db),
+):
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
+    payload = payload or RunAllRequest()
 
     # Archived sessions are skipped entirely — not run, not counted.
     session_ids = [s.id for s in job.sessions if not s.archived]
+
+    if not payload.force:
+        impact = _runall_impact(db, session_ids)
+        if any(impact.values()):
+            # 409 with the impact dict so the UI can surface exact counts
+            # in its confirm dialog — "X reviewed teams + Y manual picks
+            # will be deleted, type the job name to proceed".
+            raise HTTPException(409, detail={
+                "error": "destructive_run_all",
+                "message": (
+                    "Running the pipeline on all teams deletes existing "
+                    "clusters, role decisions, and manual labels for "
+                    "every team in this job."
+                ),
+                "impact": impact,
+                "job_name": job.name,
+            })
 
     def _run_all():
         for sid in session_ids:

@@ -107,6 +107,31 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
         db.commit()
         stage_start = _log_stage(session.name, "detecting", stage_start)
 
+        # Phase 9 safety guard: if detection produced zero faces across the
+        # *entire* session (when there were images to check), don't silently
+        # progress to 'done' with zero clusters. The common cause is source
+        # files being unreachable (UNC share disconnected, folder renamed
+        # post-ingest). Mark 'error' so the UI surfaces it instead of
+        # painting the team as successful but empty.
+        faces_count = (
+            db.query(Face).join(Image)
+            .filter(Image.session_id == session_id).count()
+        )
+        if faces_count == 0 and total > 0:
+            logger.error(
+                "[pipeline] team %s: 0 faces detected across %d images — "
+                "marking session 'error' (verify source images are accessible).",
+                session.name, total,
+            )
+            session.status = "error"
+            session.progress_stage = None
+            session.progress_current = 0
+            session.progress_total = 0
+            session.pipeline_finished_at = datetime.utcnow()
+            db.commit()
+            return
+
+
         # ── Step 3–4: cluster all face embeddings ────────────────────────────
         _set_progress(db, session, "clustering", 0, 0)
         faces = (

@@ -147,6 +147,58 @@ def test_auto_run_chains_pipeline_per_session(client, tmp_path, monkeypatch):
     assert client.get(f"/api/jobs/{jid}/ingest-status").json()["status"] == "done"
 
 
+def _seed_manual_work(SessionLocal, job_id, *, reviewed=False,
+                       manual_label=False, manual_coach=False,
+                       manual_role=False):
+    """Inject one (or more) pieces of manual review work into a job so the
+    run-all destructive-action gate has something to flag."""
+    from app.models.db_models import Cluster, Image, ImageRole, Session
+    db = SessionLocal()
+    try:
+        sess = db.query(Session).filter_by(job_id=job_id).first()
+        if reviewed:
+            sess.reviewed = 1
+        c = Cluster(
+            session_id=sess.id, image_count=0,
+            manual_label="Renamed" if manual_label else None,
+            manual_coach_override=1 if manual_coach else 0,
+        )
+        db.add(c); db.flush()
+        if manual_role:
+            img = db.query(Image).filter_by(session_id=sess.id).first()
+            if img is None:
+                img = Image(session_id=sess.id, path="/tmp/x.png", filename="x.png")
+                db.add(img); db.flush()
+            db.add(ImageRole(image_id=img.id, cluster_id=c.id, role="team",
+                             manual_override=1))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_run_all_impact_reports_all_four_counters(client, tmp_path, monkeypatch):
+    """The 409 detail's `impact` dict carries each counter independently so
+    the UI can build a precise confirm dialog."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *_a: None)
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    _seed_manual_work(
+        jobs_module.SessionLocal, jid,
+        reviewed=True, manual_label=True,
+        manual_coach=True, manual_role=True,
+    )
+    res = client.post(f"/api/jobs/{jid}/run-all")
+    assert res.status_code == 409
+    impact = res.json()["detail"]["impact"]
+    assert impact["reviewed_teams"] == 1
+    assert impact["manual_labels"] >= 1   # the manual_role seed adds a 2nd cluster
+    assert impact["manual_coach_overrides"] >= 1
+    assert impact["manual_role_decisions"] == 1
+
+
 def test_auto_run_false_does_not_chain_pipeline(client, tmp_path, monkeypatch):
     called = []
     monkeypatch.setattr(
@@ -159,3 +211,136 @@ def test_auto_run_false_does_not_chain_pipeline(client, tmp_path, monkeypatch):
         "has_lines": False, "image_subfolder_name": None, "auto_run": False,
     })
     assert called == []
+
+
+# ── Phase 9 follow-up: destructive run-all force gate ─────────────────────
+
+
+def test_run_all_proceeds_when_no_manual_work(client, tmp_path, monkeypatch):
+    """Sessions exist but no reviewed / no manual roles / no renames —
+    run-all kicks off normally, no 409."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *a, **k: None)
+    # Create a job from scratch via the API so the client fixture's
+    # overridden SessionLocal is the one populated.
+    root = _make_job_tree(tmp_path, ["TeamA", "TeamB"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    r = client.post(f"/api/jobs/{jid}/run-all")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "running"
+    assert body["session_count"] == 2
+
+
+def test_run_all_blocks_when_reviewed_team_exists(client, tmp_path, monkeypatch):
+    """Any reviewed=1 session in the job → 409 with destructive_run_all."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *a, **k: None)
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    # Mark the session reviewed directly in the same SessionLocal the client uses.
+    SL = jobs_module.SessionLocal
+    from app.models.db_models import Session as DbSessionModel
+    db = SL()
+    try:
+        s = db.query(DbSessionModel).filter_by(job_id=jid).first()
+        s.reviewed = 1
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/jobs/{jid}/run-all")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["detail"]["error"] == "destructive_run_all"
+    assert body["detail"]["impact"]["reviewed_teams"] == 1
+    assert body["detail"]["job_name"] == "J"
+
+
+def test_run_all_blocks_when_manual_label_exists(client, tmp_path, monkeypatch):
+    """Cluster.manual_label set → 409. Same gate, different signal."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *a, **k: None)
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    from app.models.db_models import Cluster, Session as DbSessionModel
+    SL = jobs_module.SessionLocal
+    db = SL()
+    try:
+        s = db.query(DbSessionModel).filter_by(job_id=jid).first()
+        db.add(Cluster(session_id=s.id, manual_label="Renamed!",
+                       image_count=1))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/jobs/{jid}/run-all")
+    assert r.status_code == 409
+    assert r.json()["detail"]["impact"]["manual_labels"] == 1
+
+
+def test_run_all_blocks_when_manual_role_exists(client, tmp_path, monkeypatch):
+    """ImageRole.manual_override=1 anywhere → 409."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *a, **k: None)
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    from app.models.db_models import (
+        Cluster, Image, ImageRole, Session as DbSessionModel,
+    )
+    SL = jobs_module.SessionLocal
+    db = SL()
+    try:
+        s = db.query(DbSessionModel).filter_by(job_id=jid).first()
+        c = Cluster(session_id=s.id, image_count=1)
+        db.add(c); db.commit(); db.refresh(c)
+        i = Image(session_id=s.id, path="/tmp/x.png", filename="x.png")
+        db.add(i); db.commit(); db.refresh(i)
+        db.add(ImageRole(image_id=i.id, cluster_id=c.id, role="team",
+                         manual_override=1))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/jobs/{jid}/run-all")
+    assert r.status_code == 409
+    assert r.json()["detail"]["impact"]["manual_role_decisions"] == 1
+
+
+def test_run_all_force_proceeds_through_gate(client, tmp_path, monkeypatch):
+    """Same destructive setup as the prior test, but force=true bypasses
+    the 409 and the pipeline kicks off normally."""
+    called = []
+    monkeypatch.setattr(jobs_module, "run_pipeline",
+                        lambda bg, sid: called.append(sid))
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    SL = jobs_module.SessionLocal
+    from app.models.db_models import Session as DbSessionModel
+    db = SL()
+    try:
+        db.query(DbSessionModel).filter_by(job_id=jid).update({"reviewed": 1})
+        db.commit()
+    finally:
+        db.close()
+
+    # Without force → 409
+    r = client.post(f"/api/jobs/{jid}/run-all")
+    assert r.status_code == 409
+
+    # With force → proceeds
+    r = client.post(f"/api/jobs/{jid}/run-all", json={"force": True})
+    assert r.status_code == 200
+    assert r.json()["status"] == "running"
+    assert len(called) == 1     # pipeline kicked off for the team
