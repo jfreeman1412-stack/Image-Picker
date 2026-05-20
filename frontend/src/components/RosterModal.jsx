@@ -20,6 +20,8 @@ export default function RosterModal({ job, onClose, onChanged }) {
   const [roster, setRoster] = useState(null);          // GET /roster body | null
   const [mismatches, setMismatches] = useState([]);    // items array
   const [suggestions, setSuggestions] = useState({ items: [], available_teams: [] });
+  const [coverage, setCoverage] = useState([]);  // [{session_id, session_name, report}, ...]
+  const [expanded, setExpanded] = useState(new Set());  // session_ids whose detail rows are open
   const [savingSessionId, setSavingSessionId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -45,6 +47,25 @@ export default function RosterModal({ job, onClose, onChanged }) {
       const r3 = await fetch(`/api/jobs/${job.id}/roster-folder-suggestions`);
       if (!r3.ok) throw new Error(`Couldn't load folder suggestions (HTTP ${r3.status}).`);
       setSuggestions(await r3.json());
+
+      // Coverage report per session. One round-trip per non-archived
+      // session — could be batched into a job-level aggregator later, but
+      // the count is small (~30) and the call is cheap.
+      const sessionList = (job.sessions || []).filter(s => !s.archived);
+      const coverageResults = [];
+      for (const s of sessionList) {
+        try {
+          const r = await fetch(`/api/sessions/${s.id}/roster-coverage`);
+          if (!r.ok) continue;
+          const body = await r.json();
+          coverageResults.push({
+            session_id: s.id,
+            session_name: s.name,
+            report: body,
+          });
+        } catch { /* skip — informational only */ }
+      }
+      setCoverage(coverageResults);
     } catch (e) {
       setError(e.message || String(e));
     } finally {
@@ -335,6 +356,92 @@ export default function RosterModal({ job, onClose, onChanged }) {
                 </div>
               );
             })}
+          </section>
+        )}
+
+        {/* ── Coverage by team (Phase 9 Section 5) ─────────────────── */}
+        {hasRoster && coverage.length > 0 && (
+          <section style={{ marginBottom: 16 }}>
+            <h3 style={{ marginBottom: 8 }}>Coverage by team</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              For each team that has a matching roster, how many expected
+              players the pipeline actually identified. Click a row to expand
+              names. Updates as the pipeline finishes each team.
+            </p>
+            {coverage
+              .filter(c => c.report.expected_players.length > 0)
+              .sort((a, b) => {
+                // Sort: teams with missing players first, then by name.
+                const am = a.report.missing_players.length;
+                const bm = b.report.missing_players.length;
+                if (am !== bm) return bm - am;
+                return a.session_name.localeCompare(b.session_name);
+              })
+              .map(({ session_id, session_name, report }) => {
+                const expected = report.expected_players.length;
+                const present = report.present_players.length;
+                const missing = report.missing_players.length;
+                const unident = report.unidentified_clusters.length;
+                const isOpen = expanded.has(session_id);
+                const toggle = () => {
+                  const next = new Set(expanded);
+                  if (next.has(session_id)) next.delete(session_id);
+                  else next.add(session_id);
+                  setExpanded(next);
+                };
+                return (
+                  <div key={session_id} className="roster-row">
+                    <button
+                      onClick={toggle}
+                      className="ghost"
+                      style={{ width: '100%', textAlign: 'left', padding: 0, background: 'transparent', border: 'none' }}
+                    >
+                      <div className="row-between" style={{ alignItems: 'baseline' }}>
+                        <div>
+                          <b>{session_name}</b>{' '}
+                          <span className="muted">
+                            {present} of {expected} found
+                            {missing > 0 && <> · <span style={{ color: 'var(--warn)' }}>{missing} missing</span></>}
+                            {unident > 0 && <> · {unident} unidentified cluster{unident === 1 ? '' : 's'}</>}
+                          </span>
+                        </div>
+                        <span className="muted">{isOpen ? '▾' : '▸'}</span>
+                      </div>
+                    </button>
+                    {isOpen && (
+                      <div style={{ marginTop: 8 }}>
+                        {missing > 0 && (
+                          <p className="muted" style={{ margin: '4px 0' }}>
+                            <b>Missing:</b>{' '}
+                            {report.missing_players.map(m => m.raw_name).join(', ')}
+                          </p>
+                        )}
+                        {report.extra_clusters.length > 0 && (
+                          <p className="muted" style={{ margin: '4px 0' }}>
+                            <b>Extras:</b>{' '}
+                            {report.extra_clusters.map(c => (
+                              c.roster_team_raw
+                                ? `${c.label} (roster says ${c.roster_team_raw})`
+                                : `${c.label} (not on roster)`
+                            )).join('; ')}
+                          </p>
+                        )}
+                        {unident > 0 && (
+                          <p className="muted" style={{ margin: '4px 0' }}>
+                            <b>{unident}</b> cluster{unident === 1 ? '' : 's'} with no
+                            copyright tag — couldn't be matched to the roster.
+                          </p>
+                        )}
+                        {missing === 0 && report.extra_clusters.length === 0 && unident === 0 && (
+                          <p className="muted" style={{ margin: '4px 0' }}>
+                            ✓ Every roster player accounted for, no extras.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
           </section>
         )}
 

@@ -20,10 +20,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db, SessionLocal
-from app.models.db_models import Cluster, ImageRole, Session
+from app.models.db_models import Cluster, ImageRole, RosterEntry, Session
 from app.services.eta import eta_seconds
 from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
+from app.services.roster import normalize_name
+from app.services.roster_check import session_norm_team
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +305,126 @@ def set_roster_mapping(
     s.roster_team_alias = alias
     db.commit()
     return {"session_id": s.id, "roster_team_alias": s.roster_team_alias}
+
+
+# ── Phase 9: per-team roster coverage report ──────────────────────────────────
+
+
+@router.get("/{session_id}/roster-coverage")
+def roster_coverage(session_id: int, db: DbSession = Depends(get_db)):
+    """Compare this session's clusters against the roster's expected players
+    for the effective team (via Phase 6.1 alias OR folder name).
+
+    Returns four buckets so the UI can show:
+      - expected_players      : roster rows for this team
+      - present_players       : roster players matched to a cluster's auto_label
+      - missing_players       : expected − present  ("X didn't get photographed")
+      - extra_clusters        : clusters whose auto_label maps to a different
+                                team in the roster OR isn't in the roster at all
+      - unidentified_clusters : clusters with no auto_label (blank copyright)
+
+    No-roster case: all buckets empty, expected_team_raw = session.name. The
+    UI is expected to hide the section when expected_players is empty.
+    """
+    s = db.query(Session).get(session_id)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+
+    effective_norm = session_norm_team(s)
+    expected_raw = s.roster_team_alias or s.name
+
+    # Roster for this team. If the session belongs to a jobless legacy row,
+    # the join below returns no rows — graceful no-op.
+    expected_rows: list[RosterEntry] = []
+    if s.job_id is not None:
+        expected_rows = (
+            db.query(RosterEntry)
+            .filter(RosterEntry.job_id == s.job_id,
+                    RosterEntry.norm_team == effective_norm)
+            .order_by(RosterEntry.raw_name.asc())
+            .all()
+        )
+
+    expected_norms = {r.norm_name for r in expected_rows}
+
+    # Build a job-wide lookup norm_name -> (norm_team, raw_team) for resolving
+    # extras (clusters whose label maps to a different team in this job).
+    job_roster: list[RosterEntry] = []
+    if s.job_id is not None:
+        job_roster = db.query(RosterEntry).filter_by(job_id=s.job_id).all()
+    by_norm_name: dict[str, tuple[str, str]] = {}
+    for r in job_roster:
+        # If a name appears on multiple teams, leave it ambiguous (None) so
+        # we don't claim a single team for it. Matches Phase 6 lookup
+        # abstain rule.
+        if r.norm_name in by_norm_name:
+            by_norm_name[r.norm_name] = (None, None)
+        else:
+            by_norm_name[r.norm_name] = (r.norm_team, r.team_name)
+    # Drop the ambiguous markers — they behave like "no match" for extras.
+    by_norm_name = {k: v for k, v in by_norm_name.items() if v[0] is not None}
+
+    present: list[dict] = []
+    extra_clusters: list[dict] = []
+    unidentified_clusters: list[dict] = []
+    matched_norms: set[str] = set()
+
+    for c in s.clusters:
+        label = (c.auto_label or "").strip()
+        if not label:
+            unidentified_clusters.append({
+                "cluster_id": c.id,
+                "image_count": c.image_count or 0,
+            })
+            continue
+        norm = normalize_name(label)
+        if not norm:
+            unidentified_clusters.append({
+                "cluster_id": c.id,
+                "image_count": c.image_count or 0,
+            })
+            continue
+        if norm in expected_norms:
+            # Find the roster row to pick a canonical raw_name for display.
+            raw_name = next(
+                (r.raw_name for r in expected_rows if r.norm_name == norm), label,
+            )
+            present.append({
+                "raw_name": raw_name,
+                "cluster_id": c.id,
+                "image_count": c.image_count or 0,
+            })
+            matched_norms.add(norm)
+        else:
+            other = by_norm_name.get(norm)
+            extra_clusters.append({
+                "cluster_id": c.id,
+                "label": c.display_label(),
+                "image_count": c.image_count or 0,
+                # raw team name if the player is on the roster for a
+                # DIFFERENT team; None if the player isn't on the roster
+                # at all.
+                "roster_team_raw": other[1] if other else None,
+            })
+
+    missing_players = [
+        {"raw_name": r.raw_name}
+        for r in expected_rows
+        if r.norm_name not in matched_norms
+    ]
+
+    return {
+        "expected_team_norm": effective_norm,
+        "expected_team_raw": expected_raw,
+        "expected_players": [
+            {"raw_name": r.raw_name, "norm_name": r.norm_name}
+            for r in expected_rows
+        ],
+        "present_players": present,
+        "missing_players": missing_players,
+        "extra_clusters": extra_clusters,
+        "unidentified_clusters": unidentified_clusters,
+    }
 
 
 # ── Archive / delete ──────────────────────────────────────────────────────────
