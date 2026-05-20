@@ -433,6 +433,23 @@ def test_aggregator_null_target_session_when_team_not_in_job(db):
     assert row["expected_team_name"] == "Nonexistent-Team"
 
 
+def test_aggregator_includes_source_image_ids(db):
+    """Frontend uses source_image_ids to drive the 'Reject as stray' loop
+    without a follow-up fetch."""
+    job, src, tgt = _job_with_two_sessions(db,
+                                            source_name="10U-Black-Softball",
+                                            target_name="11UA-Baseball")
+    src_c = _cluster_with_images(db, src, label="Eleanor-Pederson",
+                                 image_count=3, base_filename="eleanor_s")
+    replace_job_roster(db, job.id, [("Eleanor-Pederson", "11UA-Baseball")])
+    db.commit()
+
+    row = list_mismatches(job.id, db)["items"][0]
+    img_ids = {f.image_id for f in db.query(Face).filter_by(cluster_id=src_c.id).all()}
+    assert set(row["source_image_ids"]) == img_ids
+    assert len(row["source_image_ids"]) == 3
+
+
 def test_aggregator_reports_target_reviewed_state(db):
     job, src, tgt = _job_with_two_sessions(db,
                                             source_name="10U-Black-Softball",

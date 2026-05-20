@@ -1245,3 +1245,20 @@ button.danger-btn:hover:not(:disabled) { background: #dc2626; }
   background: var(--accent-bg);
   box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.18);
 }
+
+/* ── Roster modal: one row per cross-team mismatch ────────────────────── */
+.roster-modal h3 {
+  margin: 14px 0 8px;
+  font-size: 14px;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.roster-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--bg-elev-2);
+}
+.roster-row:last-child { margin-bottom: 0; }

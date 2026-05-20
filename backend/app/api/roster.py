@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
-from app.models.db_models import Cluster, Job, RosterEntry, Session
+from app.models.db_models import Cluster, Face, Job, RosterEntry, Session
 from app.services.roster import (
     CsvParseError, build_lookup, decode_bytes, get_duplicate_names,
     normalize_name, parse_csv, replace_job_roster,
@@ -182,12 +182,16 @@ def list_mismatches(job_id: int, db: DbSession = Depends(get_db)):
                     target_cluster_id = matches[0].id
                 # 0 or 2+ → leave null; panel surfaces only 'Create new'.
 
+            image_ids = sorted({
+                f.image_id for f in db.query(Face).filter_by(cluster_id=c.id).all()
+            })
             items.append({
                 "source_session_id": s.id,
                 "source_session_name": s.name,
                 "source_cluster_id": c.id,
                 "source_cluster_label": c.display_label(),
                 "source_image_count": c.image_count or 0,
+                "source_image_ids": image_ids,   # for "Reject as stray" client loop
                 "expected_team_name": raw_team_by_norm.get(expected_norm, expected_norm),
                 "target_session_id": target_sess.id if target_sess else None,
                 "target_cluster_id": target_cluster_id,

@@ -5,12 +5,15 @@ import PipelineProgress from '../components/PipelineProgress.jsx';
 import CardMenu from '../components/CardMenu.jsx';
 import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
+import RosterModal from '../components/RosterModal.jsx';
 
 export default function JobDetail() {
   const { id } = useParams();
   const nav = useNavigate();
   const [job, setJob] = useState(null);
   const [exporting, setExporting] = useState(false);
+  const [showRoster, setShowRoster] = useState(false);
+  const [rosterSummary, setRosterSummary] = useState(null); // {entries_loaded, mismatch_count}
   const [running, setRunning] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [toast, setToast] = useState(null);
@@ -20,7 +23,22 @@ export default function JobDetail() {
     const q = showArchived ? '?include_archived=true' : '';
     return fetch(`/api/jobs/${id}${q}`).then(r => r.json()).then(setJob);
   };
-  useEffect(() => { load(); }, [id, showArchived]);
+  // Lightweight roster summary for the header button. Failures here mustn't
+  // break the page — degrade silently.
+  const loadRosterSummary = async () => {
+    try {
+      const r1 = await fetch(`/api/jobs/${id}/roster`);
+      const r2 = await fetch(`/api/jobs/${id}/roster-mismatches`);
+      if (!r1.ok || !r2.ok) return;
+      const rj = await r1.json();
+      const mj = await r2.json();
+      setRosterSummary({
+        entries_loaded: rj.entries_loaded || 0,
+        mismatch_count: (mj.items || []).length,
+      });
+    } catch { /* leave summary null — button just shows generic label */ }
+  };
+  useEffect(() => { load(); loadRosterSummary(); }, [id, showArchived]);
 
   useEffect(() => {
     if (!job) return;
@@ -98,6 +116,14 @@ export default function JobDetail() {
           <button onClick={runAll} disabled={running}>
             {running ? 'Kicking off…' : 'Run pipeline on all teams'}
           </button>
+          <button
+            onClick={() => setShowRoster(true)}
+            title="Upload roster CSV and review cross-team mismatches"
+          >
+            {rosterSummary?.entries_loaded > 0
+              ? `Roster · ${rosterSummary.mismatch_count} mismatch${rosterSummary.mismatch_count === 1 ? '' : 'es'}`
+              : 'Upload roster'}
+          </button>
           <button onClick={() => setExporting(true)}>Export job</button>
           {job.archived
             ? <button className="ghost" onClick={unarchiveJob}>Unarchive job</button>
@@ -167,6 +193,14 @@ export default function JobDetail() {
       </div>
 
       {exporting && <ExportModal job={job} onClose={() => setExporting(false)} />}
+
+      {showRoster && (
+        <RosterModal
+          job={job}
+          onClose={() => setShowRoster(false)}
+          onChanged={() => { loadRosterSummary(); load(); }}
+        />
+      )}
 
       {confirm && (
         <ConfirmModal
