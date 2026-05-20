@@ -5,7 +5,7 @@ python-multipart==0.0.12
 
 # CV / ML
 insightface==0.7.3
-onnxruntime==1.19.2
+onnxruntime-gpu==1.19.2  # Phase 8: GPU acceleration. Requires CUDA 12.x runtime + cuDNN 9.x. Falls back to CPU automatically if CUDA can't init (see face_detector.py).
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 scikit-learn==1.5.2

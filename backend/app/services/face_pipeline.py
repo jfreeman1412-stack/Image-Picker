@@ -17,6 +17,7 @@ is fine; agent can move to RQ/Celery later if needed.
 import json
 import logging
 import statistics
+import time
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -46,6 +47,17 @@ def _set_progress(db: DbSession, session: Session, stage: str, current: int, tot
     db.commit()
 
 
+def _log_stage(session_name: str, stage: str, start: float) -> float:
+    """Emit one `[pipeline] team X: <stage>: T.Ts` line and return a fresh
+    monotonic clock for the next stage. WARNING level so uvicorn's default
+    filter doesn't swallow it — matches the [ingest]/[export] log style."""
+    logger.warning(
+        "[pipeline] team %s: %s: %.1fs",
+        session_name, stage, time.monotonic() - start,
+    )
+    return time.monotonic()
+
+
 def run_pipeline(db: DbSession, session_id: int) -> None:
     """Run the full pipeline for one session. Idempotent: clears prior results."""
     session = db.query(Session).get(session_id)
@@ -57,10 +69,19 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
     session.progress_stage_started_at = None  # _set_progress will stamp it
     _set_progress(db, session, "starting", 0, 0)
 
+    # Phase 8: arm a one-shot log on the first detect_faces of this run so
+    # we can see at a glance whether CUDA or CPU is actually serving the
+    # detection session — catches a silent fallback before we even look
+    # at timing numbers.
+    face_detector.arm_run_provider_check()
+
+    pipeline_start = time.monotonic()
+
     try:
         _clear_prior_results(db, session_id)
 
         # ── Step 1–2: detect faces, persist Face rows ────────────────────────
+        stage_start = time.monotonic()
         images = db.query(Image).filter_by(session_id=session_id).all()
         total = len(images)
         _set_progress(db, session, "detecting", 0, total)
@@ -84,6 +105,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
             else:
                 session.progress_current = i
         db.commit()
+        stage_start = _log_stage(session.name, "detecting", stage_start)
 
         # ── Step 3–4: cluster all face embeddings ────────────────────────────
         _set_progress(db, session, "clustering", 0, 0)
@@ -116,6 +138,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
                     label_to_cluster[label] = cluster_row
                 face.cluster_id = cluster_row.id
             db.commit()
+        stage_start = _log_stage(session.name, "clustering", stage_start)
 
         # ── Step 4b: coach detection ────────────────────────────────────────
         _set_progress(db, session, "coach_check", 0, 0)
@@ -148,6 +171,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
         for c in session.clusters:
             c.is_likely_coach = 1 if coach_flags.get(c.id, False) else 0
         db.commit()
+        stage_start = _log_stage(session.name, "coach_check", stage_start)
 
         # ── Step 4c: copyright auto-labeling ────────────────────────────────
         _set_progress(db, session, "labeling", 0, 0)
@@ -174,6 +198,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
                 c.needs_review = 1
                 c.review_reason = "ambiguous_copyright"
         db.commit()
+        stage_start = _log_stage(session.name, "labeling", stage_start)
 
         # ── Step 5: classify expression per face ─────────────────────────────
         total_faces = len(faces)
@@ -196,6 +221,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
             else:
                 session.progress_current = i
         db.commit()
+        stage_start = _log_stage(session.name, "classifying", stage_start)
 
         # ── Step 6–7: assign roles per cluster ───────────────────────────────
         db.refresh(session)
@@ -205,6 +231,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
             _sort_cluster(db, c)
             session.progress_current = i
         db.commit()
+        stage_start = _log_stage(session.name, "sorting", stage_start)
 
         # ── Step 8: outlier flagging across clusters ─────────────────────────
         sizes = {c.id: (c.image_count or 0) for c in session.clusters}
@@ -215,6 +242,12 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
                 c.needs_review = 1
                 c.review_reason = f.reason
         db.commit()
+        _log_stage(session.name, "flagging", stage_start)
+
+        logger.warning(
+            "[pipeline] team %s: TOTAL: %.1fs",
+            session.name, time.monotonic() - pipeline_start,
+        )
 
         session.status = "done"
         session.pipeline_finished_at = datetime.utcnow()
