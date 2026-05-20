@@ -482,6 +482,10 @@ def _unique_path(target: Path) -> Path:
 class ExportJobRequest(BaseModel):
     mode: str = "copy"  # "copy" | "move"
     overwrite: bool = True
+    # Phase 9: user-pickable export destination. Absolute path (UNC ok).
+    # When None, falls back to the legacy `<root>_sorted` sibling layout
+    # so existing callers / wizard runs continue to work unchanged.
+    destination_path: str | None = None
 
 
 _ROLE_PRIORITY = {
@@ -619,7 +623,18 @@ def _copy_one(src: Path, website_dst: Path, secondary_dst: Optional[Path],
         shutil.copy2(str(website_dst), str(secondary_dst))
 
 
-def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
+def _resolve_out_root(root: Path, destination_path: str | None) -> Path:
+    """Pick the export destination: user-provided absolute path, or the
+    legacy `<root>_sorted` sibling so older callers keep working."""
+    if destination_path:
+        return Path(destination_path)
+    return root.parent / f"{root.name}_sorted"
+
+
+def _run_export(
+    job_id: int, mode: str, overwrite: bool,
+    destination_path: str | None = None,
+) -> None:
     """Background task: the actual copy/move, updating Job.export_* as it
     goes so the modal can show a live bar + ETA."""
     with SessionLocal() as db:
@@ -627,7 +642,7 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
         if job is None:
             return
         root = Path(job.root_path)
-        out_root = root.parent / f"{root.name}_sorted"
+        out_root = _resolve_out_root(root, destination_path)
         try:
             # rmtree is slow over UNC — instead rename any stale out_root to
             # a sidecar and delete it in a background thread so the export
@@ -760,7 +775,7 @@ def export_job(
         raise HTTPException(409, "An export is already running for this job")
 
     root = Path(job.root_path)
-    out_root = root.parent / f"{root.name}_sorted"
+    out_root = _resolve_out_root(root, payload.destination_path)
     # 409 must be synchronous so the user gets it immediately, not via polling.
     if out_root.exists() and not payload.overwrite:
         raise HTTPException(409, f"Output exists: {out_root}")
@@ -777,7 +792,10 @@ def export_job(
     job.export_result = None
     db.commit()
 
-    background.add_task(_run_export, job.id, payload.mode, payload.overwrite)
+    background.add_task(
+        _run_export, job.id, payload.mode, payload.overwrite,
+        payload.destination_path,
+    )
     return {"job_id": job.id, "export_total": total}
 
 

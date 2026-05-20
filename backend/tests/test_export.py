@@ -84,10 +84,12 @@ def _build_job(SL, tmp_path, *, job_name="Test Job", team_specs):
     return jid, root
 
 
-def _export(client, jid, mode="copy", overwrite=True):
+def _export(client, jid, mode="copy", overwrite=True, destination_path=None):
     """POST then poll once (bg task already ran under TestClient)."""
-    r = client.post(f"/api/jobs/{jid}/export",
-                     json={"mode": mode, "overwrite": overwrite})
+    body = {"mode": mode, "overwrite": overwrite}
+    if destination_path is not None:
+        body["destination_path"] = destination_path
+    r = client.post(f"/api/jobs/{jid}/export", json=body)
     return r
 
 
@@ -248,6 +250,56 @@ def test_overwrite_true_replaces(ctx):
     _export(client, jid, overwrite=True)
     assert not stale.exists()
     assert (out_root / "To_be_Cropped" / "T" / "a.jpg").exists()
+
+
+def test_destination_path_overrides_default_location(ctx):
+    """Phase 9: user-picked destination wins; legacy <root>_sorted is NOT created."""
+    client, SL, tmp_path = ctx
+    jid, root = _build_job(SL, tmp_path, team_specs=[{"name": "T", "images": [
+        {"filename": "a.jpg", "role": "individual"}]}])
+    legacy = root.parent / f"{root.name}_sorted"
+    picked = tmp_path / "custom" / "exports" / "MyTrip"
+    _export(client, jid, destination_path=str(picked))
+    # Output lands in the picked path…
+    assert (picked / "To_be_Cropped" / "T" / "a.jpg").exists()
+    # …and the legacy sibling path is NOT created.
+    assert not legacy.exists()
+
+
+def test_destination_path_works_when_target_missing_parents(ctx):
+    """Picked destination several levels deep is auto-created (existing
+    mkdir(parents=True) handles this)."""
+    client, SL, tmp_path = ctx
+    jid, root = _build_job(SL, tmp_path, team_specs=[{"name": "T", "images": [
+        {"filename": "a.jpg", "role": "individual"}]}])
+    picked = tmp_path / "a" / "b" / "c" / "out"
+    assert not picked.exists()
+    _export(client, jid, destination_path=str(picked))
+    assert (picked / "To_be_Cropped" / "T" / "a.jpg").exists()
+
+
+def test_destination_path_none_preserves_legacy_default(ctx):
+    """Omitting destination_path keeps the original <root>_sorted behavior
+    so older callers (and unmodified UIs) continue working unchanged."""
+    client, SL, tmp_path = ctx
+    jid, root = _build_job(SL, tmp_path, team_specs=[{"name": "T", "images": [
+        {"filename": "a.jpg", "role": "individual"}]}])
+    res = _export(client, jid)
+    assert res.status_code == 200
+    legacy = root.parent / f"{root.name}_sorted"
+    assert (legacy / "To_be_Cropped" / "T" / "a.jpg").exists()
+
+
+def test_destination_path_409_when_exists_and_no_overwrite(ctx):
+    """Picked destination already populated + overwrite=False → 409 sync."""
+    client, SL, tmp_path = ctx
+    jid, _ = _build_job(SL, tmp_path, team_specs=[{"name": "T", "images": [
+        {"filename": "a.jpg", "role": "individual"}]}])
+    picked = tmp_path / "out"
+    picked.mkdir()
+    (picked / "leftover.txt").write_text("x")
+    r = _export(client, jid, overwrite=False, destination_path=str(picked))
+    assert r.status_code == 409
 
 
 def test_overwrite_false_existing_returns_409_synchronously(ctx):
