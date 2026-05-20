@@ -13,6 +13,7 @@ locations (see _read_png_metadata). JPEG/TIFF stay on the exifread path.
 """
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -48,12 +49,15 @@ def ingest_folder(db: DbSession, session_id: int, folder: Path) -> int:
     if session is None:
         raise ValueError(f"Session {session_id} not found")
 
+    start = time.monotonic()
     paths = [
         p for p in sorted(folder.iterdir())
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
     ]
     if not paths:
         db.commit()
+        logger.info("[ingest] team %s: 0 files in %.1fs",
+                    session.name, time.monotonic() - start)
         return 0
 
     # executor.map preserves input order, so Image rows land in folder order.
@@ -71,6 +75,8 @@ def ingest_folder(db: DbSession, session_id: int, folder: Path) -> int:
         for path, (capture_time, copyright_tag) in zip(paths, exifs)
     ])
     db.commit()
+    logger.info("[ingest] team %s: %d files in %.1fs",
+                session.name, len(paths), time.monotonic() - start)
     return len(paths)
 
 

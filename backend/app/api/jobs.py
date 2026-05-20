@@ -18,6 +18,8 @@ DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 import json
 import logging
 import shutil
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -569,6 +571,41 @@ def _allocate_dests(srcs: list[Path], target_dir: Path) -> list[Path]:
     return out
 
 
+def _clear_out_root(out_root: Path) -> None:
+    """Make out_root empty without paying the UNC rmtree cost up front.
+
+    - Missing → nothing to do.
+    - Empty   → reuse as-is (no rename, no delete).
+    - Has content → rename to a `.deleting-<timestamp>` sidecar (a sibling
+      path; rename is near-instant on the same volume), then `shutil.rmtree`
+      the sidecar from a daemon thread so the export can start immediately.
+      Background failures are logged, not raised — even a partial cleanup
+      doesn't compromise the export, since the sidecar is no longer on the
+      live output path.
+    """
+    if not out_root.exists():
+        return
+    try:
+        next(out_root.iterdir())  # has at least one entry
+    except StopIteration:
+        return                    # empty — leave it alone
+
+    stale = out_root.parent / (
+        f"{out_root.name}.deleting-{datetime.utcnow():%Y%m%d-%H%M%S-%f}"
+    )
+    out_root.rename(stale)
+    logger.info("[export] queued background cleanup of %s", stale)
+
+    def _bg_delete() -> None:
+        try:
+            shutil.rmtree(stale, ignore_errors=True)
+        except Exception:  # noqa: BLE001 — background, swallow + log
+            logger.exception("[export] background cleanup failed for %s", stale)
+
+    threading.Thread(target=_bg_delete, daemon=True,
+                     name=f"export-cleanup-{stale.name}").start()
+
+
 def _copy_one(src: Path, website_dst: Path, secondary_dst: Optional[Path],
               mode: str) -> None:
     """One image's full export. The TEAM/PANO secondary copy reads from
@@ -592,10 +629,11 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
         root = Path(job.root_path)
         out_root = root.parent / f"{root.name}_sorted"
         try:
-            # rmtree can itself be slow over the network share — do it here,
-            # not in the request, so the modal already shows "working".
-            if out_root.exists() and overwrite:
-                shutil.rmtree(out_root)
+            # rmtree is slow over UNC — instead rename any stale out_root to
+            # a sidecar and delete it in a background thread so the export
+            # starts copying immediately.
+            if overwrite:
+                _clear_out_root(out_root)
 
             website_root = out_root / "To_be_Cropped"
             team_root = out_root / "Team Images"
@@ -616,6 +654,8 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
             for session in to_export:
                 job.export_current_team = session.name
                 db.commit()
+                session_start = time.monotonic()
+                session_copied_start = files_copied
                 safe_team = _safe_dirname(session.name)
                 website_team = website_root / safe_team
                 team_team = team_root / safe_team
@@ -675,6 +715,11 @@ def _run_export(job_id: int, mode: str, overwrite: bool) -> None:
 
                 job.export_progress = files_copied
                 db.commit()
+                logger.info(
+                    "[export] session %s: %d files copied in %.1fs",
+                    session.name, files_copied - session_copied_start,
+                    time.monotonic() - session_start,
+                )
 
             job.export_status = "done"
             job.export_current_team = None
