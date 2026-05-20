@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import FolderBrowser from './FolderBrowser.jsx';
 
 function fmtDuration(secs) {
   if (secs == null) return '—';
@@ -16,7 +17,10 @@ export default function ExportModal({ job, onClose }) {
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
 
-  const expectedOutput = job.root_path.replace(/[\\/]+$/, '') + '_sorted';
+  // Default = legacy <root>_sorted; user can override via Browse or by typing.
+  const legacyDefault = job.root_path.replace(/[\\/]+$/, '') + '_sorted';
+  const [destination, setDestination] = useState(legacyDefault);
+  const [showPicker, setShowPicker] = useState(false);
 
   useEffect(() => () => clearInterval(pollRef.current), []);
 
@@ -37,10 +41,15 @@ export default function ExportModal({ job, onClose }) {
 
   const submit = async () => {
     setError(null);
+    // Only send destination_path when the user actually customized it.
+    // Sending legacyDefault verbatim is harmless but unnecessary.
+    const body = { mode, overwrite };
+    const trimmed = (destination || '').trim();
+    if (trimmed && trimmed !== legacyDefault) body.destination_path = trimmed;
     const res = await fetch(`/api/jobs/${job.id}/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode, overwrite }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       // 409 (output exists / already running), 400, etc. — synchronous.
@@ -63,10 +72,25 @@ export default function ExportModal({ job, onClose }) {
     <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
       <div className="modal-panel" onClick={e => e.stopPropagation()}>
         <h2>Export job</h2>
-        <p className="muted">Output: <code>{expectedOutput}</code></p>
 
         {phase === 'form' && (
           <>
+            <div className="form-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+              <label style={{ marginBottom: 4 }}>Destination</label>
+              <div className="actions" style={{ gap: 8 }}>
+                <input
+                  type="text"
+                  value={destination}
+                  onChange={(e) => setDestination(e.target.value)}
+                  style={{ flex: 1 }}
+                  placeholder="Where to copy / move the sorted output"
+                />
+                <button className="ghost" onClick={() => setShowPicker(true)}>Browse…</button>
+              </div>
+              <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                Defaults to <code>{legacyDefault}</code> (a sibling of the job folder).
+              </p>
+            </div>
             <div className="form-row">
               <label>
                 <input type="radio" name="mode" value="copy"
@@ -83,14 +107,22 @@ export default function ExportModal({ job, onClose }) {
               <label>
                 <input type="checkbox" checked={overwrite}
                        onChange={e => setOverwrite(e.target.checked)} />
-                Overwrite if {expectedOutput} already exists
+                Overwrite if the destination already exists
               </label>
             </div>
             {error && <p className="error">{error}</p>}
             <div className="actions">
               <button className="ghost" onClick={onClose}>Cancel</button>
-              <button onClick={submit}>Export</button>
+              <button onClick={submit} disabled={!destination.trim()}>Export</button>
             </div>
+            {showPicker && (
+              <FolderBrowser
+                title="Choose export destination"
+                initialPath={destination || legacyDefault}
+                onPick={(p) => setDestination(p)}
+                onClose={() => setShowPicker(false)}
+              />
+            )}
           </>
         )}
 

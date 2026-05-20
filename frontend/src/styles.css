@@ -1246,6 +1246,45 @@ button.danger-btn:hover:not(:disabled) { background: #dc2626; }
   box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.18);
 }
 
+/* ── Folder picker (FolderBrowser.jsx) ───────────────────────────────── */
+.folder-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.folder-crumb {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 3px 6px;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+}
+.folder-crumb:hover { background: var(--bg-elev-3); border-color: var(--border); }
+.folder-sep { color: var(--text-dim); padding: 0 1px; }
+
+.folder-entry {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.folder-entry:hover {
+  background: var(--bg-elev-3);
+  border-color: var(--border);
+}
+
 /* ── Roster modal: one row per cross-team mismatch ────────────────────── */
 .roster-modal {
   /* Long mismatch lists overflow the viewport. Cap height and scroll
