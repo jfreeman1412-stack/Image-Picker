@@ -27,6 +27,10 @@ KNOWN_FLAGS = [
     "no_pano_pick",
     "coach_no_solo_image",
     "empty_cluster",
+    # Phase 6: cluster's auto_label resolves to a roster row whose team
+    # differs from this session's team. Computed at read time in
+    # /clusters (not stored on Cluster.review_reason).
+    "roster_mismatch",
 ]
 
 _FLAG_VIS_KEY = "flag_visibility"

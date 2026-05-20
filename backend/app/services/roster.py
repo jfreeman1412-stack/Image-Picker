@@ -130,6 +130,30 @@ def lookup_expected_team(
     return rows[0].norm_team
 
 
+def build_lookup(db: DbSession, job_id: int) -> dict[str, str]:
+    """Bulk-fetch this job's roster into a `{norm_name: norm_team}` dict.
+
+    Names appearing on multiple teams are intentionally OMITTED so callers
+    that do `lookup.get(norm)` get `None` for both unknown names and
+    ambiguous names — both abstain cases collapse to a single check.
+    Empty dict if the job has no roster, which is how Phase 6 stays a
+    no-op when roster data isn't uploaded.
+    """
+    teams_by_name: dict[str, set[str]] = {}
+    rows = (
+        db.query(RosterEntry.norm_name, RosterEntry.norm_team)
+        .filter(RosterEntry.job_id == job_id)
+        .all()
+    )
+    for nn, nt in rows:
+        teams_by_name.setdefault(nn, set()).add(nt)
+    return {
+        nn: next(iter(teams))
+        for nn, teams in teams_by_name.items()
+        if len(teams) == 1
+    }
+
+
 def get_duplicate_names(db: DbSession, job_id: int) -> list[str]:
     """Raw names that map to more than one team in this job's roster.
     Used by the upload response so the user sees them as warnings."""

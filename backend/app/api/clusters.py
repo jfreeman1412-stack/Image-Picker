@@ -15,6 +15,10 @@ from app.db import get_db
 from app.models.db_models import Session, Cluster, Face, Image, ImageRole
 from app.services.face_pipeline import _sort_cluster
 from app.services.outliers import flag_outliers
+from app.services.roster import build_lookup
+from app.services.roster_check import (
+    add_roster_flag, cluster_is_mismatched, session_norm_team,
+)
 from app.api.settings import get_flag_visibility_map, filter_visible_reasons
 
 router = APIRouter()
@@ -44,6 +48,10 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
         raise HTTPException(404, "Session not found")
 
     flag_vis = get_flag_visibility_map(db)
+    # Roster lookup is per-job. Empty dict → no roster uploaded → mismatch
+    # check is a no-op (see roster_check.cluster_is_mismatched).
+    roster_lookup = build_lookup(db, s.job_id) if s.job_id else {}
+    sess_norm = session_norm_team(s)
 
     out = []
     for c in s.clusters:
@@ -68,7 +76,12 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
                 "manual_override": manual,
             })
 
-        visible_reasons = filter_visible_reasons(c.review_reason, flag_vis)
+        # Read-time roster_mismatch splice. Never persisted on
+        # Cluster.review_reason — roster can be uploaded/cleared without
+        # re-running the pipeline.
+        mismatched = cluster_is_mismatched(c, sess_norm, roster_lookup)
+        combined_reason = add_roster_flag(c.review_reason, mismatched)
+        visible_reasons = filter_visible_reasons(combined_reason, flag_vis)
         out.append({
             "cluster_id": c.id,
             "label": c.display_label(),
@@ -77,7 +90,7 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
             # yellow badge off visible_review_reasons so hiding all of a
             # cluster's flags visually clears it.
             "needs_review": bool(c.needs_review),
-            "review_reason": c.review_reason,
+            "review_reason": combined_reason,
             "visible_review_reasons": visible_reasons,
             "is_likely_coach": bool(c.is_likely_coach),
             "is_coach_for_sort": c.is_coach_for_sort(),
