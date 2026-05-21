@@ -6,12 +6,14 @@ plus per-shoot `PlayerMembership` rows. Distinct from the Phase 6 `RosterEntry`
 """
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.db import Base
-from app.models.db_models import Job, Player, PlayerMembership
+from app.db import Base, get_db
+from app.main import app
+from app.models.db_models import Job, Player, PlayerMembership, Session
 from app.services.players import (
     is_coach_name, load_shoot_roster_from_text, replace_shoot_memberships,
     upsert_player,
@@ -250,3 +252,168 @@ def test_load_service_unknown_job_404(db):
     with pytest.raises(HTTPException) as exc:
         load_shoot_roster_from_text(db, 99999, SAMPLE_CSV)
     assert exc.value.status_code == 404
+
+
+# ── Section 3: HTTP endpoints ─────────────────────────────────────────────
+
+@pytest.fixture
+def client(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'players-http.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine)
+
+    def _override():
+        s = TestingSessionLocal()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    app.dependency_overrides[get_db] = _override
+    try:
+        # Seed two jobs (two shoots) + a couple sessions on the first, parity
+        # with test_roster.py and so cross-shoot identity is testable over HTTP.
+        seed = TestingSessionLocal()
+        try:
+            job_a = Job(name="Shoot A", root_path="/tmp", has_lines=0)
+            job_b = Job(name="Shoot B", root_path="/tmp", has_lines=0)
+            seed.add_all([job_a, job_b]); seed.commit()
+            seed.refresh(job_a); seed.refresh(job_b)
+            for t in ("10U-Black-Softball", "11UA-Baseball"):
+                seed.add(Session(job_id=job_a.id, name=t,
+                                 source_path=f"/tmp/{t}", status="done"))
+            seed.commit()
+            job_a_id, job_b_id = job_a.id, job_b.id
+        finally:
+            seed.close()
+        c = TestClient(app)
+        c.job_a_id = job_a_id
+        c.job_b_id = job_b_id
+        yield c
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_endpoint_upload_get_delete_round_trip(client):
+    job_id = client.job_a_id
+    res = client.post(
+        f"/api/players/roster/{job_id}",
+        files={"file": ("roster.csv", SAMPLE_CSV.encode("utf-8"), "text/csv")},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["memberships_loaded"] == 8
+    assert body["coaches"] == 1
+    assert body["players_created"] == 8
+
+    res = client.get(f"/api/players/roster/{job_id}")
+    assert res.status_code == 200
+    listing = res.json()
+    assert listing["memberships_loaded"] == 8
+    assert len(listing["items"]) == 8
+    coach_items = [i for i in listing["items"] if i["is_coach"]]
+    assert len(coach_items) == 1
+    assert coach_items[0]["name"] == "Coach-10UBlack-SB"
+
+    res = client.delete(f"/api/players/roster/{job_id}")
+    assert res.status_code == 200
+    assert res.json()["deleted"] == 8
+
+    res = client.get(f"/api/players/roster/{job_id}")
+    assert res.json()["memberships_loaded"] == 0
+
+
+def test_endpoint_upload_unknown_job_404(client):
+    res = client.post(
+        "/api/players/roster/99999",
+        files={"file": ("r.csv", b"A,B\n", "text/csv")},
+    )
+    assert res.status_code == 404
+
+
+def test_endpoint_upload_malformed_rows_skipped(client):
+    job_id = client.job_a_id
+    csv_text = (
+        "Eleanor-Pederson,10U-Black-Softball\n"
+        "\n"                  # blank
+        "Lonely\n"            # short row
+        "June-Wampach,10U-Black-Softball\n"
+    )
+    res = client.post(
+        f"/api/players/roster/{job_id}",
+        files={"file": ("r.csv", csv_text.encode("utf-8"), "text/csv")},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["memberships_loaded"] == 2
+    assert body["entries_skipped"] > 0
+
+
+def test_endpoint_list_players_query_and_paging(client):
+    job_id = client.job_a_id
+    client.post(
+        f"/api/players/roster/{job_id}",
+        files={"file": ("roster.csv", SAMPLE_CSV.encode("utf-8"), "text/csv")},
+    )
+    # All 8 unique players.
+    res = client.get("/api/players")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 8
+    assert len(body["items"]) == 8
+    assert all("membership_count" in i for i in body["items"])
+
+    # ?q= filters by normalized substring.
+    res = client.get("/api/players", params={"q": "eleanor"})
+    body = res.json()
+    assert body["total"] == 1
+    assert body["items"][0]["name"] == "Eleanor-Pederson"
+    assert body["items"][0]["membership_count"] == 1
+
+    # ?limit/?offset pages (total stays the full match count).
+    res = client.get("/api/players", params={"limit": 3, "offset": 0})
+    body = res.json()
+    assert body["total"] == 8
+    assert len(body["items"]) == 3
+    res2 = client.get("/api/players", params={"limit": 3, "offset": 3})
+    assert len(res2.json()["items"]) == 3
+    # Disjoint pages.
+    page1_ids = {i["id"] for i in body["items"]}
+    page2_ids = {i["id"] for i in res2.json()["items"]}
+    assert page1_ids.isdisjoint(page2_ids)
+
+
+def test_endpoint_player_detail_cross_shoot(client):
+    """GET /api/players/{id} shows memberships across two uploaded shoots."""
+    job_a, job_b = client.job_a_id, client.job_b_id
+    client.post(
+        f"/api/players/roster/{job_a}",
+        files={"file": ("a.csv", b"Eleanor-Pederson,10U-Black-Softball\n", "text/csv")},
+    )
+    client.post(
+        f"/api/players/roster/{job_b}",
+        files={"file": ("b.csv", b"Eleanor-Pederson,Fall-Travel\n", "text/csv")},
+    )
+    # Find the (single) player id.
+    listing = client.get("/api/players", params={"q": "eleanor"}).json()
+    assert listing["total"] == 1
+    player_id = listing["items"][0]["id"]
+    assert listing["items"][0]["membership_count"] == 2
+
+    res = client.get(f"/api/players/{player_id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["name"] == "Eleanor-Pederson"
+    job_ids = {m["job_id"] for m in body["memberships"]}
+    assert job_ids == {job_a, job_b}
+    teams = {m["team"] for m in body["memberships"]}
+    assert teams == {"10U-Black-Softball", "Fall-Travel"}
+
+
+def test_endpoint_player_detail_unknown_404(client):
+    res = client.get("/api/players/99999")
+    assert res.status_code == 404
