@@ -5,13 +5,18 @@ plus per-shoot `PlayerMembership` rows. Distinct from the Phase 6 `RosterEntry`
 (roster cross-check) — see PHASE_A1_ROSTER_MODEL.md.
 """
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app.models.db_models import Job, Player, PlayerMembership
-from app.services.roster import normalize_name
+from app.services.players import (
+    is_coach_name, load_shoot_roster_from_text, replace_shoot_memberships,
+    upsert_player,
+)
+from app.services.roster import normalize_name, parse_csv
 
 
 # Real shape from the Princeton sample — same CSV format the Phase 6 roster
@@ -97,3 +102,151 @@ def test_job_cascade_deletes_memberships_keeps_players(db):
     db.delete(job); db.commit()
     assert db.query(PlayerMembership).count() == 0   # cascaded away
     assert db.query(Player).count() == 1             # Player survives
+
+
+# ── Section 2: coach detection ────────────────────────────────────────────
+
+def test_is_coach_name_detects_prefix():
+    assert is_coach_name("Coach-10UBlack-SB") is True
+    assert is_coach_name("coach-anybody") is True       # case-insensitive
+    assert is_coach_name("  Coach-Spaced  ") is True     # leading whitespace
+    assert is_coach_name("Eleanor-Pederson") is False
+    assert is_coach_name("Coachman-Lee") is False        # no hyphen after Coach
+    assert is_coach_name("Coach") is False               # no hyphen at all
+
+
+# ── Section 2: player identity / upsert ───────────────────────────────────
+
+def test_upsert_creates_then_reuses(db):
+    player1, created1 = upsert_player(db, "Eleanor-Pederson")
+    assert created1 is True
+    player2, created2 = upsert_player(db, "eleanor pederson")  # same norm
+    assert created2 is False
+    assert player2.id == player1.id
+    assert db.query(Player).count() == 1
+
+
+def test_upsert_keeps_first_seen_display_name(db):
+    p1, _ = upsert_player(db, "carter-Johanson")
+    p2, created = upsert_player(db, "Carter-Johanson")  # same norm, diff case
+    assert created is False
+    assert p2.id == p1.id
+    assert p2.display_name == "carter-Johanson"   # first-seen form preserved
+    assert db.query(Player).count() == 1
+
+
+def test_upsert_skips_empty_normalized_name(db):
+    player, created = upsert_player(db, "---")   # normalizes to ""
+    assert player is None
+    assert created is False
+    assert db.query(Player).count() == 0
+
+
+# ── Section 2: membership loading ─────────────────────────────────────────
+
+def test_load_one_membership_per_row_with_coach_flag(db):
+    job = _job(db)
+    summary = load_shoot_roster_from_text(db, job.id, SAMPLE_CSV)
+    assert summary["memberships_loaded"] == 8
+    assert summary["players_created"] == 8
+    assert summary["coaches"] == 1
+    assert summary["distinct_teams"] == 4
+    assert summary["entries_skipped"] == 0
+
+    coach_rows = db.query(PlayerMembership).filter_by(is_coach=1).all()
+    assert len(coach_rows) == 1
+    assert coach_rows[0].player.display_name == "Coach-10UBlack-SB"
+    # Everyone else is a player (is_coach=0).
+    assert db.query(PlayerMembership).filter_by(is_coach=0).count() == 7
+
+
+def test_cross_shoot_identity_one_player_two_memberships(db):
+    """The same name in two shoots → ONE Player, TWO memberships."""
+    job_a = _job(db, name="Shoot A")
+    job_b = _job(db, name="Shoot B")
+    csv_a = "Eleanor-Pederson,10U-Black-Softball\n"
+    csv_b = "Eleanor-Pederson,Fall-Travel\n"
+
+    sum_a = load_shoot_roster_from_text(db, job_a.id, csv_a)
+    sum_b = load_shoot_roster_from_text(db, job_b.id, csv_b)
+
+    assert sum_a["players_created"] == 1
+    assert sum_b["players_created"] == 0
+    assert sum_b["players_existing"] == 1   # reused from shoot A
+    assert db.query(Player).count() == 1
+    player = db.query(Player).one()
+    assert len(player.memberships) == 2
+    assert {m.job_id for m in player.memberships} == {job_a.id, job_b.id}
+
+
+def test_reupload_replaces_not_appends(db):
+    job = _job(db)
+    load_shoot_roster_from_text(db, job.id, SAMPLE_CSV)
+    load_shoot_roster_from_text(db, job.id, SAMPLE_CSV)   # same again
+    assert db.query(PlayerMembership).filter_by(job_id=job.id).count() == 8
+    assert db.query(Player).count() == 8   # not duplicated
+
+
+def test_reupload_one_shoot_does_not_touch_another(db):
+    job_a = _job(db, name="A")
+    job_b = _job(db, name="B")
+    load_shoot_roster_from_text(db, job_a.id, "Eleanor-Pederson,T1\n")
+    load_shoot_roster_from_text(db, job_b.id, "June-Wampach,T2\n")
+    # Re-upload A with a different roster; B must be untouched.
+    load_shoot_roster_from_text(db, job_a.id, "Quinn-Gentz,T1\n")
+
+    assert db.query(PlayerMembership).filter_by(job_id=job_b.id).count() == 1
+    assert db.query(Player).filter_by(norm_name="junewampach").count() == 1
+    # A's old player still exists (orphaned), B's intact.
+    assert db.query(Player).filter_by(norm_name="eleanorpederson").count() == 1
+
+
+def test_player_on_two_teams_same_shoot_two_memberships(db):
+    job = _job(db)
+    csv_text = "Jack-Smith,10U-Black-Softball\nJack-Smith,11UA-Baseball\n"
+    summary = load_shoot_roster_from_text(db, job.id, csv_text)
+    assert summary["memberships_loaded"] == 2
+    assert db.query(Player).count() == 1
+    assert db.query(PlayerMembership).filter_by(job_id=job.id).count() == 2
+
+
+def test_malformed_rows_skipped_and_counted(db):
+    job = _job(db)
+    csv_text = (
+        "Eleanor-Pederson,10U-Black-Softball\n"
+        "\n"                       # blank
+        "Lonely\n"                 # 1 col
+        "Solo,Cell,Extra\n"        # 3 cols
+        "June-Wampach,10U-Black-Softball\n"
+    )
+    summary = load_shoot_roster_from_text(db, job.id, csv_text)
+    assert summary["memberships_loaded"] == 2
+    assert summary["entries_skipped"] == 3
+
+
+def test_blank_normalized_name_row_skipped(db):
+    """A row that parses (non-empty cells) but normalizes to empty is counted
+    as rows_skipped_blank_name, not loaded as a membership."""
+    job = _job(db)
+    rows, _ = parse_csv("---,SomeTeam\nEleanor-Pederson,10U-Black-Softball\n")
+    summary = replace_shoot_memberships(db, job.id, rows)
+    db.commit()
+    assert summary["memberships_loaded"] == 1
+    assert summary["rows_skipped_blank_name"] == 1
+
+
+def test_load_service_job_cascade(db):
+    """db.delete(job) removes that job's memberships, leaves Players."""
+    job = _job(db)
+    load_shoot_roster_from_text(db, job.id, SAMPLE_CSV)
+    assert db.query(PlayerMembership).count() == 8
+
+    db.delete(job); db.commit()
+    assert db.query(PlayerMembership).count() == 0
+    assert db.query(Player).count() == 8   # global, survive the shoot
+
+
+def test_load_service_unknown_job_404(db):
+    with pytest.raises(HTTPException) as exc:
+        load_shoot_roster_from_text(db, 99999, SAMPLE_CSV)
+    assert exc.value.status_code == 404
