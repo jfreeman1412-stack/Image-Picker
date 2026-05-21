@@ -1,107 +1,141 @@
-# Phase A.3 — DONE
+# Phase A.4 — DONE
 
-Implemented `PHASE_A3_MATCHING_SERVICE.md` in full. Two sections, two commits,
-plus this summary. Branch: `phase-A1-overnight` (continued).
+Implemented `PHASE_A4_PIPELINE_INTEGRATION.md` in full. Five sections, five
+commits, plus this summary. Branch: **`phase-A4-overnight`** (cut from `main` at
+the A.4 hand-off doc commit `0af7209`).
+
+> **Heads-up:** a `git stash` entry (`WIP on main: 0af7209`) holds your earlier
+> uncommitted edits to `backend/app/api/jobs.py` and
+> `frontend/src/pages/JobWizard.jsx`. A.4 did **not** touch it — `git stash pop`
+> when you want them back.
 
 ## What got built
 
-The matching brain of the reference-photo system: given a face embedding (the
-kind `face_pipeline` produces during a shoot), return the best-matching `Player`
-above a confidence threshold, scored against **all** stored reference
-embeddings. **Purely additive and read-only** — one new service, one new router,
-one new test file, and a 2-line registration in `main.py`. **No new table, no
-migration** (A.3 computes over existing `ReferenceFace`/`Face` rows). The locked
-`face_detector.py` and `face_pipeline.py` were not touched — there is **no
-pipeline integration** (that's A.4); the only consumers are the tests and the
-debug endpoint.
+A.4 wires the A.3 matching brain into the shoot pipeline: during a sort, each
+cluster's faces are matched against the reference library, confident matches are
+labeled, uncertain ones flagged, and confident roster-coach matches feed coach
+detection. **Backend only** — match data is persisted and exposed via the
+existing `GET /clusters` API; no React (that's A.5). `face_detector.py` is
+untouched, and the matching stage loads **no model** (pure numpy over stored
+embeddings). All four locked decisions honored.
 
-### Section 1 — Matching core (`backend/app/services/matching.py`)
-- **Tunable module constants:** `HIGH_THRESHOLD = 0.6`, `LOW_THRESHOLD = 0.4`,
-  `MIN_MARGIN = 0.05`, `TOP_N_CANDIDATES = 5`.
-- `cosine_similarity(a, b)` — cosine on the vectors, normalizing defensively
-  (zero-vector guarded) so it's a dot product for the unit ArcFace embeddings
-  but still correct for a stray non-unit vector.
-- `_load_reference_index(db)` — bulk-loads every reference into a player-id
-  array + an (N, 512) matrix + a name map (the `guest_clusters`/`naming_errors`
-  pattern). Separated so A.4 can later cache/reuse it.
-- `match_embedding(db, embedding)` — the heart:
-  1. vectorized `sims = unit_matrix @ unit_query`;
-  2. **MAX over ALL of each player's references** (decision 4 — never
-     first-only), so the rule is correct today (one ref/player) and unchanged
-     when a player gains many;
-  3. rank distinct **players**;
-  4. tier via thresholds + the margin rule (margin compares the top two
-     **players**, so two refs of the same player never read as ambiguous).
-- Returns the documented result dict: `tier` (`high`/`low`/`none`), `reason`
-  (`auto_label`/`ambiguous_margin`/`low_confidence`/`no_match`), `needs_review`,
-  `player_id`, `player_name`, `score`, `margin`, `runner_up`, `candidates`.
-- **Float-boundary determinism:** comparisons use a `_EPS = 1e-6` tolerance so
-  the documented knife-edge cases (`score == 0.6` → high, `score == 0.4` → low,
-  `margin == 0.05` → high) resolve deterministically instead of flipping on
-  float32 round-off / the fact that `0.7 - 0.65 != 0.05` in IEEE floats. `_EPS`
-  is far below any calibration-meaningful difference. (This is the one
-  refinement beyond the hand-off's literal pseudocode — see note below.)
+### Section 1 — Matching-core extensions (`services/matching.py`)
+- `load_reference_index(db, *, player_ids=None)` → a reusable, pre-normalized
+  `ReferenceIndex` (player_ids / unit_matrix / name_by_player); optional roster
+  filter (empty set → empty index). Loaded once per session and reused.
+- `match_against_index(index, query_embeddings)` → scores a `(k, 512)` cluster
+  stack; per-player score = **MAX cosine over (faces × that player's
+  references)** (A.3 decision 4 generalized to multi-face). Shared `_build_result`
+  tiering helper.
+- `match_embedding(db, embedding)` preserved byte-for-byte as a thin wrapper —
+  A.3's 19 tests + `GET /api/matching/face/{id}` unchanged.
 
-### Section 2 — Debug API (`backend/app/api/matching.py`, registered in `main.py`)
-- `GET /api/matching/face/{face_id}` — reads the stored `Face.embedding`
-  (`np.frombuffer(..., float32)`), runs `match_embedding`, returns the result
-  dict plus a `thresholds` echo (`{high, low, margin}`) for legible calibration.
-  404 for an unknown face. Manual-inspection only; not wired into the pipeline.
+### Section 2 — Matching pipeline stage (`services/cluster_matching.py`, new)
+- `match_session_clusters(db, session)`: roster scope from
+  `PlayerMembership(job_id=session.job_id)` (all teams), else global fallback
+  (logs `[matching] No roster for job N — falling back to global match across M
+  references.`). Per cluster: store `match_scope` / `match_tier` /
+  `matched_player_id` / `match_confidence`; **high** → gap-fill `auto_label`
+  (source `"match"`) when no copyright, or `match_label_conflict` when copyright
+  disagrees (copyright wins), promote `is_likely_coach` for a roster-coach,
+  and log the team-mismatch sentence; **low** → `low_confidence_match` flag, no
+  label change; **none** → nothing. Empty cluster left untouched.
+
+### Section 3 — Pipeline wiring (`services/face_pipeline.py`)
+- New `matching` stage inserted **after `labeling`, before `classifying`** (so
+  coach promotion reaches `is_coach_for_sort()` during sorting). Labeling now
+  stamps `auto_label_source = "copyright"` when it sets a copyright label.
+  `progress_stage` doc updated; the zero-faces guard still short-circuits first.
+
+### Section 4 — Expose match data + validation gate
+- `KNOWN_FLAGS` gains `match_label_conflict`, `low_confidence_match`,
+  `match_team_mismatch`.
+- `roster_check.cluster_match_team_mismatch` + `add_match_team_mismatch_flag` —
+  read-time (high-tier match to a same-job, different-team player), mirroring
+  `roster_mismatch`/`duplicate_auto_label`.
+- `GET /clusters` adds an additive `match` block (`player_id`, `player_name`,
+  `confidence`, `tier`, `scope`, `roster_team`, `team_mismatch`) and splices the
+  read-time flag — **no existing field changed**.
+- `_compute_review_readiness` blocks "Mark reviewed" on a **visible**
+  `match_team_mismatch` (toggle off → informational), like `duplicate_auto_label`.
+
+### Section 5 — Global-match suggestion endpoint (`api/cluster_move.py`)
+- `POST /api/clusters/{cluster_id}/global-match-suggest`: read-only top-N global
+  matches (ignores roster scope), always tagged `scope: "global_fallback"`,
+  echoes thresholds. **Mutates nothing.** 404 unknown cluster; empty cluster →
+  clean `none`.
+
+## Schema (one migration, no new table)
+
+Five nullable columns added to `clusters` (model + the idempotent
+`_PHASE2_COLUMNS` ALTER mechanism in `db.py`): `matched_player_id`,
+`match_confidence`, `match_tier`, `match_scope`, `auto_label_source`. Verified
+the ALTER path adds them to a pre-A.4 `clusters` table (`MIGRATED_OK`).
+`matched_player_name` is derived at read time (not stored).
 
 ## Test count
 
-- **Baseline (Phase A.2): 384 passed** — confirmed (collection = 384) before any
-  change.
-- **New this phase: 19** in `backend/tests/test_matching.py` (Section 1: 16 —
-  cosine + every tier + both margin boundaries + both threshold boundaries + MAX
-  aggregation + same-player-not-ambiguous; Section 2: 3 — HTTP high / none / 404).
-  Slightly above the ~18 estimate.
-- **Final: 403 passed**, 0 failed. No existing test modified.
+- **Baseline (Phase A.3): 403 passed** — confirmed before any change.
+- **New this phase: 43** — Section 1: 6 (in `test_matching.py`); Section 2: 15
+  (`test_cluster_matching.py`); Section 3: 3 (`test_pipeline_matching.py`);
+  Section 4: 15 (`test_match_exposure.py`); Section 5: 4
+  (`test_global_match_suggest.py`).
+- **Final: 446 passed**, 0 failed. The only existing test file modified is
+  `test_matching.py` (extended per the hand-off — purely additive, no A.3 test
+  changed). `pytest -v` green after every section.
 
 ## Commits
 
 ```
-30744b9 phase A.3 section 2: matching debug API endpoint
-1c69eb6 phase A.3 section 1: cosine matching service with tiered thresholds + margin rule
-8e89ecf phase A.3 hand-off doc
+76d4b1f phase A.4 section 5: read-only global-match suggestion endpoint
+d05267e phase A.4 section 4: expose match data + team-mismatch validation gate
+5ae0352 phase A.4 section 3: wire matching stage into pipeline
+e68c293 phase A.4 section 2: matching pipeline stage (roster scope, coach signal, conflict flag)
+8d0d6b1 phase A.4 section 1: cluster-level + roster-scoped matching core
 ```
 
 ## What to verify in the morning
 
-1. **Tests:** `cd backend && pytest -v` → 403 passed (384 prior + 19 new).
-2. **No migration:** A.3 added no table — `git diff 8e89ecf HEAD --
-   backend/app/db.py backend/app/models/db_models.py` is empty; `init_db()` is
-   unchanged.
-3. **Locked files untouched:** `git diff 8e89ecf HEAD --
-   backend/app/services/face_detector.py backend/app/services/face_pipeline.py`
-   is empty. No existing test changed (only the new `test_matching.py`).
-4. **Behaviour spot-check (optional, by hand or curl; needs a real `Face` row
-   and `ReferenceFace` rows in the live DB):**
-   - `GET /api/matching/face/{id}` for a face that matches a reference →
-     `tier: "high"`, the right `player_id`, and a `thresholds` block.
-   - A face far from every reference → `tier: "none"`.
-   - The result dict shape matches the A.4 contract (tier / reason /
-     needs_review / player_id / score / margin / runner_up / candidates).
+1. **Tests:** `cd backend && ./.venv/Scripts/python.exe -m pytest -q` → 446
+   passed (403 prior + 43 new).
+2. **A.3 untouched:** `git diff main..HEAD -- backend/app/services/face_detector.py`
+   is empty; `match_embedding` + the debug endpoint behave identically (their
+   tests pass unmodified).
+3. **No existing test rewritten:** `git diff --name-only main..HEAD -- backend/tests/`
+   lists only the four new files + `test_matching.py` (extended, not edited).
+4. **Migration:** new `clusters` columns appear on your existing
+   `backend/data/player_sort.db` after the next `uvicorn` start (additive ALTERs;
+   delete the DB to start fresh if preferred).
+5. **Behaviour spot-check (optional, needs real references):** run a shoot whose
+   job has a roster + reference photos →
+   - no-copyright clusters auto-label with the matched name (`auto_label_source`
+     = `"match"`); copyright disagreements show `match_label_conflict`;
+   - `GET /sessions/{id}/clusters` carries the `match` block; a different-team
+     high match shows `match_team_mismatch` and blocks "Mark reviewed";
+   - a roster-coach match flips the cluster to coach;
+   - `POST /clusters/{id}/global-match-suggest` returns global suggestions and
+     changes nothing.
 
-## Decision / refinement notes (not blockers)
+## Decision / nuance notes (not blockers)
 
-- **`_EPS = 1e-6` tolerance in comparisons.** The hand-off's pseudocode used bare
-  `>=` / `<`. Implemented literally, the documented boundary tests are flaky:
-  IEEE floats make `0.7 - 0.65 = 0.04999999…` (so an "exactly 0.05" margin would
-  wrongly downgrade) and float32(0.6) drifts by ~1e-7 (so an "exactly 0.6" score
-  could fall below HIGH). A tiny `_EPS` absorbs that noise and makes the
-  documented boundaries hold exactly. It changes nothing at calibration scale.
-- **Thresholds are module constants**, as specified — calibrate later by editing
-  one line. Promoting them to the `Setting` store (live tuning) remains a future
-  option, out of scope.
-- New code uses `db.query(Face).get(id)` (emits `LegacyAPIWarning`) to match the
-  existing codebase convention.
+- **Gap-fill writes the matched name into `auto_label`** (origin recorded in
+  `auto_label_source`), so the unchanged `display_label()` surfaces it with no UI
+  change — the mechanism that reconciles "match fills the gap" (decision 2) with
+  "`display_label()` unchanged / UI doesn't read new fields" (decision 4).
+- **Coach promotion is high-tier + roster-scope only**, promote-only;
+  `manual_coach_override` and `is_coach_for_sort()` are untouched.
+- **`match_team_mismatch` is read-time** (recomputed from the current roster, like
+  `roster_mismatch`); the match itself is stored. It blocks readiness only when
+  visible. Team-mismatch is asserted for high-tier matches only.
+- **`db.query(...).get(id)`** used for new code to match the existing convention
+  (emits the same pre-existing `LegacyAPIWarning` as the rest of the codebase).
 
 ## Out of scope (deferred, as instructed — NOT built)
 
-Pipeline integration (auto-labelling high-tier faces / queuing low-tier for
-review) — that's **A.4**, and `face_pipeline.py` is untouched; roster-scoped
-candidate filtering (designed so it's an additive change later, but global for
-now); ANN indexes / cross-query caching; persisting match results anywhere;
-threshold UI / live calibration; re-detection / embedding generation; any change
-to `face_detector.py` or `face_pipeline.py`.
+All frontend / A.5 work (cluster-card match display, badges, the "Try global
+match" button + acceptance flow — A.4 only provides the API); incremental
+re-matching on reassign/merge (matching runs only on a full `run_pipeline`, like
+`auto_label`/coach today); demoting the coach signal; match-overrides-copyright;
+global fallback when a roster exists but has no references; ANN indexes /
+cross-session caching / persisting per-face matches; threshold UI; any change to
+`face_detector.py` or `match_embedding`'s contract.
