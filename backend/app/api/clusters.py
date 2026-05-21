@@ -12,12 +12,15 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
-from app.models.db_models import Session, Cluster, Face, Image, ImageRole
+from app.models.db_models import (
+    Session, Cluster, Face, Image, ImageRole, Player, PlayerMembership,
+)
 from app.services.face_pipeline import _sort_cluster
 from app.services.outliers import flag_outliers
 from app.services.roster import build_lookup
 from app.services.roster_check import (
-    add_duplicate_label_flag, add_roster_flag, cluster_is_mismatched,
+    add_duplicate_label_flag, add_match_team_mismatch_flag, add_roster_flag,
+    cluster_is_mismatched, cluster_match_team_mismatch,
     find_duplicate_label_cluster_ids, session_norm_team,
 )
 from app.api.settings import get_flag_visibility_map, filter_visible_reasons
@@ -61,6 +64,22 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
     from app.services.guest_clusters import guest_map_for_session
     guest_map = guest_map_for_session(db, s)
 
+    # Phase A.4: per-job roster team lookup (for the read-time match team
+    # mismatch) + matched-player display names. One query each, reused below.
+    membership_teams_by_player: dict[int, set[str]] = {}
+    raw_team_by_player: dict[int, set[str]] = {}
+    if s.job_id is not None:
+        for m in db.query(PlayerMembership).filter_by(job_id=s.job_id).all():
+            membership_teams_by_player.setdefault(m.player_id, set()).add(m.norm_team)
+            raw_team_by_player.setdefault(m.player_id, set()).add(m.team_name)
+    matched_ids = {c.matched_player_id for c in s.clusters if c.matched_player_id}
+    matched_name_by_id: dict[int, str] = {}
+    if matched_ids:
+        matched_name_by_id = dict(
+            db.query(Player.id, Player.display_name)
+            .filter(Player.id.in_(matched_ids)).all()
+        )
+
     out = []
     for c in s.clusters:
         image_ids = {f.image_id for f in c.faces}
@@ -93,6 +112,11 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
         combined_reason = add_duplicate_label_flag(
             combined_reason, c.id in dup_cluster_ids,
         )
+        # Phase A.4: read-time match team mismatch splice.
+        team_mismatch = cluster_match_team_mismatch(
+            c, sess_norm, membership_teams_by_player,
+        )
+        combined_reason = add_match_team_mismatch_flag(combined_reason, team_mismatch)
         visible_reasons = filter_visible_reasons(combined_reason, flag_vis)
         out.append({
             "cluster_id": c.id,
@@ -108,6 +132,20 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
             "is_coach_for_sort": c.is_coach_for_sort(),
             "manual_coach_override": c.manual_coach_override or 0,
             "guest_of": guest_map.get(c.id),   # None unless a confirmed cross-team guest
+            # Phase A.4: reference-match data (additive — existing UI ignores it;
+            # A.5 will render it). roster_team is the matched player's team(s)
+            # for this job, None when they aren't rostered here (e.g. fallback).
+            "match": {
+                "player_id": c.matched_player_id,
+                "player_name": matched_name_by_id.get(c.matched_player_id),
+                "confidence": c.match_confidence,
+                "tier": c.match_tier,
+                "scope": c.match_scope,
+                "roster_team": ", ".join(
+                    sorted(raw_team_by_player.get(c.matched_player_id, set()))
+                ) or None,
+                "team_mismatch": team_mismatch,
+            },
             "images": images,
         })
     return out

@@ -66,7 +66,8 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
     """
     from app.api.settings import get_flag_visibility_map  # avoid circular
     from app.services.roster_check import (
-        DUPLICATE_AUTO_LABEL, find_duplicate_label_cluster_ids,
+        DUPLICATE_AUTO_LABEL, MATCH_TEAM_MISMATCH,
+        cluster_match_team_mismatch, find_duplicate_label_cluster_ids,
     )
 
     incomplete: list[dict] = []
@@ -110,6 +111,31 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
                 }
                 incomplete.append(row)
                 by_cluster[cid] = row
+
+    # Phase A.4: match_team_mismatch blocks readiness when visible (mirrors
+    # duplicate_auto_label). Recomputed read-time from stored matches + the
+    # current roster, so it tracks roster edits without a pipeline re-run.
+    if flag_vis.get(MATCH_TEAM_MISMATCH, True):
+        from app.models.db_models import PlayerMembership
+        membership_teams_by_player: dict[int, set[str]] = {}
+        if session.job_id is not None:
+            for m in db.query(PlayerMembership).filter_by(job_id=session.job_id).all():
+                membership_teams_by_player.setdefault(m.player_id, set()).add(m.norm_team)
+        sess_norm = session_norm_team(session)
+        for c in session.clusters:
+            if not cluster_match_team_mismatch(c, sess_norm, membership_teams_by_player):
+                continue
+            if c.id in by_cluster:
+                if MATCH_TEAM_MISMATCH not in by_cluster[c.id]["missing"]:
+                    by_cluster[c.id]["missing"].append(MATCH_TEAM_MISMATCH)
+            else:
+                row = {
+                    "cluster_id": c.id,
+                    "label": c.display_label(),
+                    "missing": [MATCH_TEAM_MISMATCH],
+                }
+                incomplete.append(row)
+                by_cluster[c.id] = row
 
     return {"ready": not incomplete, "incomplete_clusters": incomplete}
 

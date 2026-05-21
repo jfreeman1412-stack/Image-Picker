@@ -39,6 +39,18 @@ KNOWN_FLAGS = [
     # also blocks "Mark reviewed & next" — toggle visibility to make it
     # informational-only.
     "duplicate_auto_label",
+    # Phase A.4: reference-photo matching flags.
+    # match_label_conflict / low_confidence_match are STORED on
+    # Cluster.review_reason by the matching pipeline stage. A high-tier match
+    # disagreeing with the EXIF copyright tag → match_label_conflict; a
+    # low-tier (uncertain) match → low_confidence_match.
+    "match_label_conflict",
+    "low_confidence_match",
+    # match_team_mismatch is computed at READ TIME in /clusters (not stored),
+    # like roster_mismatch/duplicate_auto_label: a high-tier match to a player
+    # rostered for a DIFFERENT team than this session. When *visible*, it also
+    # blocks "Mark reviewed & next" (toggle off → informational-only).
+    "match_team_mismatch",
 ]
 
 _FLAG_VIS_KEY = "flag_visibility"

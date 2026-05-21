@@ -24,6 +24,7 @@ from app.services.roster import normalize_name
 
 ROSTER_MISMATCH = "roster_mismatch"
 DUPLICATE_AUTO_LABEL = "duplicate_auto_label"
+MATCH_TEAM_MISMATCH = "match_team_mismatch"
 
 
 def find_duplicate_label_cluster_ids(clusters) -> set[int]:
@@ -77,6 +78,40 @@ def add_roster_flag(review_reason: str | None, mismatched: bool) -> str | None:
     existing = [r.strip() for r in (review_reason or "").split(",") if r.strip()]
     if mismatched and ROSTER_MISMATCH not in existing:
         existing.append(ROSTER_MISMATCH)
+    return ",".join(existing) if existing else None
+
+
+def cluster_match_team_mismatch(
+    cluster: Cluster,
+    session_norm_team: str,
+    membership_teams_by_player: dict[int, set[str]],
+) -> bool:
+    """Phase A.4: True iff this cluster has a HIGH reference-match to a player
+    who is rostered for this job but NOT for this session's team — a strong
+    "mis-clustered or wrong-team photo" signal.
+
+    `membership_teams_by_player` maps {player_id: {norm_team, ...}} for this
+    session's job. We abstain (return False) when the matched player isn't
+    rostered for this job at all (e.g. a global-fallback match), or for non-high
+    tiers — a low-tier suggestion is too uncertain to assert a team conflict.
+    Computed at read time (the roster can change without re-running), mirroring
+    `cluster_is_mismatched`."""
+    if cluster.match_tier != "high" or cluster.matched_player_id is None:
+        return False
+    teams = membership_teams_by_player.get(cluster.matched_player_id)
+    if not teams:
+        return False  # matched player not rostered for this job → abstain
+    return session_norm_team not in teams
+
+
+def add_match_team_mismatch_flag(
+    review_reason: str | None, is_mismatch: bool,
+) -> str | None:
+    """Same shape as `add_roster_flag` / `add_duplicate_label_flag`, for the
+    read-time match-team-mismatch case."""
+    existing = [r.strip() for r in (review_reason or "").split(",") if r.strip()]
+    if is_mismatch and MATCH_TEAM_MISMATCH not in existing:
+        existing.append(MATCH_TEAM_MISMATCH)
     return ",".join(existing) if existing else None
 
 
