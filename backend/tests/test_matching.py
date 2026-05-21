@@ -260,3 +260,67 @@ def test_http_match_face_none(client):
 def test_http_unknown_face_404(client):
     res = client.get("/api/matching/face/99999")
     assert res.status_code == 404
+
+
+# ── Section A.4 §1: roster-scoped index + cluster (multi-face) aggregation ──
+
+def test_load_index_filters_by_player(db):
+    a = _player_with_refs(db, "Alice", [1.0])
+    _player_with_refs(db, "Bob", [0.9])
+    all_idx = matching.load_reference_index(db)
+    assert all_idx.unit_matrix.shape[0] == 2          # both players' refs
+    a_idx = matching.load_reference_index(db, player_ids={a.id})
+    assert a_idx.unit_matrix.shape[0] == 1
+    assert set(a_idx.player_ids.tolist()) == {a.id}
+
+
+def test_load_index_empty_for_player_without_refs(db):
+    p = Player(norm_name="x", display_name="X")
+    db.add(p); db.commit()
+    idx = matching.load_reference_index(db, player_ids={p.id})
+    assert idx.unit_matrix.shape[0] == 0
+    assert matching.match_against_index(idx, QUERY)["tier"] == "none"
+
+
+def test_load_index_empty_player_ids_set_is_empty(db):
+    _player_with_refs(db, "Alice", [1.0])
+    idx = matching.load_reference_index(db, player_ids=set())
+    assert idx.unit_matrix.shape[0] == 0
+
+
+def test_match_against_index_single_query_matches_a3(db):
+    alice = _player_with_refs(db, "Alice", [1.0])
+    idx = matching.load_reference_index(db)
+    res = matching.match_against_index(idx, QUERY)
+    assert res["tier"] == "high"
+    assert res["player_id"] == alice.id
+
+
+def test_cluster_max_over_faces(db):
+    # Player A has ONE reference (== e0). Two cluster faces sit at cosine 0.5 and
+    # 0.7 to it → the cluster's score is the MAX over faces = 0.7 (high tier).
+    alice = _player_with_refs(db, "Alice", [1.0])   # reference == QUERY (e0)
+    idx = matching.load_reference_index(db)
+    faces = np.stack([_ref_at(0.5), _ref_at(0.7)])
+    res = matching.match_against_index(idx, faces)
+    assert res["score"] == pytest.approx(0.7, abs=1e-3)
+    assert res["tier"] == "high"
+    assert res["player_id"] == alice.id
+
+
+def test_cluster_max_over_faces_and_references(db):
+    # 2 faces × 2 references → score is the single largest cosine among all 4
+    # (face, reference) pairs. Asserted against a brute-force max so the test
+    # doesn't depend on hand-deriving the 2-D geometry.
+    r1, r2 = _ref_at(0.5), _ref_at(0.55)
+    alice = _player_with_refs(db, "Alice", [0.5, 0.55])
+    idx = matching.load_reference_index(db)
+    f1, f2 = QUERY, _ref_at(0.7)
+    faces = np.stack([f1, f2])
+    expected = max(
+        matching.cosine_similarity(f, r)
+        for f in (f1, f2) for r in (r1, r2)
+    )
+    res = matching.match_against_index(idx, faces)
+    assert res["score"] == pytest.approx(round(float(expected), 4), abs=1e-3)
+    assert res["player_id"] == alice.id
