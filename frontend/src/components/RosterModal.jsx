@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 
 /**
  * Roster upload + mismatch review modal.
@@ -17,7 +18,16 @@ import { useEffect, useRef, useState } from 'react';
  * (Phase 5 lesson — see SessionDetail.load).
  */
 export default function RosterModal({ job, onClose, onChanged }) {
+  const nav = useNavigate();
+  // Navigate to a team's review page; close the modal first so the user
+  // lands cleanly on the cluster grid.
+  const goToSession = (sessionId) => {
+    if (!sessionId) return;
+    onClose();
+    nav(`/session/${sessionId}`);
+  };
   const [roster, setRoster] = useState(null);          // GET /roster body | null
+  const [namingErrors, setNamingErrors] = useState([]); // cross-team collisions
   const [mismatches, setMismatches] = useState([]);    // items array
   const [suggestions, setSuggestions] = useState({ items: [], available_teams: [] });
   const [coverage, setCoverage] = useState([]);  // [{session_id, session_name, report}, ...]
@@ -47,6 +57,10 @@ export default function RosterModal({ job, onClose, onChanged }) {
       const r3 = await fetch(`/api/jobs/${job.id}/roster-folder-suggestions`);
       if (!r3.ok) throw new Error(`Couldn't load folder suggestions (HTTP ${r3.status}).`);
       setSuggestions(await r3.json());
+
+      const r4 = await fetch(`/api/jobs/${job.id}/naming-errors`);
+      if (!r4.ok) throw new Error(`Couldn't load naming errors (HTTP ${r4.status}).`);
+      setNamingErrors((await r4.json()).items || []);
 
       // Coverage report per session. One round-trip per non-archived
       // session — could be batched into a job-level aggregator later, but
@@ -445,6 +459,64 @@ export default function RosterModal({ job, onClose, onChanged }) {
           </section>
         )}
 
+        {/* ── Possible naming errors (Phase 10) ─────────────────────── */}
+        {namingErrors.length > 0 && (
+          <section style={{ marginBottom: 16 }}>
+            <h3 style={{ marginBottom: 8 }}>
+              Possible naming errors ({namingErrors.length})
+            </h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              A player name that appears in two different teams. Face matching
+              tells you which case it is.
+            </p>
+            {namingErrors.map((it) => {
+              const isNamingError = it.verdict === 'different_face';
+              return (
+                <div key={it.norm_name} className="roster-row">
+                  <div>
+                    <b>{it.raw_name}</b>{' · '}
+                    {isNamingError ? (
+                      <span style={{ color: 'var(--warn)' }}>
+                        ⚠ different faces (likely a naming error)
+                      </span>
+                    ) : it.verdict === 'same_face' ? (
+                      <span className="muted">✓ same face in two folders</span>
+                    ) : (
+                      <span className="muted">? couldn't compare faces</span>
+                    )}
+                  </div>
+                  <div style={{ marginTop: 4 }}>
+                    {it.clusters.map((c) => (
+                      <div key={c.cluster_id} className="muted" style={{ fontSize: 13 }}>
+                        <button
+                          className="folder-crumb"
+                          onClick={() => goToSession(c.session_id)}
+                          title={`Open ${c.session_name}`}
+                          style={{ padding: '1px 4px' }}
+                        >
+                          {c.session_name} ↗
+                        </button>
+                        {' '}{c.image_count} imgs
+                        {c.in_correct_team && (
+                          <span style={{ color: 'var(--success)' }}> · ✓ correct team</span>
+                        )}
+                        {c.session_reviewed && (
+                          <span> · <span style={{ color: 'var(--text-dim)' }}>reviewed</span></span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="muted" style={{ marginTop: 6 }}>
+                    {isNamingError
+                      ? 'The same name is on two different kids — the photographer probably didn’t update the copyright field when switching teams. Open both teams and rename the wrong one.'
+                      : 'Same player photographed in two folders — use the Mismatches actions below to move one into the other.'}
+                  </p>
+                </div>
+              );
+            })}
+          </section>
+        )}
+
         {/* ── Mismatches list ────────────────────────────────────────── */}
         <section>
           <h3 style={{ marginBottom: 8 }}>
@@ -468,15 +540,39 @@ export default function RosterModal({ job, onClose, onChanged }) {
               <div key={row.source_cluster_id} className="roster-row">
                 <div className="row-between" style={{ alignItems: 'baseline' }}>
                   <div>
-                    <b>{row.source_session_name}</b>
+                    <button
+                      className="folder-crumb"
+                      onClick={() => goToSession(row.source_session_id)}
+                      title={`Open ${row.source_session_name}`}
+                      style={{ padding: '1px 4px' }}
+                    >
+                      {row.source_session_name} ↗
+                    </button>
                     {' → '}
-                    <b>{row.expected_team_name}</b>
+                    {canMove ? (
+                      <button
+                        className="folder-crumb"
+                        onClick={() => goToSession(row.target_session_id)}
+                        title={`Open ${row.expected_team_name}`}
+                        style={{ padding: '1px 4px' }}
+                      >
+                        {row.expected_team_name} ↗
+                      </button>
+                    ) : (
+                      <b>{row.expected_team_name}</b>
+                    )}
                     {' · '}
                     <span>{row.source_cluster_label}</span>
                     {' · '}
                     <span className="muted">{row.source_image_count} images</span>
                   </div>
                 </div>
+                <p className="muted" style={{ marginTop: 4 }}>
+                  <b>{row.source_cluster_label}</b> should be on{' '}
+                  <b>{row.expected_team_name}</b> (per roster); currently in{' '}
+                  <b>{row.source_session_name}</b>.
+                  {canMove ? ' Recommended: move.' : ''}
+                </p>
                 {!canMove && (
                   <p className="muted" style={{ marginTop: 4 }}>
                     Expected team <b>{row.expected_team_name}</b> is not a team folder in
