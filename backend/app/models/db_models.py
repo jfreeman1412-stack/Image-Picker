@@ -121,6 +121,15 @@ class Cluster(Base):
     manual_label = Column(String, nullable=True)            # set by rename; wins over auto_label
     # 0 = no override (use is_likely_coach), 1 = forced coach, -1 = forced player
     manual_coach_override = Column(Integer, default=0)
+    # Phase A.4: reference-photo match results, computed in the matching stage.
+    # matched_player_id is the best matched Player (high/low tier); NULL for
+    # none/unmatched. auto_label_source records whether the current auto_label
+    # came from EXIF copyright or from a face match (so A.5 can badge origin).
+    matched_player_id = Column(Integer, ForeignKey("players.id"), nullable=True)
+    match_confidence = Column(Float, nullable=True)    # best cosine, rounded
+    match_tier = Column(String, nullable=True)         # high | low | none
+    match_scope = Column(String, nullable=True)        # roster | global_fallback
+    auto_label_source = Column(String, nullable=True)  # copyright | match
 
     session = relationship("Session", back_populates="clusters")
     faces = relationship("Face", back_populates="cluster")

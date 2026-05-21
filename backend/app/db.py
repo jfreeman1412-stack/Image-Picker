@@ -33,6 +33,12 @@ _PHASE2_COLUMNS = {
         ("auto_label", "VARCHAR"),
         ("manual_label", "VARCHAR"),
         ("manual_coach_override", "INTEGER DEFAULT 0"),
+        # Phase A.4: reference-photo match results.
+        ("matched_player_id", "INTEGER"),
+        ("match_confidence", "FLOAT"),
+        ("match_tier", "VARCHAR"),
+        ("match_scope", "VARCHAR"),
+        ("auto_label_source", "VARCHAR"),
     ],
     "image_roles": [
         ("manual_override", "INTEGER DEFAULT 0"),
