@@ -27,6 +27,7 @@ export default function ClusterCard({
   onSetRole,
   onClearOverride,
   onSetCoachOverride,
+  onOpenSession,   // (session_id) → navigate to another team (guest link)
   dragFrom,        // cluster_id an image is currently being dragged from (or null)
   onDragStart,     // (from_cluster_id) → parent tracks the active drag
   onDragEnd,       // () → parent clears the active drag
@@ -116,9 +117,15 @@ export default function ClusterCard({
   const completeClass =
     incomplete === undefined ? '' : incomplete ? 'incomplete' : 'complete';
 
+  // Phase 11: a confirmed cross-team guest (phantom sibling). When set, the
+  // card is someone else's player caught in a buddy shot here — suppress the
+  // coach pill, the team/pano completeness chip, and the review flags (all
+  // noise for a non-member) and show a "belongs to <team>" banner instead.
+  const guest = cluster.guest_of || null;
+
   return (
     <div
-      className={`cluster-card ${completeClass} ${showReview ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
+      className={`cluster-card ${guest ? 'guest' : ''} ${guest ? '' : completeClass} ${(!guest && showReview) ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
       onDragOver={handleCardDragOver}
       onDragLeave={handleCardDragLeave}
       onDrop={handleCardDrop}
@@ -137,12 +144,24 @@ export default function ClusterCard({
             {cluster.label}
           </h3>
         )}
-        {isCoach && (
+        {guest && (
+          <span className="guest-pill" title={`Face matches ${guest.name} (distance ${guest.distance})`}>
+            Guest ·{' '}
+            <button
+              className="guest-link"
+              onClick={() => onOpenSession && onOpenSession(guest.session_id)}
+              title={`Open ${guest.team}`}
+            >
+              {guest.name} → {guest.team} ↗
+            </button>
+          </span>
+        )}
+        {!guest && isCoach && (
           <span className="coach-pill" title="Treated as a coach for sorting">
             COACH{coachManual && <span className="lock" title="Manually set"> 🔒</span>}
           </span>
         )}
-        {onSetCoachOverride && (
+        {!guest && onSetCoachOverride && (
           <select
             className="coach-select"
             value={cluster.manual_coach_override ?? 0}
@@ -155,10 +174,10 @@ export default function ClusterCard({
           </select>
         )}
         <span className="cluster-count">{cluster.image_count} images</span>
-        {incomplete === false && (
+        {!guest && incomplete === false && (
           <span className="complete-chip" title="Team + pano assigned">✓ complete</span>
         )}
-        {incomplete === true && (
+        {!guest && incomplete === true && (
           <span
             className="incomplete-chip"
             title={`Missing ${(missing || []).join(' and ')}`}
@@ -166,12 +185,22 @@ export default function ClusterCard({
             ▲ needs {(missing || []).join(' + ')}
           </span>
         )}
-        {visibleReasons.map(reason => (
+        {!guest && visibleReasons.map(reason => (
           <span key={reason} className="review-badge" title={reason}>
             ⚠ {reason}
           </span>
         ))}
       </div>
+
+      {guest && (
+        <p className="guest-note">
+          These photos are <b>{guest.name}</b> from <b>{guest.team}</b> — caught
+          in a buddy shot here, not a member of this team. Handle them on{' '}
+          <button className="guest-link" onClick={() => onOpenSession && onOpenSession(guest.session_id)}>
+            {guest.team} ↗
+          </button>; nothing to pick here.
+        </p>
+      )}
 
       <div className="thumb-strip">
         {cluster.images.map((img, idx) => {

@@ -302,9 +302,14 @@ export default function SessionDetail() {
     return incompleteClusterIds.has(c.cluster_id);
   };
 
-  const visible = filter === 'review'
+  const visibleUnsorted = filter === 'review'
     ? clusters.filter(clusterNeedsAttention)
     : clusters;
+  // Phase 11: float confirmed cross-team guest clusters to the end — they're
+  // not this team's members, so they shouldn't sit among the real players.
+  const visible = [...visibleUnsorted].sort(
+    (a, b) => (a.guest_of ? 1 : 0) - (b.guest_of ? 1 : 0),
+  );
 
   // Progress indicator: team N of M · X reviewed
   let progress = null;
@@ -389,6 +394,7 @@ export default function SessionDetail() {
             onSetRole={setRole}
             onClearOverride={clearOverride}
             onSetCoachOverride={setCoachOverride}
+            onOpenSession={(sid) => nav(`/session/${sid}`)}
             dragFrom={dragFrom}
             onDragStart={onThumbDragStart}
             onDragEnd={onThumbDragEnd}
