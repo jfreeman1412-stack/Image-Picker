@@ -2,7 +2,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, DateTime, Float, ForeignKey, Index, LargeBinary,
-    PrimaryKeyConstraint,
+    PrimaryKeyConstraint, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -37,6 +37,9 @@ class Job(Base):
     sessions = relationship("Session", back_populates="job", cascade="all, delete-orphan")
     roster_entries = relationship(
         "RosterEntry", back_populates="job", cascade="all, delete-orphan"
+    )
+    player_memberships = relationship(
+        "PlayerMembership", back_populates="job", cascade="all, delete-orphan"
     )
 
 
@@ -163,6 +166,51 @@ class RosterEntry(Base):
     norm_team = Column(String, nullable=False)   # "10ublacksoftball" — matches norm(session.name)
 
     job = relationship("Job", back_populates="roster_entries")
+
+
+class Player(Base):
+    """A unique person across all shoots/leagues/seasons. Identity in A.1 is
+    the normalized name (no face data yet); `norm_name` is the dedup key and is
+    globally unique. NOT the same as the Phase 6 `RosterEntry` — see
+    PHASE_A1_ROSTER_MODEL.md. Future phases hang a reference photo + face
+    embedding off this row.
+    """
+    __tablename__ = "players"
+
+    id = Column(Integer, primary_key=True)
+    norm_name = Column(String, nullable=False, unique=True, index=True)  # dedup key
+    display_name = Column(String, nullable=False)   # first-seen raw form, e.g. "Eleanor-Pederson"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # Later phases add reference_image_path / embedding here. OUT OF SCOPE for A.1.
+
+    memberships = relationship(
+        "PlayerMembership", back_populates="player",
+        cascade="all, delete-orphan",
+    )
+
+
+class PlayerMembership(Base):
+    """One row per (player, shoot, team). `job_id` is the shoot. `is_coach` is
+    derived from the raw name's 'Coach-' prefix at parse time. `norm_team`
+    matches normalize_name(Session.name)."""
+    __tablename__ = "player_memberships"
+    __table_args__ = (
+        Index("ix_player_memberships_job", "job_id"),
+        Index("ix_player_memberships_player", "player_id"),
+        UniqueConstraint("job_id", "player_id", "norm_team",
+                         name="uq_membership_job_player_team"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    team_name = Column(String, nullable=False)   # raw, as in CSV
+    norm_team = Column(String, nullable=False)   # matches normalize_name(Session.name)
+    is_coach = Column(Integer, default=0)        # 0 | 1, from "Coach-" name prefix
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    player = relationship("Player", back_populates="memberships")
+    job = relationship("Job", back_populates="player_memberships")
 
 
 class Setting(Base):
