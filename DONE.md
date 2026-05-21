@@ -1,87 +1,117 @@
-# Phase A.1 — DONE
+# Phase A.2 — DONE
 
-Implemented `PHASE_A1_ROSTER_MODEL.md` in full. Three sections, three commits,
-plus this summary. Branch: `phase-A1-overnight`.
+Implemented `PHASE_A2_REFERENCE_UPLOAD.md` in full. Three sections, three
+commits, plus this summary. Branch: `phase-A1-overnight` (continued).
 
 ## What got built
 
-The identity spine for the future reference-photo system. **Purely additive** —
-two new tables, a new service, a new router, a new test file, and a 2-line
-registration in `main.py`. The existing Phase 6 `RosterEntry` and everything
-that reads it are byte-for-byte unchanged.
+The first real face data hanging off the A.1 identity spine: a reference photo
+per player, its 512-d InsightFace embedding, automatic quality gates, on-disk
+storage, and the upload/list/delete/replace API. **Purely additive** — one new
+table, one new service, one new router, one new test file, and a 2-line
+registration in `main.py`. `face_detector.py` (the locked InsightFace
+integration) was not touched; A.2 only calls `detect_faces`.
 
-### Section 1 — Models (`backend/app/models/db_models.py`)
-- **`Player`** — one row per unique person, globally deduped by `norm_name`
-  (unique, indexed). `display_name` keeps the first-seen raw form.
-- **`PlayerMembership`** — one row per `(player, shoot=job, team)`. Stores
-  `team_name`/`norm_team` as strings (no Session FK, like the existing roster),
-  plus `is_coach`. Unique constraint `uq_membership_job_player_team` +
-  per-job/per-player indexes.
-- Added `player_memberships` relationship to `Job` with
-  `cascade="all, delete-orphan"`: deleting a Job removes its memberships but
-  **not** the global Players. Added `UniqueConstraint` to the sqlalchemy import.
-- No `db.py` change — `Base.metadata.create_all` builds both new tables at
-  startup (verified: `init_db()` adds `players` + `player_memberships`, leaves
-  `roster_entries` and all existing data intact).
+### Section 1 — Model (`backend/app/models/db_models.py`)
+- **`ReferenceFace`** — one row per uploaded reference photo. Columns:
+  `player_id` (FK, hard link), `captured_job_id` (nullable FK — provenance),
+  `image_path`, `original_filename`, `embedding` (512-d float32 `.tobytes()`,
+  stored exactly like `Face.embedding`), `det_score`, `bbox` (JSON),
+  `face_area_ratio`, `created_at`. Index on `player_id`.
+- Added `references` relationship to `Player` with
+  `cascade="all, delete-orphan"`: deleting a Player removes its reference
+  **rows** (file cleanup is the delete/replace service paths' job). Deleting a
+  Job does **not** touch references (no relationship from `Job`) — a person's
+  reference rightly survives a shoot's deletion; a stale `captured_job_id` is
+  accepted.
+- No `db.py` change — `create_all` builds `reference_faces` at startup
+  (verified: `init_db()` adds the table, leaves all existing tables/data
+  intact).
 
-### Section 2 — Load service (`backend/app/services/players.py`)
-Reuses `normalize_name` / `parse_csv` / `decode_bytes` / `CsvParseError` from
-`services/roster.py` (the one intentional shared seam). Functions:
-- `is_coach_name(raw)` — true iff name starts with `Coach-` (case-insensitive,
-  hyphen required; `Coachman-Lee` is not a coach). Prefix is kept in the name.
-- `upsert_player(db, raw)` — find-or-create by `norm_name`; `(None, False)` for
-  junk that normalizes to empty.
-- `replace_shoot_memberships(db, job_id, rows)` — wipe-and-reload this shoot's
-  memberships; idempotent; returns a lean summary dict.
-- `load_shoot_roster_from_text(db, job_id, text)` — testable core: parse +
-  replace + commit; 404 if job missing.
+### Section 2 — Quality gate + service (`backend/app/services/references.py`)
+- `evaluate_reference_quality(detections)` — **pure** function (no I/O, no
+  model) that picks the single reference face or raises `ReferenceQualityError`
+  with a stable `code` + clear message. First failure wins:
+  `no_face` → `multiple_faces` → `low_confidence` → `face_too_small`. The
+  multiplicity check fires at the detector's 0.5 floor, so **any second real
+  face triggers `multiple_faces`** (the requested over-alert on bystanders).
+  Thresholds: `REF_MIN_DET_SCORE = 0.65`, `REF_MIN_AREA_RATIO = 0.02`.
+- `add_reference` — validates player (404) + optional captured job (404), runs
+  `face_detector.detect_faces`, enforces the gate (no row / no file on
+  failure), then persists row + file at `data/references/{player_id}/{id}{ext}`.
+  Appends — multiple references per player allowed. Stores original bytes (no
+  re-encode), extension sanitized to jpg/jpeg/png.
+- `list_references`, `delete_reference` (removes row **and** file),
+  `replace_player_references` (validates the new photo **before** wiping, so a
+  failed replace leaves existing references intact).
+- `REFERENCES_DIR` is a module-level dir (mkdir at import), monkeypatchable in
+  tests — mirrors `api/images.py`'s `THUMB_DIR`.
 
-### Section 3 — API (`backend/app/api/players.py`, registered in `main.py`)
-- `POST   /api/players/roster/{job_id}` — multipart CSV upload, replaces shoot
-  (CsvParseError → 400 with `{error, line, message}`, like `roster.py`).
-- `GET    /api/players/roster/{job_id}` — this shoot's memberships (check-in
-  roster), coach flagged.
-- `DELETE /api/players/roster/{job_id}` — clear shoot memberships (leaves Players).
-- `GET    /api/players` — list/query unique players (`?q=` normalized substring,
-  `?limit`/`?offset` paging, `total` before paging, per-page `membership_count`).
-- `GET    /api/players/{player_id}` — one player + memberships across all shoots.
-- Static `/roster/...` routes declared before dynamic `/{player_id}`.
+### Section 3 — API (`backend/app/api/references.py`, registered in `main.py`)
+- `POST   /api/players/{player_id}/references` — multipart upload (append);
+  optional `?job_id=` provenance; `ReferenceQualityError` → 400
+  `{error, message}`.
+- `GET    /api/players/{player_id}/references` — list (404 if player missing).
+- `PUT    /api/players/{player_id}/references` — replace all with one.
+- `DELETE /api/players/{player_id}/references/{ref_id}` — delete one.
+- `GET    /api/players/{player_id}/references/{ref_id}/image` — serve the photo
+  (`FileResponse`).
+- All routes nest under `/{player_id}/references...` — no collision with A.1's
+  `/{player_id}` route.
 
 ## Test count
 
-- **Baseline (Phase 11): 330 passed** — confirmed green at startup before any change.
-- **New this phase: 22** in `backend/tests/test_players.py` (Section 1: 3,
-  Section 2: 11, Section 3: 8 — matches the hand-off's ~22 estimate).
-- **Final: 352 passed**, 0 failed. No existing test modified.
+- **Baseline (Phase A.1): 352 passed** — confirmed (collection = 352) before
+  any change.
+- **New this phase: 32** in `backend/tests/test_references.py` (Section 1: 3,
+  Section 2: 20, Section 3: 9 — above the hand-off's ~24 estimate because the
+  quality gate and rejection paths were parametrized for full coverage).
+- **Final: 384 passed**, 0 failed. No existing test modified.
 
 ## Commits
 
 ```
-7df679c phase A.1 section 3: players API (shoot roster upload + player query)
-6be6da6 phase A.1 section 2: roster CSV parse + Player/membership load service
-61fdbf9 phase A.1 section 1: Player + PlayerMembership models
+d7ad6b7 phase A.2 section 3: reference upload/list/delete/replace API
+d62de9c phase A.2 section 2: reference quality gate + add/list/delete/replace service
+90cf392 phase A.2 section 1: ReferenceFace model
+0a67c62 phase A.2 hand-off doc
 ```
 
 ## What to verify in the morning
 
-1. **Tests:** `cd backend && pytest -v` → 352 passed (330 prior + 22 new).
+1. **Tests:** `cd backend && pytest -v` → 384 passed (352 prior + 32 new).
 2. **Migration safety:** the real `backend/data/player_sort.db` opens with no
-   error and gains exactly two tables (`players`, `player_memberships`); no
-   existing data touched. (Verified via `init_db()` against the live DB.)
-3. **RosterEntry untouched:** `git diff 2e2de2d HEAD -- backend/app/services/roster.py
-   backend/app/api/roster.py backend/tests/test_roster.py` is empty.
-4. **Acceptance walk-through (optional, by hand or curl):**
-   - Upload the Princeton sample CSV to a shoot → 8 Players, 8 memberships, the
-     `Coach-` row flagged `is_coach`.
-   - Upload a 2nd shoot sharing a name → `GET /api/players/{id}` shows ONE
-     player with TWO memberships (cross-shoot identity).
-   - Re-upload a shoot → membership count unchanged, no duplicate Players;
-     deleting a Job removes its memberships but leaves the Players.
-   - `GET /api/players?q=eleanor` filters by normalized name.
+   error and gains exactly one table (`reference_faces`); existing tables/data
+   untouched. (Verified via `init_db()` against the live DB.)
+3. **`face_detector.py` untouched:** `git diff 0a67c62 HEAD --
+   backend/app/services/face_detector.py` is empty. No existing test changed
+   (only the new `test_references.py` was added).
+4. **Acceptance walk-through (optional, by hand or curl; needs the real
+   InsightFace model + a real photo since the tests mock the detector):**
+   - Upload a clean single-face photo → file lands in
+     `data/references/{player_id}/`, 512-d embedding persisted, summary returns
+     `det_score`.
+   - Upload a photo with two people → 400 `multiple_faces`; no-face /
+     low-confidence / too-small each → 400 with their own message; no row or
+     file left behind.
+   - Upload twice for one player → two references; `DELETE` removes one (row +
+     file); `PUT` replaces all with one (a failed `PUT` keeps the old set).
+   - Upload references for the same player against two different `?job_id=`
+     shoots → both list under the player, each carrying its `captured_job_id`.
+
+## Tuning / follow-ups (not blockers)
+
+- `REF_MIN_DET_SCORE` (0.65) and `REF_MIN_AREA_RATIO` (0.02) are proposed
+  starting values — tune against real check-in photos. One-line constant
+  changes in `services/references.py`.
+- New service code uses `db.query(...).get(id)` (emits SQLAlchemy
+  `LegacyAPIWarning`) to match the existing codebase convention; migrating the
+  whole codebase to `Session.get()` is a separate cleanup, out of scope here.
 
 ## Out of scope (deferred, as instructed — NOT built)
 
-Face recognition / reference photos / embeddings; mobile/tablet check-in app;
-auto-matching; `PlayerMembership`→`Session` FK; rich upload warnings; merge/split
-UI + orphan cleanup; any frontend. The forward constraint stands: future
-`Player` data must stay provenance-tagged so a merge can be undone.
+Face matching / embedding search; pipeline integration; mobile/tablet app + any
+UI; image derivatives (thumbnails / re-encode / EXIF stripping); Player
+merge/split implementation; orphaned-file GC beyond the delete/replace paths;
+`membership_id` provenance (anchored on `captured_job_id` instead — memberships
+are unstable across roster re-uploads); any change to `face_detector.py`.
