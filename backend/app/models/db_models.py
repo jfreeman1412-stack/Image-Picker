@@ -187,6 +187,10 @@ class Player(Base):
         "PlayerMembership", back_populates="player",
         cascade="all, delete-orphan",
     )
+    references = relationship(
+        "ReferenceFace", back_populates="player",
+        cascade="all, delete-orphan",
+    )
 
 
 class PlayerMembership(Base):
@@ -211,6 +215,37 @@ class PlayerMembership(Base):
 
     player = relationship("Player", back_populates="memberships")
     job = relationship("Job", back_populates="player_memberships")
+
+
+class ReferenceFace(Base):
+    """A reference photo + its face embedding for one Player (the person).
+
+    Phase A.2 of the reference-photo system. A Player may have MANY references
+    (different angles / lighting). `player_id` is the hard link (cascade from
+    Player). `captured_job_id` is best-effort provenance — the shoot the photo
+    was taken in — recorded so a future 'Split Player' can re-partition
+    references (see PHASE_A1's split-friendly mandate). It is `job_id`, not
+    `membership_id`, because memberships are wiped/recreated on every roster
+    re-upload while jobs are stable. Embedding is the 512-d L2-normalized
+    ArcFace vector, stored like Face.embedding.
+    """
+    __tablename__ = "reference_faces"
+    __table_args__ = (
+        Index("ix_reference_faces_player", "player_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    captured_job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)  # provenance
+    image_path = Column(String, nullable=False)      # data/references/{player_id}/{id}{ext}
+    original_filename = Column(String, nullable=True)
+    embedding = Column(LargeBinary, nullable=False)  # 512-d float32 .tobytes(), L2-normalized
+    det_score = Column(Float, nullable=False)
+    bbox = Column(String, nullable=True)             # JSON [x, y, w, h], like Face.bbox
+    face_area_ratio = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    player = relationship("Player", back_populates="references")
 
 
 class Setting(Base):
