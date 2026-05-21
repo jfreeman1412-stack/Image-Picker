@@ -313,6 +313,19 @@ def folder_suggestions(job_id: int, db: DbSession = Depends(get_db)):
     return {"items": items, "available_teams": available}
 
 
+@router.get("/{job_id}/naming-errors")
+def naming_errors(job_id: int, db: DbSession = Depends(get_db)):
+    """Cross-team duplicate-name detection (Phase 10): names that appear as
+    clusters in 2+ teams, classified same_face (mis-foldered) vs
+    different_face (photographer didn't update the copyright field). See
+    services/naming_errors.py."""
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    from app.services.naming_errors import find_cross_team_name_collisions
+    return {"items": find_cross_team_name_collisions(db, job_id)}
+
+
 @router.delete("/{job_id}/roster")
 def delete_roster(job_id: int, db: DbSession = Depends(get_db)):
     job = db.query(Job).get(job_id)

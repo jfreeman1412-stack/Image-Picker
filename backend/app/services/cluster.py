@@ -17,10 +17,16 @@ import numpy as np
 
 from sklearn.cluster import DBSCAN
 
+# Cosine-distance cutoff DBSCAN uses to decide two faces are the same
+# person. Exposed as a module constant so other services (e.g. cross-team
+# naming-error detection) classify "same face" with the exact same bar the
+# pipeline used to group faces in the first place.
+DEFAULT_EPS = 0.4
+
 
 def cluster_embeddings(
     embeddings: List[np.ndarray],
-    eps: float = 0.4,
+    eps: float = DEFAULT_EPS,
     min_samples: int = 2,
 ) -> List[int]:
     """Assign each embedding a cluster label.
