@@ -30,6 +30,7 @@ from app.services.sort_rules import ImageRecord, assign_roles, assign_roles_coac
 from app.services.outliers import flag_outliers
 from app.services.coach_detection import detect_coaches
 from app.services.labeling import derive_cluster_label
+from app.services.cluster_matching import match_session_clusters
 
 logger = logging.getLogger(__name__)
 
@@ -219,11 +220,22 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
                 })
             label, ambiguous = derive_cluster_label(faces_with_meta)
             c.auto_label = label
+            if label:
+                c.auto_label_source = "copyright"
             if ambiguous:
                 c.needs_review = 1
                 c.review_reason = "ambiguous_copyright"
         db.commit()
         stage_start = _log_stage(session.name, "labeling", stage_start)
+
+        # ── Step 4d: reference matching ──────────────────────────────────────
+        # Runs AFTER labeling (so it knows whether copyright is present) and
+        # BEFORE sorting (so a confident roster-coach match can flip
+        # is_likely_coach in time to feed is_coach_for_sort()). See A.4.
+        _set_progress(db, session, "matching", 0, 0)
+        match_session_clusters(db, session)
+        db.commit()
+        stage_start = _log_stage(session.name, "matching", stage_start)
 
         # ── Step 5: classify expression per face ─────────────────────────────
         total_faces = len(faces)

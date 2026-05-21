@@ -57,7 +57,7 @@ class Session(Base):
     reviewed_at = Column(DateTime, nullable=True)
     archived = Column(Integer, default=0)            # 0 | 1; soft-hide from job detail
     archived_at = Column(DateTime, nullable=True)
-    progress_stage = Column(String, nullable=True)   # "detecting" | "clustering" | "classifying" | "sorting" | None
+    progress_stage = Column(String, nullable=True)   # "detecting" | "clustering" | "coach_check" | "labeling" | "matching" | "classifying" | "sorting" | None
     progress_current = Column(Integer, default=0)
     progress_total = Column(Integer, default=0)      # 0 → indeterminate (just show stage name)
     progress_started_at = Column(DateTime, nullable=True)        # whole-pipeline start (for elapsed)
