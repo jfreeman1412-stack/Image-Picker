@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db, SessionLocal
-from app.models.db_models import Cluster, ImageRole, RosterEntry, Session
+from app.models.db_models import Cluster, Face, ImageRole, RosterEntry, Session
 from app.services.eta import eta_seconds
 from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
@@ -32,11 +32,35 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _cluster_is_buddy_only(db: DbSession, cluster_id: int) -> bool:
+    """True only when the cluster HAS face data and every one of its images
+    is multi-face (no solo portrait) — the phantom shape (Phase 11: guest
+    siblings, or coaches with no solo). Such a cluster can never produce a
+    team/pano pick (those roles only come from single-face photos), so the
+    readiness gate shouldn't nag it. 'Missing player' coverage lives in the
+    roster-coverage report instead.
+
+    Clusters with NO face rows (legacy rows, or abstract test fixtures that
+    model images via ImageRole only) return False so the normal gate still
+    applies — we only special-case clusters we can positively identify as
+    buddy-only.
+    """
+    faces = db.query(Face).filter_by(cluster_id=cluster_id).all()
+    if not faces:
+        return False
+    for iid in {f.image_id for f in faces}:
+        if db.query(Face).filter_by(image_id=iid).count() == 1:
+            return False     # has at least one solo portrait
+    return True
+
+
 def _compute_review_readiness(db: DbSession, session: Session) -> dict:
     """Per cluster: a coach needs a 'team' role; a player needs both 'team'
     and 'panoramic'. Phase 9: also blocks when the `duplicate_auto_label`
     flag is currently visible AND there are duplicate-labeled clusters in
-    this session.
+    this session. Phase 11: clusters with zero single-face images are
+    skipped entirely — they can't satisfy a team/pano pick (phantom /
+    guest / no-solo coach), so nagging is pointless.
 
     Returns {ready, incomplete_clusters:[{cluster_id,label,missing:[...]}]}.
     """
@@ -48,6 +72,10 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
     incomplete: list[dict] = []
     by_cluster: dict[int, dict] = {}        # so we can merge multiple reasons
     for c in session.clusters:
+        # Phase 11: a buddy-only cluster (faces present, none single-face)
+        # can never get a team/pano pick — don't block on it.
+        if _cluster_is_buddy_only(db, c.id):
+            continue
         roles = {
             r.role for r in db.query(ImageRole).filter_by(cluster_id=c.id).all()
         }

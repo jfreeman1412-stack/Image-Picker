@@ -313,6 +313,18 @@ def folder_suggestions(job_id: int, db: DbSession = Depends(get_db)):
     return {"items": items, "available_teams": available}
 
 
+@router.get("/{job_id}/guest-clusters")
+def guest_clusters(job_id: int, db: DbSession = Depends(get_db)):
+    """Cross-team guest clusters (Phase 11): phantom clusters that are
+    actually a player from another team caught in a buddy shot. See
+    services/guest_clusters.py."""
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    from app.services.guest_clusters import find_guest_clusters
+    return {"items": find_guest_clusters(db, job_id)}
+
+
 @router.get("/{job_id}/naming-errors")
 def naming_errors(job_id: int, db: DbSession = Depends(get_db)):
     """Cross-team duplicate-name detection (Phase 10): names that appear as

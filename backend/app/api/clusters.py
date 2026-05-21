@@ -55,6 +55,11 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
     sess_norm = session_norm_team(s)
     # Phase 9: cross-cluster duplicate-auto-label set. Read-time only.
     dup_cluster_ids = find_duplicate_label_cluster_ids(s.clusters)
+    # Phase 11: cross-team guest clusters (phantom siblings). Cheap unless
+    # this session actually has structural candidates (then it loads other
+    # teams' centroids once). {cluster_id: {name, team, session_id, distance}}
+    from app.services.guest_clusters import guest_map_for_session
+    guest_map = guest_map_for_session(db, s)
 
     out = []
     for c in s.clusters:
@@ -102,6 +107,7 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
             "is_likely_coach": bool(c.is_likely_coach),
             "is_coach_for_sort": c.is_coach_for_sort(),
             "manual_coach_override": c.manual_coach_override or 0,
+            "guest_of": guest_map.get(c.id),   # None unless a confirmed cross-team guest
             "images": images,
         })
     return out
