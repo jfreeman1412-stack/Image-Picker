@@ -1,117 +1,107 @@
-# Phase A.2 — DONE
+# Phase A.3 — DONE
 
-Implemented `PHASE_A2_REFERENCE_UPLOAD.md` in full. Three sections, three
-commits, plus this summary. Branch: `phase-A1-overnight` (continued).
+Implemented `PHASE_A3_MATCHING_SERVICE.md` in full. Two sections, two commits,
+plus this summary. Branch: `phase-A1-overnight` (continued).
 
 ## What got built
 
-The first real face data hanging off the A.1 identity spine: a reference photo
-per player, its 512-d InsightFace embedding, automatic quality gates, on-disk
-storage, and the upload/list/delete/replace API. **Purely additive** — one new
-table, one new service, one new router, one new test file, and a 2-line
-registration in `main.py`. `face_detector.py` (the locked InsightFace
-integration) was not touched; A.2 only calls `detect_faces`.
+The matching brain of the reference-photo system: given a face embedding (the
+kind `face_pipeline` produces during a shoot), return the best-matching `Player`
+above a confidence threshold, scored against **all** stored reference
+embeddings. **Purely additive and read-only** — one new service, one new router,
+one new test file, and a 2-line registration in `main.py`. **No new table, no
+migration** (A.3 computes over existing `ReferenceFace`/`Face` rows). The locked
+`face_detector.py` and `face_pipeline.py` were not touched — there is **no
+pipeline integration** (that's A.4); the only consumers are the tests and the
+debug endpoint.
 
-### Section 1 — Model (`backend/app/models/db_models.py`)
-- **`ReferenceFace`** — one row per uploaded reference photo. Columns:
-  `player_id` (FK, hard link), `captured_job_id` (nullable FK — provenance),
-  `image_path`, `original_filename`, `embedding` (512-d float32 `.tobytes()`,
-  stored exactly like `Face.embedding`), `det_score`, `bbox` (JSON),
-  `face_area_ratio`, `created_at`. Index on `player_id`.
-- Added `references` relationship to `Player` with
-  `cascade="all, delete-orphan"`: deleting a Player removes its reference
-  **rows** (file cleanup is the delete/replace service paths' job). Deleting a
-  Job does **not** touch references (no relationship from `Job`) — a person's
-  reference rightly survives a shoot's deletion; a stale `captured_job_id` is
-  accepted.
-- No `db.py` change — `create_all` builds `reference_faces` at startup
-  (verified: `init_db()` adds the table, leaves all existing tables/data
-  intact).
+### Section 1 — Matching core (`backend/app/services/matching.py`)
+- **Tunable module constants:** `HIGH_THRESHOLD = 0.6`, `LOW_THRESHOLD = 0.4`,
+  `MIN_MARGIN = 0.05`, `TOP_N_CANDIDATES = 5`.
+- `cosine_similarity(a, b)` — cosine on the vectors, normalizing defensively
+  (zero-vector guarded) so it's a dot product for the unit ArcFace embeddings
+  but still correct for a stray non-unit vector.
+- `_load_reference_index(db)` — bulk-loads every reference into a player-id
+  array + an (N, 512) matrix + a name map (the `guest_clusters`/`naming_errors`
+  pattern). Separated so A.4 can later cache/reuse it.
+- `match_embedding(db, embedding)` — the heart:
+  1. vectorized `sims = unit_matrix @ unit_query`;
+  2. **MAX over ALL of each player's references** (decision 4 — never
+     first-only), so the rule is correct today (one ref/player) and unchanged
+     when a player gains many;
+  3. rank distinct **players**;
+  4. tier via thresholds + the margin rule (margin compares the top two
+     **players**, so two refs of the same player never read as ambiguous).
+- Returns the documented result dict: `tier` (`high`/`low`/`none`), `reason`
+  (`auto_label`/`ambiguous_margin`/`low_confidence`/`no_match`), `needs_review`,
+  `player_id`, `player_name`, `score`, `margin`, `runner_up`, `candidates`.
+- **Float-boundary determinism:** comparisons use a `_EPS = 1e-6` tolerance so
+  the documented knife-edge cases (`score == 0.6` → high, `score == 0.4` → low,
+  `margin == 0.05` → high) resolve deterministically instead of flipping on
+  float32 round-off / the fact that `0.7 - 0.65 != 0.05` in IEEE floats. `_EPS`
+  is far below any calibration-meaningful difference. (This is the one
+  refinement beyond the hand-off's literal pseudocode — see note below.)
 
-### Section 2 — Quality gate + service (`backend/app/services/references.py`)
-- `evaluate_reference_quality(detections)` — **pure** function (no I/O, no
-  model) that picks the single reference face or raises `ReferenceQualityError`
-  with a stable `code` + clear message. First failure wins:
-  `no_face` → `multiple_faces` → `low_confidence` → `face_too_small`. The
-  multiplicity check fires at the detector's 0.5 floor, so **any second real
-  face triggers `multiple_faces`** (the requested over-alert on bystanders).
-  Thresholds: `REF_MIN_DET_SCORE = 0.65`, `REF_MIN_AREA_RATIO = 0.02`.
-- `add_reference` — validates player (404) + optional captured job (404), runs
-  `face_detector.detect_faces`, enforces the gate (no row / no file on
-  failure), then persists row + file at `data/references/{player_id}/{id}{ext}`.
-  Appends — multiple references per player allowed. Stores original bytes (no
-  re-encode), extension sanitized to jpg/jpeg/png.
-- `list_references`, `delete_reference` (removes row **and** file),
-  `replace_player_references` (validates the new photo **before** wiping, so a
-  failed replace leaves existing references intact).
-- `REFERENCES_DIR` is a module-level dir (mkdir at import), monkeypatchable in
-  tests — mirrors `api/images.py`'s `THUMB_DIR`.
-
-### Section 3 — API (`backend/app/api/references.py`, registered in `main.py`)
-- `POST   /api/players/{player_id}/references` — multipart upload (append);
-  optional `?job_id=` provenance; `ReferenceQualityError` → 400
-  `{error, message}`.
-- `GET    /api/players/{player_id}/references` — list (404 if player missing).
-- `PUT    /api/players/{player_id}/references` — replace all with one.
-- `DELETE /api/players/{player_id}/references/{ref_id}` — delete one.
-- `GET    /api/players/{player_id}/references/{ref_id}/image` — serve the photo
-  (`FileResponse`).
-- All routes nest under `/{player_id}/references...` — no collision with A.1's
-  `/{player_id}` route.
+### Section 2 — Debug API (`backend/app/api/matching.py`, registered in `main.py`)
+- `GET /api/matching/face/{face_id}` — reads the stored `Face.embedding`
+  (`np.frombuffer(..., float32)`), runs `match_embedding`, returns the result
+  dict plus a `thresholds` echo (`{high, low, margin}`) for legible calibration.
+  404 for an unknown face. Manual-inspection only; not wired into the pipeline.
 
 ## Test count
 
-- **Baseline (Phase A.1): 352 passed** — confirmed (collection = 352) before
-  any change.
-- **New this phase: 32** in `backend/tests/test_references.py` (Section 1: 3,
-  Section 2: 20, Section 3: 9 — above the hand-off's ~24 estimate because the
-  quality gate and rejection paths were parametrized for full coverage).
-- **Final: 384 passed**, 0 failed. No existing test modified.
+- **Baseline (Phase A.2): 384 passed** — confirmed (collection = 384) before any
+  change.
+- **New this phase: 19** in `backend/tests/test_matching.py` (Section 1: 16 —
+  cosine + every tier + both margin boundaries + both threshold boundaries + MAX
+  aggregation + same-player-not-ambiguous; Section 2: 3 — HTTP high / none / 404).
+  Slightly above the ~18 estimate.
+- **Final: 403 passed**, 0 failed. No existing test modified.
 
 ## Commits
 
 ```
-d7ad6b7 phase A.2 section 3: reference upload/list/delete/replace API
-d62de9c phase A.2 section 2: reference quality gate + add/list/delete/replace service
-90cf392 phase A.2 section 1: ReferenceFace model
-0a67c62 phase A.2 hand-off doc
+30744b9 phase A.3 section 2: matching debug API endpoint
+1c69eb6 phase A.3 section 1: cosine matching service with tiered thresholds + margin rule
+8e89ecf phase A.3 hand-off doc
 ```
 
 ## What to verify in the morning
 
-1. **Tests:** `cd backend && pytest -v` → 384 passed (352 prior + 32 new).
-2. **Migration safety:** the real `backend/data/player_sort.db` opens with no
-   error and gains exactly one table (`reference_faces`); existing tables/data
-   untouched. (Verified via `init_db()` against the live DB.)
-3. **`face_detector.py` untouched:** `git diff 0a67c62 HEAD --
-   backend/app/services/face_detector.py` is empty. No existing test changed
-   (only the new `test_references.py` was added).
-4. **Acceptance walk-through (optional, by hand or curl; needs the real
-   InsightFace model + a real photo since the tests mock the detector):**
-   - Upload a clean single-face photo → file lands in
-     `data/references/{player_id}/`, 512-d embedding persisted, summary returns
-     `det_score`.
-   - Upload a photo with two people → 400 `multiple_faces`; no-face /
-     low-confidence / too-small each → 400 with their own message; no row or
-     file left behind.
-   - Upload twice for one player → two references; `DELETE` removes one (row +
-     file); `PUT` replaces all with one (a failed `PUT` keeps the old set).
-   - Upload references for the same player against two different `?job_id=`
-     shoots → both list under the player, each carrying its `captured_job_id`.
+1. **Tests:** `cd backend && pytest -v` → 403 passed (384 prior + 19 new).
+2. **No migration:** A.3 added no table — `git diff 8e89ecf HEAD --
+   backend/app/db.py backend/app/models/db_models.py` is empty; `init_db()` is
+   unchanged.
+3. **Locked files untouched:** `git diff 8e89ecf HEAD --
+   backend/app/services/face_detector.py backend/app/services/face_pipeline.py`
+   is empty. No existing test changed (only the new `test_matching.py`).
+4. **Behaviour spot-check (optional, by hand or curl; needs a real `Face` row
+   and `ReferenceFace` rows in the live DB):**
+   - `GET /api/matching/face/{id}` for a face that matches a reference →
+     `tier: "high"`, the right `player_id`, and a `thresholds` block.
+   - A face far from every reference → `tier: "none"`.
+   - The result dict shape matches the A.4 contract (tier / reason /
+     needs_review / player_id / score / margin / runner_up / candidates).
 
-## Tuning / follow-ups (not blockers)
+## Decision / refinement notes (not blockers)
 
-- `REF_MIN_DET_SCORE` (0.65) and `REF_MIN_AREA_RATIO` (0.02) are proposed
-  starting values — tune against real check-in photos. One-line constant
-  changes in `services/references.py`.
-- New service code uses `db.query(...).get(id)` (emits SQLAlchemy
-  `LegacyAPIWarning`) to match the existing codebase convention; migrating the
-  whole codebase to `Session.get()` is a separate cleanup, out of scope here.
+- **`_EPS = 1e-6` tolerance in comparisons.** The hand-off's pseudocode used bare
+  `>=` / `<`. Implemented literally, the documented boundary tests are flaky:
+  IEEE floats make `0.7 - 0.65 = 0.04999999…` (so an "exactly 0.05" margin would
+  wrongly downgrade) and float32(0.6) drifts by ~1e-7 (so an "exactly 0.6" score
+  could fall below HIGH). A tiny `_EPS` absorbs that noise and makes the
+  documented boundaries hold exactly. It changes nothing at calibration scale.
+- **Thresholds are module constants**, as specified — calibrate later by editing
+  one line. Promoting them to the `Setting` store (live tuning) remains a future
+  option, out of scope.
+- New code uses `db.query(Face).get(id)` (emits `LegacyAPIWarning`) to match the
+  existing codebase convention.
 
 ## Out of scope (deferred, as instructed — NOT built)
 
-Face matching / embedding search; pipeline integration; mobile/tablet app + any
-UI; image derivatives (thumbnails / re-encode / EXIF stripping); Player
-merge/split implementation; orphaned-file GC beyond the delete/replace paths;
-`membership_id` provenance (anchored on `captured_job_id` instead — memberships
-are unstable across roster re-uploads); any change to `face_detector.py`.
+Pipeline integration (auto-labelling high-tier faces / queuing low-tier for
+review) — that's **A.4**, and `face_pipeline.py` is untouched; roster-scoped
+candidate filtering (designed so it's an additive change later, but global for
+now); ANN indexes / cross-query caching; persisting match results anywhere;
+threshold UI / live calibration; re-detection / embedding generation; any change
+to `face_detector.py` or `face_pipeline.py`.
