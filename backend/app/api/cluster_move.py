@@ -32,6 +32,7 @@ In both modes:
 """
 import logging
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
@@ -39,6 +40,7 @@ from sqlalchemy.orm import Session as DbSession
 from app.api.clusters import _resort_session_outliers
 from app.db import get_db
 from app.models.db_models import Cluster, Face, Image, ImageRole, Session
+from app.services import matching
 from app.services.face_pipeline import _sort_cluster
 from app.services.roster import normalize_name
 
@@ -207,3 +209,34 @@ def _do_merge(
     _resort_session_outliers(db, source_session_id)
     _resort_session_outliers(db, target_session.id)
     return target.id, _unreview_target(target_session)
+
+
+@router.post("/{cluster_id}/global-match-suggest")
+def global_match_suggest(cluster_id: int, db: DbSession = Depends(get_db)):
+    """Phase A.4: read-only top-N GLOBAL reference matches for a cluster,
+    ignoring roster scope — the conservative escape hatch from decision 1 and
+    the data layer for A.5's "Try global match" button.
+
+    Mutates nothing: it never writes matched_player_id / auto_label /
+    is_likely_coach / review flags. Accepting a suggestion is a separate,
+    explicit user action (rename / set-role) in A.5. 404 if the cluster doesn't
+    exist; an empty cluster returns a clean 'none' result, not a 500.
+    """
+    cluster = db.query(Cluster).get(cluster_id)
+    if cluster is None:
+        raise HTTPException(404, "Cluster not found")
+
+    faces = db.query(Face).filter_by(cluster_id=cluster_id).all()
+    embs = [np.frombuffer(f.embedding, dtype=np.float32) for f in faces]
+    index = matching.load_reference_index(db)            # GLOBAL — no player_ids
+    result = (
+        matching.match_against_index(index, np.stack(embs))
+        if embs else matching._none_result()
+    )
+    result["scope"] = "global_fallback"                  # always — a global query
+    result["thresholds"] = {                             # echo, like the debug endpoint
+        "high": matching.HIGH_THRESHOLD,
+        "low": matching.LOW_THRESHOLD,
+        "margin": matching.MIN_MARGIN,
+    }
+    return result
