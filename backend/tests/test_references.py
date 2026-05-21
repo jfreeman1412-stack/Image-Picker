@@ -9,10 +9,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.db import Base
+from app.db import Base, get_db
+from app.main import app
 from app.models.db_models import Job, Player, ReferenceFace
 from app.services import references
 
@@ -328,3 +330,130 @@ def test_replace_failed_gate_keeps_existing(db, tmp_path, monkeypatch):
     assert db.query(ReferenceFace).one().id == good.id
     assert good_path.exists()
     assert not list(tmp_path.glob(".tmp-*"))
+
+
+# ── Section 3: HTTP endpoints ─────────────────────────────────────────────
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'references-http.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine)
+
+    def _override():
+        s = TestingSessionLocal()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    app.dependency_overrides[get_db] = _override
+    # Reference files land under tmp_path (not the real data/references dir).
+    monkeypatch.setattr(references, "REFERENCES_DIR", tmp_path)
+    try:
+        seed = TestingSessionLocal()
+        try:
+            player = Player(norm_name="eleanorpederson",
+                            display_name="Eleanor-Pederson")
+            job_a = Job(name="Shoot A", root_path="/tmp", has_lines=0)
+            job_b = Job(name="Shoot B", root_path="/tmp", has_lines=0)
+            seed.add_all([player, job_a, job_b]); seed.commit()
+            seed.refresh(player); seed.refresh(job_a); seed.refresh(job_b)
+            pid, jid_a, jid_b = player.id, job_a.id, job_b.id
+        finally:
+            seed.close()
+        c = TestClient(app)
+        c.player_id = pid
+        c.job_a_id = jid_a
+        c.job_b_id = jid_b
+        yield c
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def _upload(client, pid, faces, monkeypatch, *, method="post", job_id=None,
+            filename="ref.jpg"):
+    monkeypatch.setattr(references.face_detector, "detect_faces",
+                        _fake_detector(faces))
+    url = f"/api/players/{pid}/references"
+    params = {"job_id": job_id} if job_id is not None else {}
+    files = {"file": (filename, b"\xff\xd8imagebytes", "image/jpeg")}
+    return getattr(client, method)(url, files=files, params=params)
+
+
+def test_http_round_trip(client, monkeypatch):
+    pid = client.player_id
+    res = _upload(client, pid, [_face(det_score=0.9)], monkeypatch)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["player_id"] == pid
+    ref_id = body["id"]
+
+    listing = client.get(f"/api/players/{pid}/references").json()
+    assert len(listing["items"]) == 1
+    assert listing["items"][0]["id"] == ref_id
+
+    img = client.get(f"/api/players/{pid}/references/{ref_id}/image")
+    assert img.status_code == 200
+    assert img.content == b"\xff\xd8imagebytes"
+
+    res = client.delete(f"/api/players/{pid}/references/{ref_id}")
+    assert res.status_code == 200
+    assert res.json() == {"deleted": 1}
+    assert client.get(f"/api/players/{pid}/references").json()["items"] == []
+
+
+def test_http_multiple_faces_400(client, monkeypatch):
+    res = _upload(client, client.player_id, [_face(), _face()], monkeypatch)
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == "multiple_faces"
+
+
+@pytest.mark.parametrize("faces,code", [
+    ([], "no_face"),
+    ([_face(det_score=0.55)], "low_confidence"),
+    ([_face(area=0.005)], "face_too_small"),
+])
+def test_http_quality_rejections_400(client, monkeypatch, faces, code):
+    res = _upload(client, client.player_id, faces, monkeypatch)
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == code
+
+
+def test_http_unknown_player_404(client, monkeypatch):
+    res = _upload(client, 99999, [_face()], monkeypatch)
+    assert res.status_code == 404
+
+
+def test_http_unknown_job_404(client, monkeypatch):
+    res = _upload(client, client.player_id, [_face()], monkeypatch, job_id=99999)
+    assert res.status_code == 404
+
+
+def test_http_put_replace(client, monkeypatch):
+    pid = client.player_id
+    _upload(client, pid, [_face()], monkeypatch)
+    _upload(client, pid, [_face()], monkeypatch)   # two references now
+    assert len(client.get(f"/api/players/{pid}/references").json()["items"]) == 2
+
+    second = _upload(client, pid, [_face()], monkeypatch,
+                     method="put", filename="new.jpg").json()
+    listing = client.get(f"/api/players/{pid}/references").json()
+    assert len(listing["items"]) == 1                  # wiped 2 → set 1 (not appended)
+    assert listing["items"][0]["id"] == second["id"]
+
+
+def test_http_cross_shoot_provenance(client, monkeypatch):
+    pid = client.player_id
+    _upload(client, pid, [_face()], monkeypatch, job_id=client.job_a_id,
+            filename="a.jpg")
+    _upload(client, pid, [_face()], monkeypatch, job_id=client.job_b_id,
+            filename="b.jpg")
+    listing = client.get(f"/api/players/{pid}/references").json()
+    assert len(listing["items"]) == 2
+    assert {i["captured_job_id"] for i in listing["items"]} == {
+        client.job_a_id, client.job_b_id}
