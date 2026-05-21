@@ -6,11 +6,13 @@ import math
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.db import Base
-from app.models.db_models import Player, ReferenceFace
+from app.db import Base, get_db
+from app.main import app
+from app.models.db_models import Face, Image, Player, ReferenceFace
 from app.services import matching
 
 
@@ -189,3 +191,72 @@ def test_same_player_top_two_not_ambiguous(db):
     assert res["tier"] == "high"
     assert res["reason"] == "auto_label"
     assert res["player_id"] == alice.id
+
+
+# ── Section 2: debug API ──────────────────────────────────────────────────
+
+@pytest.fixture
+def client(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'matching-http.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine)
+
+    def _override():
+        s = TestingSessionLocal()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    app.dependency_overrides[get_db] = _override
+    try:
+        seed = TestingSessionLocal()
+        try:
+            alice = Player(norm_name="alice", display_name="Alice")
+            seed.add(alice); seed.flush()
+            seed.add(ReferenceFace(
+                player_id=alice.id, image_path="/tmp/a.jpg",
+                embedding=_ref_at(1.0).tobytes(), det_score=0.9))
+            img = Image(path="/tmp/face.jpg", filename="face.jpg")
+            seed.add(img); seed.flush()
+            match_face = Face(image_id=img.id, bbox="[0,0,10,10]",
+                              embedding=_ref_at(1.0).tobytes(), det_score=0.9)
+            far_face = Face(image_id=img.id, bbox="[0,0,10,10]",
+                            embedding=_ref_at(0.1).tobytes(), det_score=0.9)
+            seed.add_all([match_face, far_face]); seed.commit()
+            c_alice_id = alice.id
+            c_match_face_id = match_face.id
+            c_far_face_id = far_face.id
+        finally:
+            seed.close()
+        c = TestClient(app)
+        c.alice_id = c_alice_id
+        c.match_face_id = c_match_face_id
+        c.far_face_id = c_far_face_id
+        yield c
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_http_match_face_high(client):
+    res = client.get(f"/api/matching/face/{client.match_face_id}")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["tier"] == "high"
+    assert body["player_id"] == client.alice_id
+    assert body["thresholds"]["high"] == 0.6
+
+
+def test_http_match_face_none(client):
+    res = client.get(f"/api/matching/face/{client.far_face_id}")
+    assert res.status_code == 200
+    assert res.json()["tier"] == "none"
+
+
+def test_http_unknown_face_404(client):
+    res = client.get("/api/matching/face/99999")
+    assert res.status_code == 404

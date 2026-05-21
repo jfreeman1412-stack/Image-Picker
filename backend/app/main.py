@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
-    browse, sessions, clusters, cluster_move, images, jobs, players,
+    browse, sessions, clusters, cluster_move, images, jobs, matching, players,
     references, roster, settings,
 )
 from app.db import init_db
@@ -62,6 +62,7 @@ app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
 app.include_router(roster.router, prefix="/api/jobs", tags=["roster"])
 app.include_router(players.router, prefix="/api/players", tags=["players"])
 app.include_router(references.router, prefix="/api/players", tags=["references"])
+app.include_router(matching.router, prefix="/api/matching", tags=["matching"])
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(clusters.router, prefix="/api/sessions", tags=["clusters"])
 app.include_router(cluster_move.router, prefix="/api/clusters", tags=["cluster-move"])
