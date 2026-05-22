@@ -42,6 +42,28 @@ async function peek(path) {
   return res.json();
 }
 
+/** Shape a single /peek result into the same {team_count, team_total,
+ * candidates[]} envelope that /scan-image-locations returns, so step 6 has one
+ * render path. Used for single-team jobs (one folder, no outlier risk). */
+function candidatesFromPeek(p) {
+  const candidates = [
+    {
+      subfolder: null,
+      image_count: p.image_count || 0,
+      raw_count: p.raw_count || 0,
+      teams_with: (p.image_count || 0) > 0 ? 1 : 0,
+    },
+    ...(p.subfolders || []).map((s) => ({
+      subfolder: s.name,
+      image_count: s.image_count || 0,
+      raw_count: s.raw_count || 0,
+      teams_with: (s.image_count || 0) > 0 ? 1 : 0,
+    })),
+  ];
+  candidates.sort((a, b) => b.image_count - a.image_count || b.teams_with - a.teams_with);
+  return { team_count: 1, team_total: 1, candidates };
+}
+
 
 export default function JobWizard() {
   const nav = useNavigate();
@@ -54,7 +76,7 @@ export default function JobWizard() {
   const [rootPeek, setRootPeek] = useState(null);
   const [hasLines, setHasLines] = useState(null);            // true | false | 'single'
   const [teamFolders, setTeamFolders] = useState([]);
-  const [firstTeamPeek, setFirstTeamPeek] = useState(null);
+  const [imageLocations, setImageLocations] = useState(null);  // {team_count, team_total, candidates[]}
   const [imageSubfolder, setImageSubfolder] = useState(null);
   const [autoRun, setAutoRun] = useState(true);
 
@@ -130,7 +152,9 @@ export default function JobWizard() {
         setTeamFolders(rootPeek.subfolders);
         setStep('teams');
       } else {
-        // 'single' — the whole root is one team.
+        // 'single' — the whole root is one team. One folder, so there's no
+        // anomalous-first-folder risk; build the candidate list locally from
+        // the root peek in the same shape the scan endpoint returns.
         const inside = await peek(rootPath);
         const teamName = rootPeek.path.split(/[\\/]/).pop();
         setTeamFolders([{
@@ -139,23 +163,34 @@ export default function JobWizard() {
           image_count: rootPeek.image_count,
           raw_count: rootPeek.raw_count,
         }]);
-        setFirstTeamPeek({ ...inside, name: teamName });
+        setImageLocations(candidatesFromPeek(inside));
         setStep('subfolder');
       }
     } catch (e) { setError(String(e.message || e)); }
     finally { setBusy(false); }
   };
 
-  /** From teams confirmation → /peek first team to find image subfolders. */
+  /** From teams confirmation → scan EVERY team folder (server-side) to find
+   * where the images live. We aggregate across all teams instead of sampling
+   * one: the first folder alphabetically is often a non-team outlier like
+   * "_Color Swatch" (case-insensitive sort puts "_" before letters) with no
+   * image subfolder, which would otherwise hide the real "Adjusted"/"JPG"
+   * subfolder from step 6. The scan reports each candidate's total image count
+   * and how many teams contain it, so the right pick is obvious. */
   const confirmTeams = async () => {
     reset(); setBusy(true);
     try {
-      const firstTeam = teamFolders[0];
-      const teamPath = hasLines === true
-        ? `${rootPath}\\${rootPeek.subfolders[0].name}\\${firstTeam.name}`
-        : `${rootPath}\\${firstTeam.name}`;
-      const inside = await peek(teamPath);
-      setFirstTeamPeek({ ...inside, name: firstTeam.name });
+      const res = await fetch('/api/jobs/scan-image-locations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root_path: rootPath, has_lines: hasLines === true }),
+      });
+      if (!res.ok) {
+        let msg;
+        try { msg = await res.text(); } catch { msg = `HTTP ${res.status}`; }
+        throw new Error(msg);
+      }
+      setImageLocations(await res.json());
       setStep('subfolder');
     } catch (e) { setError(String(e.message || e)); }
     finally { setBusy(false); }
@@ -385,34 +420,51 @@ export default function JobWizard() {
           <p className="muted">{teamFolders.length} teams total.</p>
           <div className="actions">
             <button className="ghost" onClick={() => setStep('structure')}>← Back</button>
-            <button disabled={busy} onClick={confirmTeams}>Looks right →</button>
+            <button disabled={busy} onClick={confirmTeams}>
+              {busy ? 'Scanning teams…' : 'Looks right →'}
+            </button>
           </div>
         </section>
       )}
 
       {/* Step 6: Image subfolder */}
-      {step === 'subfolder' && firstTeamPeek && (
+      {step === 'subfolder' && imageLocations && (
         <section className="card">
           <h2>Where are the images?</h2>
-          <p>
-            Looking inside <code>{firstTeamPeek.name}</code>: found{' '}
-            <b>{firstTeamPeek.image_count}</b> images and <b>{firstTeamPeek.raw_count}</b> raws
-            in the team-folder root, plus <b>{firstTeamPeek.subfolders.length}</b> subfolders.
-          </p>
-          <p className="warn">
-            The pattern you pick here applies to <b>every</b> team folder in the job.
+          <p className="muted">
+            Scanned <b>{imageLocations.team_count}</b>
+            {imageLocations.team_total > imageLocations.team_count
+              ? <> of {imageLocations.team_total}</> : null}{' '}
+            team folder{imageLocations.team_count === 1 ? '' : 's'}. Pick where the
+            photos to sort live — the same pattern applies to <b>every</b> team.
           </p>
           <div className="wizard-choices">
-            <button onClick={() => chooseImageLocation(null)}>
-              Images are in the team-folder root
-            </button>
-            {firstTeamPeek.subfolders.map((sub) => (
-              <button key={sub.name} onClick={() => chooseImageLocation(sub.name)}>
-                Images are in subfolder "{sub.name}"
-                <span className="muted"> ({sub.image_count} images)</span>
+            {imageLocations.candidates.map((c, i) => (
+              <button
+                key={c.subfolder ?? '__root__'}
+                className={i === 0 && c.image_count > 0 ? 'primary' : ''}
+                onClick={() => chooseImageLocation(c.subfolder)}
+              >
+                {c.subfolder
+                  ? <>Images are in subfolder "<b>{c.subfolder}</b>"</>
+                  : 'Images are in the team-folder root'}
+                <span className="muted">
+                  {' '}({c.image_count} image{c.image_count === 1 ? '' : 's'}
+                  {c.raw_count ? `, ${c.raw_count} raw` : ''}
+                  {imageLocations.team_count > 1
+                    ? `, in ${c.teams_with} of ${imageLocations.team_count} teams` : ''})
+                </span>
               </button>
             ))}
           </div>
+          {imageLocations.candidates.every((c) => c.image_count === 0) && (
+            <p className="warn">
+              No sortable images (JPG/PNG/TIFF…) were found in any of these
+              locations{imageLocations.candidates.some((c) => c.raw_count) ? ' — only RAW files' : ''}.
+              If your processed images live in a subfolder that isn't listed, they
+              may be nested deeper, or not exported from your editor yet.
+            </p>
+          )}
           <div className="actions">
             <button
               className="ghost"

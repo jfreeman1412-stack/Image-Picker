@@ -17,6 +17,7 @@ DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 """
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -96,6 +97,97 @@ def peek_folder(payload: PeekRequest):
         "subfolders": subfolders,
         "image_count": image_count,
         "raw_count": raw_count,
+    }
+
+
+# ── Scan image locations across ALL team folders (wizard step 6) ──────────────
+
+
+class ScanImageLocationsRequest(BaseModel):
+    root_path: str
+    has_lines: bool
+    max_teams: int = 60  # bound the scan on a slow/large UNC share
+
+
+def _count_dir_by_ext(path: Path) -> tuple[int, int, list[str]]:
+    """(supported_images, raws, subdir_names) for one directory, one scandir
+    pass. Uses os.scandir so the dirent type is cached — far fewer stat() round
+    trips than Path.iterdir()+is_file(), which matters a lot over UNC shares."""
+    imgs = raws = 0
+    subdirs: list[str] = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_dir():
+                        subdirs.append(e.name)
+                        continue
+                    if e.is_file():
+                        ext = os.path.splitext(e.name)[1].lower()
+                        if ext in SUPPORTED_EXTS:
+                            imgs += 1
+                        elif ext in RAW_EXTS:
+                            raws += 1
+                except OSError:
+                    continue
+    except (PermissionError, OSError) as exc:
+        logger.warning("[scan] could not read %s: %s", path, exc)
+    return imgs, raws, subdirs
+
+
+@router.post("/scan-image-locations")
+def scan_image_locations(payload: ScanImageLocationsRequest):
+    """Aggregate where the sortable images live across EVERY team folder, so
+    the wizard's 'Where are the images?' step doesn't get fooled by an
+    anomalous first folder (e.g. a `_Color Swatch` calibration folder that
+    sorts first but has no `Adjusted/` subfolder). Returns candidate locations
+    — the team-folder root plus every subfolder name seen — each with the total
+    sortable-image count and how many teams contain it, sorted best-first.
+    """
+    root = Path(payload.root_path)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(400, f"Not a directory: {payload.root_path}")
+
+    team_dirs = list(_iter_team_folders(root, payload.has_lines))
+    scanned = team_dirs[: max(1, payload.max_teams)]
+
+    root_imgs = root_raws = root_teams = 0
+    sub_imgs: dict[str, int] = {}
+    sub_raws: dict[str, int] = {}
+    sub_teams: dict[str, int] = {}
+
+    for team in scanned:
+        t_imgs, t_raws, subdirs = _count_dir_by_ext(team)
+        root_imgs += t_imgs
+        root_raws += t_raws
+        if t_imgs:
+            root_teams += 1
+        for name in subdirs:
+            s_imgs, s_raws, _ = _count_dir_by_ext(team / name)
+            sub_imgs[name] = sub_imgs.get(name, 0) + s_imgs
+            sub_raws[name] = sub_raws.get(name, 0) + s_raws
+            sub_teams[name] = sub_teams.get(name, 0) + 1
+
+    candidates = [{
+        "subfolder": None,
+        "image_count": root_imgs,
+        "raw_count": root_raws,
+        "teams_with": root_teams,
+    }]
+    for name in sub_imgs:
+        candidates.append({
+            "subfolder": name,
+            "image_count": sub_imgs[name],
+            "raw_count": sub_raws[name],
+            "teams_with": sub_teams[name],
+        })
+    # Best first: most sortable images, then most teams covered.
+    candidates.sort(key=lambda c: (c["image_count"], c["teams_with"]), reverse=True)
+
+    return {
+        "team_count": len(scanned),
+        "team_total": len(team_dirs),
+        "candidates": candidates,
     }
 
 
