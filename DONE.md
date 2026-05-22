@@ -139,3 +139,38 @@ re-matching on reassign/merge (matching runs only on a full `run_pipeline`, like
 global fallback when a roster exists but has no references; ANN indexes /
 cross-session caching / persisting per-face matches; threshold UI; any change to
 `face_detector.py` or `match_embedding`'s contract.
+
+## Smoke-test findings (real-data verification — pre-merge, not in tests)
+
+A.4 was exercised against one real shoot (110 individual portraits, 15 players,
+filenames as ground truth; CPU detection — no CUDA on this laptop). Integration
+ran end-to-end (`status=done`; the matching stage slots in after labeling /
+before sorting), and the decision logic behaved exactly as specified: held-out
+same-session accuracy 15/15 (conf 0.84–0.96); agreement fired no flag; a
+deliberately mislabeled reference fired `match_label_conflict` with copyright
+winning the label; gap-fill populated `auto_label` + `auto_label_source='match'`
+on a no-copyright cluster. Three findings to record before this is trusted:
+
+1. **The A.2 reference-quality gate rejects shoot photos.** Every face in the
+   shoot is far below the gate's `REF_MIN_AREA_RATIO = 0.02` — max observed face
+   area was **0.0075** of the frame (these are full-body poses), and a real
+   upload returned `400 face_too_small`. **Reference photos must be dedicated
+   close-up captures (the phone/tablet check-in flow), not pulled from shoot
+   folders.**
+
+2. **Cross-capture accuracy is the key untested unknown.** All numbers above are
+   the *same-session ceiling* — reference and query are different frames of the
+   same shoot, minutes apart (same-person cosine ≈ 0.78–0.94 vs ≤ 0.32 for
+   different children, so the 0.6/0.4 thresholds sit cleanly in the gap). The
+   realistic case — a close-up reference matched against a shoot face on a
+   different day/lighting/distance — will score lower and has **not** been
+   measured. Necessary, not sufficient; validating it needs real close-up
+   references.
+
+3. **On current real data, matching is redundant with copyright.** Every cluster
+   that matched confidently already carried a correct copyright `auto_label`
+   (agreement), and every no-copyright cluster was a degraded background fragment
+   that was unmatchable (all tier `none`, top score ≤ 0.38). So gap-fill adds no
+   value *today*; A.4's value is the **future no-copyright state** (plus conflict
+   detection in the interim) — exactly the transitional rationale behind
+   Decision 2.
