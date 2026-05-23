@@ -1,0 +1,56 @@
+/* Phase B.1 capture app — mobile-first dark theme. Reuses the Player Sort token
+ * names (see frontend/src/styles.css) but only the subset this app needs. */
+:root {
+  --bg:         #0b0d12;
+  --bg-elev-1:  #14171f;
+  --border:     #232833;
+  --text:       #e6e8ee;
+  --text-muted: #9aa3b2;
+  --accent:     #6ea8fe;
+  --radius-lg:  12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Full-viewport and notch-aware (pairs with viewport-fit=cover). 100dvh tracks
+ * the dynamic viewport so mobile browser chrome doesn't clip the layout. */
+.screen {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding:
+    max(16px, env(safe-area-inset-top)) 16px
+    max(16px, env(safe-area-inset-bottom));
+}
+
+.card {
+  width: 100%;
+  max-width: 360px;
+  padding: 28px 24px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  text-align: center;
+}
+
+.card h1 { margin: 0 0 6px; font-size: 1.6rem; }
+.muted { margin: 0; color: var(--text-muted); }
+.target { margin: 16px 0 0; color: var(--text-muted); font-size: 0.9rem; }
+
+.card code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #0008;
+  color: var(--accent);
+}

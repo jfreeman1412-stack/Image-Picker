@@ -23,3 +23,7 @@ backend/data/uploads/
 
 # Local agent / tooling state
 .claude/
+
+# Local env files (keep .env.example tracked)
+.env
+.env.local
