@@ -5,11 +5,12 @@ cross-check (`/api/jobs/{job_id}/roster`) — that flags name/team mismatches;
 this builds a global `Player` (unique person) + per-shoot `PlayerMembership`.
 See PHASE_A1_ROSTER_MODEL.md.
 
-    POST   /api/players/roster/{job_id}   upload (multipart CSV) — replaces shoot
-    GET    /api/players/roster/{job_id}   list this shoot's memberships
-    DELETE /api/players/roster/{job_id}   clear this shoot's memberships
-    GET    /api/players                   list/query unique players (?q,?limit,?offset)
-    GET    /api/players/{player_id}       one player + memberships across shoots
+    POST   /api/players/roster/{job_id}                  upload (multipart CSV) — replaces shoot
+    GET    /api/players/roster/{job_id}                  list this shoot's memberships
+    GET    /api/players/roster/{job_id}/reference-status which players have a photo FOR this shoot
+    DELETE /api/players/roster/{job_id}                  clear this shoot's memberships
+    GET    /api/players                                  list/query unique players (?q,?limit,?offset)
+    GET    /api/players/{player_id}                      one player + memberships across shoots
 
 Static `/roster/...` routes are declared BEFORE the dynamic `/{player_id}`
 route so FastAPI matches them correctly.
@@ -21,7 +22,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
-from app.models.db_models import Job, Player, PlayerMembership
+from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
 from app.services.players import load_shoot_roster_from_text
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
@@ -75,6 +76,25 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
         ],
         "distinct_teams": len({m.norm_team for m in memberships}),
     }
+
+
+@router.get("/roster/{job_id}/reference-status")
+def shoot_reference_status(job_id: int, db: DbSession = Depends(get_db)):
+    """Phase B.2 — which players already have a reference photo captured FOR
+    THIS shoot (the check-in ✓ status). **Shoot-scoped:** a reference captured
+    for a different shoot, or with no provenance (`captured_job_id IS NULL`,
+    e.g. a B.1 upload), does NOT count — each shoot needs its own photo. 404 if
+    the job is missing. Counts a player regardless of whether they're still on
+    the current roster; the caller only badges players it displays."""
+    if db.query(Job).get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    rows = (
+        db.query(ReferenceFace.player_id)
+        .filter(ReferenceFace.captured_job_id == job_id)
+        .distinct()
+        .all()
+    )
+    return {"player_ids_with_references": [pid for (pid,) in rows]}
 
 
 @router.delete("/roster/{job_id}")

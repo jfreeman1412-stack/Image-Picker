@@ -13,7 +13,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base, get_db
 from app.main import app
-from app.models.db_models import Job, Player, PlayerMembership, Session
+from app.models.db_models import (
+    Job, Player, PlayerMembership, ReferenceFace, Session,
+)
 from app.services.players import (
     is_coach_name, load_shoot_roster_from_text, replace_shoot_memberships,
     upsert_player,
@@ -292,6 +294,7 @@ def client(tmp_path):
         c = TestClient(app)
         c.job_a_id = job_a_id
         c.job_b_id = job_b_id
+        c.SessionLocal = TestingSessionLocal  # for tests that seed rows directly
         yield c
     finally:
         app.dependency_overrides.clear()
@@ -416,4 +419,67 @@ def test_endpoint_player_detail_cross_shoot(client):
 
 def test_endpoint_player_detail_unknown_404(client):
     res = client.get("/api/players/99999")
+    assert res.status_code == 404
+
+
+# ── Phase B.2: roster reference-status (shoot-scoped ✓) ────────────────────
+
+def _seed_ref(client, player_id, captured_job_id):
+    """Insert a ReferenceFace row directly (no detector needed — the endpoint
+    only reads player_id + captured_job_id)."""
+    s = client.SessionLocal()
+    try:
+        s.add(ReferenceFace(
+            player_id=player_id, captured_job_id=captured_job_id,
+            image_path="x", embedding=b"\x00", det_score=0.9,
+        ))
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_reference_status_is_shoot_scoped(client):
+    """Only a reference captured FOR THIS shoot counts toward ✓. A ref from a
+    different shoot, or with no provenance (NULL), does not — and the isolation
+    holds in both directions (cross-shoot identity, one Player, two shoots)."""
+    job_a, job_b = client.job_a_id, client.job_b_id
+    client.post(f"/api/players/roster/{job_a}",
+                files={"file": ("a.csv",
+                                b"Eleanor-Pederson,T1\nJune-Wampach,T1\n", "text/csv")})
+    client.post(f"/api/players/roster/{job_b}",
+                files={"file": ("b.csv", b"Eleanor-Pederson,T2\n", "text/csv")})
+
+    roster_a = client.get(f"/api/players/roster/{job_a}").json()["items"]
+    pid = {i["name"]: i["player_id"] for i in roster_a}
+    eleanor, june = pid["Eleanor-Pederson"], pid["June-Wampach"]
+
+    _seed_ref(client, eleanor, job_a)   # Eleanor: captured FOR job_a
+    _seed_ref(client, june, job_b)      # June: captured for a DIFFERENT shoot
+    _seed_ref(client, june, None)       # June: a no-provenance (B.1-style) ref
+
+    status_a = client.get(f"/api/players/roster/{job_a}/reference-status")
+    assert status_a.status_code == 200, status_a.text
+    ids_a = status_a.json()["player_ids_with_references"]
+    assert eleanor in ids_a             # ✓ — has a photo for THIS shoot
+    assert june not in ids_a            # only other-shoot / NULL refs → not ✓
+
+    # job_b sees the mirror image: June's job_b ref counts; Eleanor's job_a
+    # ref does not leak across.
+    ids_b = client.get(f"/api/players/roster/{job_b}/reference-status").json()[
+        "player_ids_with_references"]
+    assert june in ids_b
+    assert eleanor not in ids_b
+
+
+def test_reference_status_empty_when_no_refs_for_shoot(client):
+    job_a = client.job_a_id
+    client.post(f"/api/players/roster/{job_a}",
+                files={"file": ("a.csv", b"Eleanor-Pederson,T1\n", "text/csv")})
+    res = client.get(f"/api/players/roster/{job_a}/reference-status")
+    assert res.status_code == 200
+    assert res.json()["player_ids_with_references"] == []
+
+
+def test_reference_status_unknown_job_404(client):
+    res = client.get("/api/players/roster/99999/reference-status")
     assert res.status_code == 404
