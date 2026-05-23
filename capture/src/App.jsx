@@ -5,6 +5,10 @@
 //   Section 5: upload the still to the A.2 reference endpoint, with success and
 //              quality-rejection UI. The camera stays live throughout, so
 //              Retake / Capture another return to the preview instantly.
+//   Section 6: top bar showing the target player + endpoint (so a tester knows
+//              what they're uploading as); the state machine itself was already
+//              assembled across 2–5 (live → review → uploading → success|error
+//              → live; camera acquired once, torn down on unmount).
 // Uploads target VITE_REF_PLAYER_ID. See ../PHASE_B1_CAPTURE_PROTOTYPE.md.
 import { useEffect, useState } from 'react';
 import useCamera from './useCamera.js';
@@ -120,6 +124,13 @@ export default function App() {
   return (
     <main className="camera-screen">
       <video ref={videoRef} className="camera-video" autoPlay playsInline muted />
+
+      <header className="topbar">
+        <span className="topbar-title">Reference capture</span>
+        <span className="topbar-target" title={`POST /api/players/${PLAYER_ID}/references`}>
+          {PLAYER_ID ? `→ player #${PLAYER_ID}` : 'no player set'}
+        </span>
+      </header>
 
       {shot && <img className="shot-image" src={shot.url} alt="Captured photo" />}
 

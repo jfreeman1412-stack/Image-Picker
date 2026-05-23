@@ -16,7 +16,7 @@
 
 * { box-sizing: border-box; }
 
-html, body, #root { height: 100%; }
+html, body, #root { height: 100%; overflow: hidden; }  /* full-screen camera — no page scroll/bounce */
 
 body {
   margin: 0;
@@ -214,3 +214,24 @@ body {
 .result-meta { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
 
 .controls-inline { display: flex; gap: 12px; }
+
+/* ── Top bar (Section 6) ────────────────────────────────────────────────────
+ * Context for the tester: what player this uploads as. Non-interactive so it
+ * never intercepts taps. */
+.topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: max(10px, env(safe-area-inset-top)) 16px 10px;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0));
+  color: #fff;
+  pointer-events: none;
+}
+.topbar-title { font-size: 0.95rem; font-weight: 600; }
+.topbar-target { font-size: 0.85rem; color: var(--text-muted); }
