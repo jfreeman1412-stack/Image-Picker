@@ -8,6 +8,8 @@
   --text-muted:    #9aa3b2;
   --accent:        #6ea8fe;
   --accent-strong: #3b82f6;
+  --success:       #34d399;
+  --warn:          #f5b056;
   --radius:        8px;
   --radius-lg:     12px;
 }
@@ -169,18 +171,46 @@ body {
   color: #fff;
 }
 
-/* Status banner (e.g. the Section 5 upload seam). */
-.banner {
+/* ── Upload result / status (Section 5) ─────────────────────────────────── */
+
+.status-pill {
   position: absolute;
-  top: max(16px, env(safe-area-inset-top));
   left: 50%;
+  bottom: max(40px, calc(env(safe-area-inset-bottom) + 32px));
   transform: translateX(-50%);
   z-index: 3;
-  max-width: calc(100vw - 32px);
-  padding: 8px 14px;
-  border-radius: var(--radius);
-  background: rgba(0, 0, 0, 0.7);
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
   color: #fff;
-  font-size: 0.9rem;
+  font-size: 1rem;
+}
+
+/* Bottom panel for success / failure, over a gradient so text stays legible
+ * on top of the captured photo. */
+.result-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 24px max(20px, calc(env(safe-area-inset-bottom) + 16px));
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0));
   text-align: center;
 }
+
+.result-line {
+  margin: 0;
+  max-width: 360px;
+  font-size: 1.05rem;
+  line-height: 1.4;
+}
+.result-line.success { color: var(--success); font-weight: 600; }
+.result-line.warn { color: var(--warn); }
+.result-meta { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
+
+.controls-inline { display: flex; gap: 12px; }

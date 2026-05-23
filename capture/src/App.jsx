@@ -1,21 +1,24 @@
 // Phase B.1 — capture screen.
-//   Section 2: open the rear camera (useCamera).
-//   Section 3: fixed framing oval (guidance only).
-//   Section 4: capture a still → review → Retake / Use photo.
-// The captured JPEG is the FULL frame (the oval doesn't crop). The camera
-// stream stays live across capture/retake so retake is instant — we never
-// re-acquire it. "Use photo" lands on a placeholder "ready" state; Section 5
-// replaces it with the multipart upload to the reference endpoint.
-// See ../PHASE_B1_CAPTURE_PROTOTYPE.md.
+//   Section 2: rear camera (useCamera).
+//   Section 3: framing oval (guidance only).
+//   Section 4: capture a still → review.
+//   Section 5: upload the still to the A.2 reference endpoint, with success and
+//              quality-rejection UI. The camera stays live throughout, so
+//              Retake / Capture another return to the preview instantly.
+// Uploads target VITE_REF_PLAYER_ID. See ../PHASE_B1_CAPTURE_PROTOTYPE.md.
 import { useEffect, useState } from 'react';
 import useCamera from './useCamera.js';
 
+const PLAYER_ID = import.meta.env.VITE_REF_PLAYER_ID;
+
 export default function App() {
   const { videoRef, status, error } = useCamera();
-  const [shot, setShot] = useState(null);        // { blob, url } | null
-  const [confirmed, setConfirmed] = useState(false);
+  const [shot, setShot] = useState(null);               // { blob, url } | null
+  const [upload, setUpload] = useState('idle');         // idle | uploading | success | error
+  const [result, setResult] = useState(null);           // success summary dict | null
+  const [uploadError, setUploadError] = useState(null); // { kind, message } | null
 
-  // Free the object URL when the shot changes or the screen unmounts.
+  // Free the captured object URL when the shot changes or the screen unmounts.
   useEffect(() => {
     if (!shot) return undefined;
     return () => URL.revokeObjectURL(shot.url);
@@ -40,25 +43,86 @@ export default function App() {
     );
   };
 
-  const retake = () => {
+  // Back to a live preview, ready to shoot again (Retake / Capture another).
+  const reset = () => {
     setShot(null);          // effect cleanup revokes the URL
-    setConfirmed(false);
+    setUpload('idle');
+    setResult(null);
+    setUploadError(null);
   };
-  const usePhoto = () => setConfirmed(true);
+
+  const sendUpload = async () => {
+    if (!shot) return;
+    if (!PLAYER_ID) {
+      setUploadError({
+        kind: 'not_found',
+        message:
+          'VITE_REF_PLAYER_ID is not set. Point capture/.env at a real player id ' +
+          'and restart the dev server.',
+      });
+      setUpload('error');
+      return;
+    }
+    setUpload('uploading');
+    setUploadError(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', shot.blob, 'capture.jpg');
+      const res = await fetch(`/api/players/${PLAYER_ID}/references`, {
+        method: 'POST',
+        body: fd,
+      });
+      if (!res.ok) {
+        // 400 quality gate → detail is { error, message }; 404 → detail is a string.
+        const body = await res.json().catch(() => ({}));
+        const code = body?.detail?.error;
+        if (res.status === 404) {
+          setUploadError({
+            kind: 'not_found',
+            message:
+              `Player #${PLAYER_ID} wasn’t found on the server. Set ` +
+              `VITE_REF_PLAYER_ID to a real player id (see README) and restart.`,
+          });
+        } else if (code) {
+          setUploadError({ kind: 'quality', code, message: body.detail.message });
+        } else {
+          setUploadError({
+            kind: 'other',
+            message:
+              (typeof body?.detail === 'string' && body.detail) ||
+              `Upload failed (HTTP ${res.status}).`,
+          });
+        }
+        setUpload('error');
+        return;
+      }
+      setResult(await res.json());
+      setUpload('success');
+    } catch {
+      setUploadError({
+        kind: 'network',
+        message: 'Upload failed — check the connection and try again.',
+      });
+      setUpload('error');
+    }
+  };
 
   const live = status === 'live';
-  const capturing = live && !shot;             // live preview, ready to shoot
-  const reviewing = live && shot && !confirmed; // froze a shot, deciding
-  const ready = live && shot && confirmed;      // accepted (Section 5 will upload)
+  const capturing = live && !shot;
+  const reviewing = live && shot && upload === 'idle';
+  const uploading = live && shot && upload === 'uploading';
+  const succeeded = live && shot && upload === 'success';
+  const failed = live && shot && upload === 'error';
+  // Network/unknown failures can retry the same blob; a quality rejection or a
+  // missing player needs a fresh shot (or a config fix), so only Retake there.
+  const retryable = failed && (uploadError?.kind === 'network' || uploadError?.kind === 'other');
 
   return (
     <main className="camera-screen">
       <video ref={videoRef} className="camera-video" autoPlay playsInline muted />
 
-      {/* The frozen still sits above the live video during review/ready. */}
       {shot && <img className="shot-image" src={shot.url} alt="Captured photo" />}
 
-      {/* Framing oval only while composing a live shot. */}
       {capturing && (
         <div className="frame-overlay" aria-hidden="true">
           <div className="frame-oval" />
@@ -66,25 +130,42 @@ export default function App() {
         </div>
       )}
 
-      {ready && (
-        <div className="banner">Photo ready — uploading is wired in Section 5.</div>
-      )}
-
-      {/* Controls (interactive — outside the pointer-events:none overlay). */}
       {capturing && (
         <div className="controls">
           <button className="shutter" onClick={capture} aria-label="Capture photo" />
         </div>
       )}
+
       {reviewing && (
         <div className="controls">
-          <button className="btn ghost" onClick={retake}>Retake</button>
-          <button className="btn" onClick={usePhoto}>Use photo</button>
+          <button className="btn ghost" onClick={reset}>Retake</button>
+          <button className="btn" onClick={sendUpload}>Use photo</button>
         </div>
       )}
-      {ready && (
-        <div className="controls">
-          <button className="btn ghost" onClick={retake}>Capture another</button>
+
+      {uploading && <div className="status-pill">Uploading…</div>}
+
+      {succeeded && result && (
+        <div className="result-panel">
+          <p className="result-line success">✓ Saved as player #{result.player_id}</p>
+          <p className="result-meta">
+            detection {Number(result.det_score).toFixed(2)}
+            {result.face_area_ratio != null &&
+              ` · face ${(result.face_area_ratio * 100).toFixed(1)}% of frame`}
+          </p>
+          <button className="btn" onClick={reset}>Capture another</button>
+        </div>
+      )}
+
+      {failed && uploadError && (
+        <div className="result-panel">
+          <p className="result-line warn">{uploadError.message}</p>
+          <div className="controls-inline">
+            <button className="btn ghost" onClick={reset}>Retake</button>
+            {retryable && (
+              <button className="btn" onClick={sendUpload}>Try again</button>
+            )}
+          </div>
         </div>
       )}
 
