@@ -1,8 +1,8 @@
-// Phase B.1 — Section 2: live camera preview. Opens the rear camera via
-// getUserMedia and fills the screen with the feed; the framing oval (Section 3),
-// capture (Section 4), and upload (Section 5) build on top of this. Permission,
-// insecure-context, and no-camera failures each show a clear message.
-// See ../PHASE_B1_CAPTURE_PROTOTYPE.md.
+// Phase B.1 — capture screen. Section 2 opened the rear camera (useCamera);
+// Section 3 adds the fixed framing oval the volunteer fills with the player's
+// face. It's purely visual guidance — no crop, no gate (pointer-events: none) —
+// sized large enough that a filled face clears A.2's 2% area gate with no
+// client-side detection. See ../PHASE_B1_CAPTURE_PROTOTYPE.md.
 import useCamera from './useCamera.js';
 
 export default function App() {
@@ -11,6 +11,13 @@ export default function App() {
   return (
     <main className="camera-screen">
       <video ref={videoRef} className="camera-video" autoPlay playsInline muted />
+
+      {status === 'live' && (
+        <div className="frame-overlay" aria-hidden="true">
+          <div className="frame-oval" />
+          <p className="frame-hint">Fill the oval with the player’s face</p>
+        </div>
+      )}
 
       {status === 'starting' && (
         <div className="camera-overlay">

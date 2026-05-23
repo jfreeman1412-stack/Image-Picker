@@ -82,3 +82,41 @@ body {
   cursor: pointer;
 }
 .btn:active { opacity: 0.85; }
+
+/* ── Framing oval (Section 3) ───────────────────────────────────────────────
+ * Purely visual guidance over the live feed: a centered vertical oval with the
+ * surround dimmed via a huge box-shadow spread (the oval's border-radius makes
+ * the "hole" oval). pointer-events:none so it never blocks the capture button. */
+.frame-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.frame-oval {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  /* width = 65% of the shorter viewport side; height = 1.3× (faces are taller) */
+  width: min(65vw, 65vh);
+  height: calc(min(65vw, 65vh) * 1.3);
+  transform: translate(-50%, -50%);
+  border: 3px solid rgba(255, 255, 255, 0.9);
+  border-radius: 50%;
+  /* vmax so the dim covers the whole screen in any orientation */
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.5);
+}
+
+.frame-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: max(28px, calc(env(safe-area-inset-bottom) + 24px));
+  margin: 0;
+  padding: 0 24px;
+  text-align: center;
+  color: #fff;
+  font-size: 0.95rem;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
