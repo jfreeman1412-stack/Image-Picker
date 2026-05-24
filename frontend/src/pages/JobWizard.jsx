@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import FolderBrowser from '../components/FolderBrowser.jsx';
 
 /**
@@ -45,8 +45,12 @@ async function peek(path) {
 
 export default function JobWizard() {
   const nav = useNavigate();
+  // Phase C.2: when rendered at /job/:id/import-images, the wizard runs in
+  // "import mode" — it skips name + roster and ingests into the existing job.
+  const { id: targetJobId } = useParams();
+  const importMode = !!targetJobId;
 
-  const [step, setStep] = useState('name');
+  const [step, setStep] = useState(importMode ? 'folder' : 'name');
   const [name, setName] = useState('');
   const [useRoster, setUseRoster] = useState(null);          // true | false | null
   const [rosterFile, setRosterFile] = useState(null);        // File obj
@@ -172,17 +176,19 @@ export default function JobWizard() {
     setBusy(true);
     setRosterUploadWarning(null);
     try {
-      const res = await fetch('/api/jobs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          root_path: rootPath,
-          has_lines: hasLines === true,
-          image_subfolder_name: imageSubfolder,
-          auto_run: autoRun,
-        }),
-      });
+      const res = await fetch(
+        importMode ? `/api/jobs/${targetJobId}/import-images` : '/api/jobs',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...(importMode ? {} : { name }),
+            root_path: rootPath,
+            has_lines: hasLines === true,
+            image_subfolder_name: imageSubfolder,
+            auto_run: autoRun,
+          }),
+        });
       if (!res.ok) {
         let msg;
         try { msg = await res.text(); } catch { msg = `HTTP ${res.status}`; }
@@ -217,9 +223,11 @@ export default function JobWizard() {
   };
 
   // ── Header step indicator ────────────────────────────────────────────
-  const visibleSteps = STEP_KEYS.filter(k => !(k === 'subfolder' && hasLines === 'single' && step !== 'subfolder'));
-  // (we always show 'subfolder' once we're on/past it — it's a real step)
-  const stepIndex = STEP_KEYS.indexOf(step);
+  // Import mode reuses only the back half — hide the name/roster steps.
+  const stepKeysShown = importMode
+    ? STEP_KEYS.filter(k => k !== 'name' && k !== 'roster')
+    : STEP_KEYS;
+  const stepIndex = stepKeysShown.indexOf(step);
 
   // ── Render ───────────────────────────────────────────────────────────
   return (
@@ -227,12 +235,12 @@ export default function JobWizard() {
       <header className="row-between">
         <div>
           <Link to="/">← All jobs</Link>
-          <h1>New job</h1>
+          <h1>{importMode ? 'Import images' : 'New job'}</h1>
         </div>
       </header>
 
       <ol className="wizard-steps">
-        {STEP_KEYS.map((k, i) => (
+        {stepKeysShown.map((k, i) => (
           <li key={k} className={k === step ? 'active' : i < stepIndex ? 'done' : ''}>
             {i + 1}. {STEP_LABELS[k]}
           </li>
@@ -328,7 +336,12 @@ export default function JobWizard() {
             <button onClick={() => setShowFolderPicker(true)}>Browse…</button>
           </div>
           <div className="actions">
-            <button className="ghost" onClick={() => setStep('roster')}>← Back</button>
+            <button
+              className="ghost"
+              onClick={() => importMode ? nav(`/job/${targetJobId}`) : setStep('roster')}
+            >
+              ← {importMode ? 'Cancel' : 'Back'}
+            </button>
             <button disabled={!rootPath.trim() || busy} onClick={onFolderConfirm}>
               {busy ? 'Inspecting…' : 'Next →'}
             </button>
@@ -427,12 +440,14 @@ export default function JobWizard() {
       {/* Step 7: Create + progress */}
       {step === 'create' && (
         <section className="card">
-          <h2>Confirm and create</h2>
+          <h2>{importMode ? 'Confirm and import' : 'Confirm and create'}</h2>
           {!creatingJobId ? (
             <>
               <ul>
-                <li>Job: <b>{name}</b></li>
-                <li>Roster: {useRoster ? <b>{rosterFile?.name || 'will upload'}</b> : <span className="muted">(none)</span>}</li>
+                {!importMode && <li>Job: <b>{name}</b></li>}
+                {!importMode && (
+                  <li>Roster: {useRoster ? <b>{rosterFile?.name || 'will upload'}</b> : <span className="muted">(none)</span>}</li>
+                )}
                 <li>Folder: <code>{rootPath}</code></li>
                 <li>Structure: {hasLines === true ? 'lines → teams' : hasLines === 'single' ? 'single team' : 'teams'}</li>
                 <li>Teams: <b>{teamFolders.length}</b></li>
@@ -449,7 +464,9 @@ export default function JobWizard() {
               <div className="actions">
                 <button className="ghost" onClick={() => setStep('subfolder')}>← Back</button>
                 <button disabled={busy} onClick={create}>
-                  {busy ? 'Creating…' : 'Create job'}
+                  {busy
+                    ? (importMode ? 'Importing…' : 'Creating…')
+                    : (importMode ? 'Import images' : 'Create job')}
                 </button>
               </div>
             </>
@@ -471,7 +488,7 @@ export default function JobWizard() {
             </div>
           ) : (
             <div className="ingest-progress">
-              <p><b>Creating job…</b></p>
+              <p><b>{importMode ? 'Importing images…' : 'Creating job…'}</b></p>
               <div className="progress-bar">
                 <div
                   className="progress-fill"

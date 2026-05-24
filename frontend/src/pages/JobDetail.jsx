@@ -215,6 +215,21 @@ export default function JobDetail() {
         </div>
       )}
 
+      {job.sessions.length === 0 && (
+        <div className="all-reviewed-banner">
+          <div>
+            <b>No images yet.</b> Attach a Player roster now; import the photos
+            once the shoot is done.
+          </div>
+          <button
+            className="primary"
+            onClick={() => nav(`/job/${id}/import-images`)}
+          >
+            Import images →
+          </button>
+        </div>
+      )}
+
       <div className="team-grid">
         {job.sessions.map(s => {
           const menuItems = [

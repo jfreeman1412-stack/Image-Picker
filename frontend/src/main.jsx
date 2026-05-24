@@ -14,6 +14,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
       <Routes>
         <Route path="/" element={<JobList />} />
         <Route path="/job/new" element={<JobWizard />} />
+        <Route path="/job/:id/import-images" element={<JobWizard />} />
         <Route path="/job/:id" element={<JobDetail />} />
         <Route path="/session/:id" element={<SessionDetail />} />
         <Route path="/settings" element={<Settings />} />
