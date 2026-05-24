@@ -319,6 +319,43 @@ body {
 .roster-title { margin: 0; font-size: 1.15rem; }
 .roster-count { color: var(--text-muted); font-size: 0.85rem; }
 
+/* Filter bar (Section 4) — team select + name search + needs-photo toggle.
+ * Lives in the fixed header so it stays put while the list scrolls. Wraps on
+ * narrow phones. */
+.roster-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.filter-select, .filter-search {
+  padding: 9px 12px;
+  font-size: 0.95rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  appearance: none;
+}
+.filter-select { flex: none; }
+.filter-search { flex: 1; min-width: 120px; }
+.filter-select:focus, .filter-search:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Needs-photo toggle pill. */
+.pill {
+  flex: none;
+  padding: 9px 14px;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pill.active {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
 .roster-body { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .roster-pad { padding: 20px; }
 

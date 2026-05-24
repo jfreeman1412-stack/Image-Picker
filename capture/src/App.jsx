@@ -25,6 +25,12 @@ export default function App() {
   const [rosterError, setRosterError] = useState(null);
   const [reloadKey, setReloadKey] = useState(0);            // bump to refetch
 
+  // Filter state, lifted here too (Decision 5) so it's preserved when the user
+  // captures a player and returns. Default = all teams / empty search / off.
+  const [teamFilter, setTeamFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [needsPhotoOnly, setNeedsPhotoOnly] = useState(false);
+
   // Fetch the roster + shoot-scoped ✓ status whenever the chosen shoot changes
   // (or a manual reload is requested). Kept in App so a later capture can update
   // the ✓ Set in place without a refetch, and filters/state survive navigation.
@@ -60,6 +66,9 @@ export default function App() {
     setSelectedJob(null);
     setRoster([]);
     setReferencedPlayerIds(new Set());
+    setTeamFilter('');           // fresh filters for the next shoot
+    setSearch('');
+    setNeedsPhotoOnly(false);
     setView('shoots');
   };
 
@@ -82,6 +91,12 @@ export default function App() {
         referencedPlayerIds={referencedPlayerIds}
         status={rosterStatus}
         error={rosterError}
+        teamFilter={teamFilter}
+        search={search}
+        needsPhotoOnly={needsPhotoOnly}
+        onTeamFilter={setTeamFilter}
+        onSearch={setSearch}
+        onNeedsPhotoOnly={setNeedsPhotoOnly}
         onReload={() => setReloadKey((k) => k + 1)}
         onBack={backToShoots}
       />
