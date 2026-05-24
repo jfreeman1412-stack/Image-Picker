@@ -235,3 +235,52 @@ body {
 }
 .topbar-title { font-size: 0.95rem; font-weight: 600; }
 .topbar-target { font-size: 0.85rem; color: var(--text-muted); }
+
+/* ── Non-camera screens (Section 2 picker; Sections 3–4 roster) ─────────────
+ * The camera screen is full-bleed + fixed; the picker/roster screens are normal
+ * dark screens. `.screen` is the shared shell. (Section 4 relaxes overflow for
+ * the scrollable roster list.) */
+.screen {
+  width: 100vw;
+  height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  padding:
+    max(16px, env(safe-area-inset-top)) 20px
+    max(16px, env(safe-area-inset-bottom));
+}
+
+/* Shoot picker — a centered card. */
+.picker-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.picker-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(420px, 100%);
+  padding: 24px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.picker-title { margin: 0; font-size: 1.3rem; }
+.picker-sub { margin: 0; color: var(--text-muted); }
+.picker-block { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+
+/* Native <select> for the shoot list — the OS picker is the best mobile UX. */
+.picker-select {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 1rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  appearance: none;
+}
+.picker-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
