@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import CardMenu from '../components/CardMenu.jsx';
 import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
+import NewShootModal from '../components/NewShootModal.jsx';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -21,6 +22,7 @@ export default function JobList() {
   const [showArchived, setShowArchived] = useState(false);
   const [toast, setToast] = useState(null);     // {message, actionLabel, onAction}
   const [confirm, setConfirm] = useState(null); // {job}
+  const [showNewShoot, setShowNewShoot] = useState(false);
 
   const load = async () => {
     const q = showArchived ? '?include_archived=true' : '';
@@ -63,6 +65,12 @@ export default function JobList() {
         </div>
         <div className="actions">
           <Link to="/settings"><button className="ghost">Settings</button></Link>
+          <button
+            onClick={() => setShowNewShoot(true)}
+            title="Create a job with no images yet so you can attach a roster pre-shoot"
+          >
+            + New shoot
+          </button>
           <Link to="/job/new"><button className="primary-cta">+ New job</button></Link>
         </div>
       </header>
@@ -185,6 +193,8 @@ export default function JobList() {
           onClose={() => setToast(null)}
         />
       )}
+
+      {showNewShoot && <NewShootModal onClose={() => setShowNewShoot(false)} />}
     </div>
   );
 }
