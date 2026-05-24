@@ -102,6 +102,21 @@ A cluster is flagged `needs_review` if:
 - Team or panoramic pick failed per rules above, OR
 - The cluster contains an image with no detected face but the user has manually added it.
 
+## Creating a job
+
+Two entry points on the home screen:
+
+- **+ New job** — the image-based wizard for a **post-shoot** sort: point at a
+  folder of team images, confirm the structure, and the pipeline runs.
+- **+ New shoot** — a **pre-shoot** job with *no images yet*, so a **Player
+  roster** can be attached before the shoot (the capture app shoots reference
+  photos against it). When the photos arrive, open the job and use **Import
+  images** to ingest them into that *same* job and sort normally.
+
+Pre-shoot lifecycle: **New shoot → Player roster → (shoot day) → Import images →
+sort & export.** Re-importing into a job that already has teams is refused (one
+import per job for now).
+
 ## Rosters
 
 There are **two** roster CSVs, for two different purposes — both reached from a
