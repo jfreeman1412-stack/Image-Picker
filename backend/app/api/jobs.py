@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import DATA_DIR, SessionLocal, get_db
-from app.models.db_models import Cluster, ImageRole, Image, Job, Session
+from app.models.db_models import Cluster, ImageRole, Image, Job, PlayerMembership, Session
 from app.api.sessions import pipeline_progress_fields
 from app.services.eta import eta_seconds
 from app.services.face_pipeline import run_pipeline
@@ -357,12 +357,39 @@ def ingest_status(job_id: int, db: DbSession = Depends(get_db)):
 
 
 @router.get("")
-def list_jobs(db: DbSession = Depends(get_db), include_archived: bool = False):
-    """List jobs. Archived jobs are excluded unless ?include_archived=true."""
+def list_jobs(
+    db: DbSession = Depends(get_db),
+    include_archived: bool = False,
+    stage: str | None = None,
+):
+    """List jobs. Archived jobs are excluded unless ?include_archived=true.
+
+    `?stage=capture` returns the **capture-ready** slice for the mobile capture
+    app: not archived, a roster attached (≥1 PlayerMembership), and no images
+    imported yet (no sessions). This is derived from existing data — importing
+    images (which creates sessions) drops a shoot off the list automatically, so
+    the capture view self-manages without manual archiving. The desktop app
+    omits `stage` and keeps seeing every non-archived job (all lifecycle stages).
+    """
+    if stage == "capture":
+        include_archived = False  # capture view never includes archived
     q = db.query(Job)
     if not include_archived:
         q = q.filter((Job.archived == 0) | (Job.archived.is_(None)))
     jobs = q.order_by(Job.created_at.desc()).all()
+
+    if stage == "capture":
+        job_ids = [j.id for j in jobs]
+        rostered: set[int] = set()
+        if job_ids:
+            rostered = {
+                jid for (jid,) in db.query(PlayerMembership.job_id)
+                .filter(PlayerMembership.job_id.in_(job_ids))
+                .distinct().all()
+            }
+        # has a roster AND no images imported yet (no sessions at all)
+        jobs = [j for j in jobs if j.id in rostered and len(j.sessions) == 0]
+
     out = []
     for j in jobs:
         # Stats reflect non-archived sessions only — an archived team

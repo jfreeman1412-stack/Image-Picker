@@ -430,3 +430,42 @@ def test_import_images_409_when_teams_already_exist(client, tmp_path):
     # folder check, so reusing the same folder still 409s on the session count).
     r = client.post(f"/api/jobs/{jid}/import-images", json=body)
     assert r.status_code == 409
+
+
+# ── Capture-ready lifecycle filter: GET /api/jobs?stage=capture ───────────
+
+def _add_roster(client, jid, csv=b"Ava-Nguyen,Lions\n"):
+    return client.post(f"/api/players/roster/{jid}",
+                       files={"file": ("r.csv", csv, "text/csv")})
+
+
+def test_stage_capture_filters_to_rostered_image_less(client, tmp_path):
+    # capture-ready: image-less shoot WITH a roster
+    ready = client.post("/api/jobs/shoot", json={"name": "Ready"}).json()["job_id"]
+    _add_roster(client, ready)
+    # image-less shoot with NO roster → nothing to capture against
+    noroster = client.post("/api/jobs/shoot", json={"name": "No roster"}).json()["job_id"]
+    # imported job (has images) even WITH a roster → past the capture window
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    imported = client.post("/api/jobs", json={
+        "name": "Imported", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    _add_roster(client, imported, csv=b"Bob-Lee,TeamA\n")
+
+    capture_ids = {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
+    assert ready in capture_ids
+    assert noroster not in capture_ids       # no roster
+    assert imported not in capture_ids       # already imported
+
+    # Default view is unchanged — every non-archived job, all stages.
+    all_ids = {j["id"] for j in client.get("/api/jobs").json()}
+    assert {ready, noroster, imported} <= all_ids
+
+
+def test_stage_capture_excludes_archived(client):
+    jid = client.post("/api/jobs/shoot", json={"name": "Archived ready"}).json()["job_id"]
+    _add_roster(client, jid)
+    assert jid in {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
+    client.post(f"/api/jobs/{jid}/archive")
+    assert jid not in {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
