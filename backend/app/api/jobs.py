@@ -110,6 +110,14 @@ class CreateJobRequest(BaseModel):
     auto_run: bool = True  # chain the pipeline once import finishes
 
 
+class CreateShootRequest(BaseModel):
+    """Phase C.2 — make an image-less 'shoot' job pre-shoot so a roster can be
+    attached before any photos exist. `root_path` is an optional *future*
+    location, stored as-is (NOT validated — the folder may not exist yet)."""
+    name: str
+    root_path: Optional[str] = None
+
+
 def _iter_team_folders(root: Path, has_lines: bool):
     """Yield team folders given the wizard's structural choice."""
     if has_lines:
@@ -249,6 +257,26 @@ def create_job(
     )
 
     return {"job_id": job.id, "ingest_total": team_total}
+
+
+@router.post("/shoot")
+def create_shoot(payload: CreateShootRequest, db: DbSession = Depends(get_db)):
+    """Create an image-less job (Phase C.2). No folder, no ingest — the operator
+    attaches a Player roster pre-shoot and imports images later via
+    /import-images. `ingest_status="awaiting_images"` marks the deferred state;
+    `root_path` (optional future location) is stored verbatim, not validated."""
+    root = (payload.root_path or "").strip() or None
+    job = Job(
+        name=payload.name,
+        root_path=root,
+        ingest_status="awaiting_images",
+        ingest_progress=0,
+        ingest_total=0,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return {"job_id": job.id}
 
 
 @router.get("/{job_id}/ingest-status")

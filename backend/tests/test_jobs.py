@@ -344,3 +344,39 @@ def test_run_all_force_proceeds_through_gate(client, tmp_path, monkeypatch):
     assert r.status_code == 200
     assert r.json()["status"] == "running"
     assert len(called) == 1     # pipeline kicked off for the team
+
+
+# ── Phase C.2 Section 1: create an image-less "shoot" job ─────────────────
+
+def test_create_shoot_makes_image_less_job(client):
+    r = client.post("/api/jobs/shoot", json={"name": "Spring Shoot"})
+    assert r.status_code == 200, r.text
+    jid = r.json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{jid}").json()
+    assert detail["name"] == "Spring Shoot"
+    assert detail["sessions"] == []          # no images/sessions
+    assert detail["root_path"] is None
+
+    status = client.get(f"/api/jobs/{jid}/ingest-status").json()
+    assert status["status"] == "awaiting_images"
+    assert status["total"] == 0
+
+
+def test_create_shoot_no_folder_validation(client):
+    """Unlike POST /api/jobs, a nonexistent (or future) folder must NOT 400 —
+    the shoot exists before its images do."""
+    r = client.post("/api/jobs/shoot", json={
+        "name": "Pre-shoot", "root_path": r"Z:\not\there\yet",
+    })
+    assert r.status_code == 200, r.text
+    jid = r.json()["job_id"]
+    assert client.get(f"/api/jobs/{jid}").json()["root_path"] == r"Z:\not\there\yet"
+
+
+def test_create_shoot_appears_in_list_as_zero_team(client):
+    jid = client.post("/api/jobs/shoot", json={"name": "Listed Shoot"}).json()["job_id"]
+    listing = client.get("/api/jobs").json()
+    row = next(j for j in listing if j["id"] == jid)
+    assert row["session_count"] == 0
+    assert row["image_count"] == 0
