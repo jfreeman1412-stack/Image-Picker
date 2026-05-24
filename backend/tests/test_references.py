@@ -457,3 +457,148 @@ def test_http_cross_shoot_provenance(client, monkeypatch):
     assert len(listing["items"]) == 2
     assert {i["captured_job_id"] for i in listing["items"]} == {
         client.job_a_id, client.job_b_id}
+
+
+# ── Phase B.2: shoot-scoped replace / delete (service) ─────────────────────
+
+def test_replace_shoot_reference_is_scoped(db, tmp_path, monkeypatch):
+    """Replacing this shoot's reference keeps exactly one for it and leaves
+    every OTHER shoot's reference intact (unlike the player-wide replace)."""
+    _mock(monkeypatch, tmp_path, [_face()])
+    player = _player(db)
+    job_a = _job(db, "Shoot A")
+    job_b = _job(db, "Shoot B")
+    references.add_reference(db, player.id, b"a", captured_job_id=job_a.id,
+                             original_filename="a.jpg")
+    references.add_reference(db, player.id, b"b", captured_job_id=job_b.id,
+                             original_filename="b.jpg")
+
+    summary = references.replace_shoot_reference(
+        db, player.id, job_a.id, b"a2", original_filename="a2.jpg")
+
+    a_refs = db.query(ReferenceFace).filter_by(
+        player_id=player.id, captured_job_id=job_a.id).all()
+    b_refs = db.query(ReferenceFace).filter_by(
+        player_id=player.id, captured_job_id=job_b.id).all()
+    assert len(a_refs) == 1 and a_refs[0].id == summary["id"]  # exactly the new one
+    assert summary["captured_job_id"] == job_a.id
+    assert len(b_refs) == 1                                     # Shoot B untouched
+
+
+def test_replace_shoot_reference_collapses_within_shoot(db, tmp_path, monkeypatch):
+    """If a shoot already had >1 ref, replace collapses to exactly one."""
+    _mock(monkeypatch, tmp_path, [_face()])
+    player = _player(db)
+    job = _job(db)
+    references.add_reference(db, player.id, b"x", captured_job_id=job.id,
+                             original_filename="x.jpg")
+    references.add_reference(db, player.id, b"y", captured_job_id=job.id,
+                             original_filename="y.jpg")
+    assert db.query(ReferenceFace).filter_by(captured_job_id=job.id).count() == 2
+    references.replace_shoot_reference(db, player.id, job.id, b"z",
+                                       original_filename="z.jpg")
+    assert db.query(ReferenceFace).filter_by(captured_job_id=job.id).count() == 1
+
+
+def test_replace_shoot_failed_gate_keeps_existing(db, tmp_path, monkeypatch):
+    """A failed gate on a shoot-scoped replace leaves this shoot's ref intact."""
+    monkeypatch.setattr(references, "REFERENCES_DIR", tmp_path)
+    player = _player(db)
+    job = _job(db)
+    monkeypatch.setattr(references.face_detector, "detect_faces",
+                        _fake_detector([_face()]))
+    references.add_reference(db, player.id, b"good", captured_job_id=job.id,
+                             original_filename="good.jpg")
+    good = db.query(ReferenceFace).one()
+    good_path = Path(good.image_path)
+
+    monkeypatch.setattr(references.face_detector, "detect_faces",
+                        _fake_detector([]))  # no_face
+    with pytest.raises(references.ReferenceQualityError):
+        references.replace_shoot_reference(db, player.id, job.id, b"bad",
+                                           original_filename="bad.jpg")
+    assert db.query(ReferenceFace).count() == 1
+    assert db.query(ReferenceFace).one().id == good.id
+    assert good_path.exists()
+    assert not list(tmp_path.glob(".tmp-*"))
+
+
+def test_replace_shoot_reference_404s(db, tmp_path, monkeypatch):
+    _mock(monkeypatch, tmp_path, [_face()])
+    player = _player(db)
+    job = _job(db)
+    with pytest.raises(HTTPException) as e_player:
+        references.replace_shoot_reference(db, 99999, job.id, b"x",
+                                           original_filename="x.jpg")
+    assert e_player.value.status_code == 404
+    with pytest.raises(HTTPException) as e_job:
+        references.replace_shoot_reference(db, player.id, 99999, b"x",
+                                           original_filename="x.jpg")
+    assert e_job.value.status_code == 404
+    assert db.query(ReferenceFace).count() == 0   # nothing stored on either 404
+
+
+def test_delete_shoot_references_scoped_and_idempotent(db, tmp_path, monkeypatch):
+    _mock(monkeypatch, tmp_path, [_face()])
+    player = _player(db)
+    job_a = _job(db, "Shoot A")
+    job_b = _job(db, "Shoot B")
+    references.add_reference(db, player.id, b"a", captured_job_id=job_a.id,
+                             original_filename="a.jpg")
+    references.add_reference(db, player.id, b"b", captured_job_id=job_b.id,
+                             original_filename="b.jpg")
+    a_path = Path(db.query(ReferenceFace)
+                  .filter_by(captured_job_id=job_a.id).one().image_path)
+
+    assert references.delete_shoot_references(db, player.id, job_a.id) == {"deleted": 1}
+    assert db.query(ReferenceFace).filter_by(captured_job_id=job_a.id).count() == 0
+    assert db.query(ReferenceFace).filter_by(captured_job_id=job_b.id).count() == 1
+    assert not a_path.exists()
+    # Idempotent — deleting again is a no-op success.
+    assert references.delete_shoot_references(db, player.id, job_a.id) == {"deleted": 0}
+
+
+def test_delete_shoot_references_unknown_player_404(db):
+    with pytest.raises(HTTPException) as exc:
+        references.delete_shoot_references(db, 99999, 1)
+    assert exc.value.status_code == 404
+
+
+# ── Phase B.2: shoot-scoped replace / delete (HTTP) ────────────────────────
+
+def test_http_shoot_replace_and_delete(client, monkeypatch):
+    pid, jid_a, jid_b = client.player_id, client.job_a_id, client.job_b_id
+    monkeypatch.setattr(references.face_detector, "detect_faces",
+                        _fake_detector([_face()]))
+    files = {"file": ("cap.jpg", b"\xff\xd8imagebytes", "image/jpeg")}
+
+    ra = client.put(f"/api/players/{pid}/references/shoot/{jid_a}", files=files)
+    assert ra.status_code == 200, ra.text
+    assert ra.json()["captured_job_id"] == jid_a
+    rb = client.put(f"/api/players/{pid}/references/shoot/{jid_b}", files=files)
+    assert rb.status_code == 200
+    assert len(client.get(f"/api/players/{pid}/references").json()["items"]) == 2
+
+    # Re-capture shoot A → still one for A, B intact (total stays 2).
+    client.put(f"/api/players/{pid}/references/shoot/{jid_a}", files=files)
+    listing = client.get(f"/api/players/{pid}/references").json()["items"]
+    assert len(listing) == 2
+    assert sum(1 for i in listing if i["captured_job_id"] == jid_a) == 1
+
+    # Delete shoot A's → only B remains; deleting again is idempotent.
+    d = client.delete(f"/api/players/{pid}/references/shoot/{jid_a}")
+    assert d.status_code == 200 and d.json() == {"deleted": 1}
+    remaining = client.get(f"/api/players/{pid}/references").json()["items"]
+    assert len(remaining) == 1 and remaining[0]["captured_job_id"] == jid_b
+    assert client.delete(
+        f"/api/players/{pid}/references/shoot/{jid_a}").json() == {"deleted": 0}
+
+
+def test_http_shoot_replace_failed_gate_400(client, monkeypatch):
+    pid, jid = client.player_id, client.job_a_id
+    monkeypatch.setattr(references.face_detector, "detect_faces",
+                        _fake_detector([_face(), _face()]))
+    files = {"file": ("x.jpg", b"\xff\xd8imagebytes", "image/jpeg")}
+    res = client.put(f"/api/players/{pid}/references/shoot/{jid}", files=files)
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == "multiple_faces"

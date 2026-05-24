@@ -5,6 +5,8 @@
     PUT    /api/players/{player_id}/references                   replace ALL with one
     DELETE /api/players/{player_id}/references/{ref_id}          delete one
     GET    /api/players/{player_id}/references/{ref_id}/image    serve the stored photo
+    PUT    /api/players/{player_id}/references/shoot/{job_id}    replace this player's ref FOR one shoot (B.2)
+    DELETE /api/players/{player_id}/references/shoot/{job_id}    delete this player's ref(s) FOR one shoot (B.2)
 
 All routes nest under `/{player_id}/references...`, so none collide with the
 A.1 `/{player_id}` route (different segment counts). The real logic lives in
@@ -21,8 +23,9 @@ from sqlalchemy.orm import Session as DbSession
 from app.db import get_db
 from app.models.db_models import ReferenceFace
 from app.services.references import (
-    ReferenceQualityError, add_reference, delete_reference, list_references,
-    replace_player_references,
+    ReferenceQualityError, add_reference, delete_reference,
+    delete_shoot_references, list_references, replace_player_references,
+    replace_shoot_reference,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,3 +98,35 @@ def reference_image(player_id: int, ref_id: int, db: DbSession = Depends(get_db)
     if not path.exists():
         raise HTTPException(404, "File missing on disk")
     return FileResponse(path)
+
+
+# ── shoot-scoped replace / delete (Phase B.2) ─────────────────────────────
+# Distinct 3-segment paths (`references/shoot/{job_id}`) — no collision with the
+# typed-int `references/{ref_id}` routes above.
+
+@router.put("/{player_id}/references/shoot/{job_id}")
+async def replace_shoot_reference_endpoint(
+    player_id: int,
+    job_id: int,
+    file: UploadFile = File(...),
+    db: DbSession = Depends(get_db),
+):
+    """Set this player's single reference FOR THIS shoot (capture / retake).
+    Validates, then wipes only this shoot's refs and stores the new one tagged
+    with job_id; other shoots are untouched. A failed quality gate leaves this
+    shoot's existing reference intact."""
+    data = await file.read()
+    try:
+        return replace_shoot_reference(
+            db, player_id, job_id, data, original_filename=file.filename)
+    except ReferenceQualityError as exc:
+        raise _quality_400(exc)
+
+
+@router.delete("/{player_id}/references/shoot/{job_id}")
+def delete_shoot_reference_endpoint(
+    player_id: int, job_id: int, db: DbSession = Depends(get_db),
+):
+    """Remove this player's reference(s) FOR THIS shoot only. Idempotent;
+    other shoots untouched."""
+    return delete_shoot_references(db, player_id, job_id)

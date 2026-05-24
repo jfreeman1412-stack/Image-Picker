@@ -168,6 +168,28 @@ def _wipe_player_references(db: DbSession, player_id: int) -> int:
     return n
 
 
+def _wipe_player_references_for_job(
+    db: DbSession, player_id: int, job_id: int,
+) -> int:
+    """Phase B.2 — shoot-scoped sibling of _wipe_player_references: delete only
+    this player's reference rows + files whose `captured_job_id == job_id`,
+    leaving every other shoot's references intact. Caller commits."""
+    refs = (
+        db.query(ReferenceFace)
+        .filter_by(player_id=player_id, captured_job_id=job_id)
+        .all()
+    )
+    for r in refs:
+        _unlink_quietly(r.image_path)
+    n = (
+        db.query(ReferenceFace)
+        .filter_by(player_id=player_id, captured_job_id=job_id)
+        .delete(synchronize_session=False)
+    )
+    db.flush()
+    return n
+
+
 def _unlink_quietly(path: str | None) -> None:
     if not path:
         return
@@ -262,3 +284,41 @@ def replace_player_references(
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+
+# ── shoot-scoped replace / delete (Phase B.2) ─────────────────────────────
+
+def replace_shoot_reference(
+    db: DbSession, player_id: int, job_id: int, data: bytes, *,
+    original_filename: str | None = None,
+) -> dict:
+    """Phase B.2 — set this player's single reference FOR ONE shoot (capture /
+    retake). Validate the new photo (detect + gate), then wipe ONLY this
+    player's refs whose `captured_job_id == job_id`, then store the new one
+    tagged with `job_id`. Every other shoot's references are untouched — unlike
+    `replace_player_references`, which wipes the player globally. The new photo
+    is validated BEFORE the wipe, so a failed gate leaves this shoot's existing
+    reference intact. 404 if the player or the job is missing."""
+    _require_player(db, player_id)
+    _require_job_if_given(db, job_id)  # job_id is required here → 404 if missing
+    ext = _safe_ext(original_filename)
+    tmp = _write_temp(data, ext)
+    try:
+        face = evaluate_reference_quality(face_detector.detect_faces(tmp))
+        _wipe_player_references_for_job(db, player_id, job_id)
+        return _store_reference(
+            db, player_id, job_id, face, tmp, ext, original_filename)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def delete_shoot_references(db: DbSession, player_id: int, job_id: int) -> dict:
+    """Phase B.2 — remove this player's reference(s) FOR ONE shoot only
+    (`captured_job_id == job_id`); other shoots are untouched. Idempotent:
+    returns {"deleted": 0} when there's nothing for this shoot. 404 if the
+    player is missing."""
+    _require_player(db, player_id)
+    n = _wipe_player_references_for_job(db, player_id, job_id)
+    db.commit()
+    return {"deleted": n}
