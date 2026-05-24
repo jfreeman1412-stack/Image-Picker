@@ -284,3 +284,82 @@ body {
   appearance: none;
 }
 .picker-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ── Roster screen (Section 3; filters added in Section 4) ──────────────────
+ * Full-height flex column: a fixed header over a scrollable list. The global
+ * html/body overflow:hidden stops page bounce; the list scrolls internally. */
+.roster-screen {
+  display: flex;
+  flex-direction: column;
+  padding: 0;                 /* header/list manage their own padding */
+}
+
+.roster-header {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding:
+    max(12px, env(safe-area-inset-top)) 20px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev-1);
+}
+
+.link-back {
+  align-self: flex-start;
+  padding: 0;
+  font-size: 0.9rem;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.roster-titles { display: flex; align-items: baseline; gap: 10px; }
+.roster-title { margin: 0; font-size: 1.15rem; }
+.roster-count { color: var(--text-muted); font-size: 0.85rem; }
+
+.roster-body { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.roster-pad { padding: 20px; }
+
+.roster-list { list-style: none; margin: 0; padding: 0; }
+
+.roster-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.roster-row-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.roster-name { font-size: 1.02rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.tag {
+  flex: none;
+  padding: 1px 7px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+}
+
+.roster-row-meta { display: flex; align-items: center; gap: 10px; flex: none; }
+.roster-team { color: var(--text-muted); font-size: 0.85rem; }
+
+.badge-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--bg);
+  background: var(--success);
+  border-radius: 50%;
+}
