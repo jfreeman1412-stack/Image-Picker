@@ -33,6 +33,10 @@ export default function PlayerRosterModal({ job, onClose }) {
   const [firstNameColumn, setFirstNameColumn] = useState('');
   const [lastNameColumn, setLastNameColumn] = useState('');
   const [teamColumn, setTeamColumn] = useState('');
+  // Validation (dry-run).
+  const [validating, setValidating] = useState(false);
+  const [report, setReport] = useState(null);          // dry-run response body
+  const [validateError, setValidateError] = useState(null);
 
   // ── ESC closes ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -78,6 +82,13 @@ export default function PlayerRosterModal({ job, onClose }) {
     setTeamColumn('');
   }, [columns, hasHeader]);
 
+  // Any change to the mapping invalidates a prior validation result, so the
+  // operator can't upload against a stale "valid" report.
+  useEffect(() => {
+    setReport(null); setValidateError(null);
+  }, [nameMode, nameColumn, firstNameColumn, lastNameColumn, teamColumn,
+      hasHeader, columns]);
+
   // ── Derived: column labels + preview reconcile with the header toggle ─────
   // With a header, row 1 is column names. Without, the first row is data and
   // columns are positional "Column N" (1-based) — the exact labels the backend
@@ -113,6 +124,38 @@ export default function PlayerRosterModal({ job, onClose }) {
     first_name_column: nameMode === 'split' ? (firstNameColumn || null) : null,
     last_name_column: nameMode === 'split' ? (lastNameColumn || null) : null,
     team_column: teamColumn || null,
+  };
+
+  // ── Validate (dry-run) ────────────────────────────────────────────────────
+  const buildForm = (extra = {}) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('mapping', JSON.stringify(mapping));
+    Object.entries(extra).forEach(([k, v]) => fd.append(k, v));
+    return fd;
+  };
+
+  const validate = async () => {
+    setValidating(true);
+    setValidateError(null);
+    setReport(null);
+    try {
+      const res = await fetch(`/api/players/roster/${job.id}/mapped`, {
+        method: 'POST', body: buildForm({ dry_run: 'true' }),
+      });
+      // A dry-run returns 200 even when the roster is invalid (the report says
+      // so). A non-200 is a real failure (job gone, malformed mapping JSON).
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.message
+          || `Validation failed (HTTP ${res.status}).`);
+      }
+      setReport(await res.json());
+    } catch (e) {
+      setValidateError(e.message || String(e));
+    } finally {
+      setValidating(false);
+    }
   };
 
   const ColumnSelect = ({ label, value, onChange }) => (
@@ -290,6 +333,62 @@ export default function PlayerRosterModal({ job, onClose }) {
                     </tbody>
                   </table>
                 </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ── Validate ────────────────────────────────────────────────── */}
+        {inspected && (
+          <section style={{ marginBottom: 4 }}>
+            <div className="actions" style={{ gap: 8 }}>
+              <button
+                className="primary"
+                disabled={!mappingComplete || validating}
+                onClick={validate}
+                title={mappingComplete ? '' : 'Map name + team first'}
+              >
+                {validating ? 'Validating…' : 'Validate'}
+              </button>
+            </div>
+
+            {validateError && (
+              <p className="error" style={{ marginTop: 8 }}>{validateError}</p>
+            )}
+
+            {report && report.ok && (
+              <div style={{ marginTop: 8 }}>
+                <p style={{ color: 'var(--success)', margin: 0 }}>
+                  ✓ {report.summary.valid_rows} player
+                  {report.summary.valid_rows === 1 ? '' : 's'} across{' '}
+                  {report.summary.distinct_teams} team
+                  {report.summary.distinct_teams === 1 ? '' : 's'}
+                  {report.summary.coaches > 0 &&
+                    ` · ${report.summary.coaches} coach${report.summary.coaches === 1 ? '' : 'es'}`}.
+                </p>
+                {report.references_warning?.count > 0 && (
+                  <p className="warn" style={{ marginTop: 6 }}>
+                    {report.references_warning.message}{' '}
+                    Uploading will ask you to confirm the replace.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {report && !report.ok && (
+              <div style={{ marginTop: 8 }}>
+                <p className="error" style={{ margin: 0 }}>
+                  Upload blocked — fix the CSV (or the mapping) and re-validate.
+                </p>
+                <ul className="confirm-impact" style={{ marginTop: 4 }}>
+                  {report.mapping_errors.map((m) => <li key={m}>{m}</li>)}
+                  {report.row_errors.map((e) => (
+                    <li key={e.reason}>
+                      <b>{e.rows.length}</b> {e.rows.length === 1 ? 'row' : 'rows'}{' '}
+                      {e.label}: rows {e.rows.join(', ')}
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
           </section>
