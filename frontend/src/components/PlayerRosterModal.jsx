@@ -27,6 +27,12 @@ export default function PlayerRosterModal({ job, onClose }) {
   const [sampleRows, setSampleRows] = useState([]);
   const [totalRows, setTotalRows] = useState(0);
   const [hasHeader, setHasHeader] = useState(true);
+  // Column mapping (the serializable object sent to the backend).
+  const [nameMode, setNameMode] = useState('full');   // 'full' | 'split'
+  const [nameColumn, setNameColumn] = useState('');
+  const [firstNameColumn, setFirstNameColumn] = useState('');
+  const [lastNameColumn, setLastNameColumn] = useState('');
+  const [teamColumn, setTeamColumn] = useState('');
 
   // ── ESC closes ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -65,6 +71,13 @@ export default function PlayerRosterModal({ job, onClose }) {
     if (f) inspect(f);
   };
 
+  // Column names change when a new file is inspected or the header toggle
+  // flips (header names ↔ "Column N"), so stale selections must clear.
+  useEffect(() => {
+    setNameColumn(''); setFirstNameColumn(''); setLastNameColumn('');
+    setTeamColumn('');
+  }, [columns, hasHeader]);
+
   // ── Derived: column labels + preview reconcile with the header toggle ─────
   // With a header, row 1 is column names. Without, the first row is data and
   // columns are positional "Column N" (1-based) — the exact labels the backend
@@ -75,6 +88,44 @@ export default function PlayerRosterModal({ job, onClose }) {
   const previewRows = hasHeader ? sampleRows : [columns, ...sampleRows];
   const dataRowCount = hasHeader ? Math.max(totalRows - 1, 0) : totalRows;
   const inspected = columns.length > 0;
+
+  // ── Mapping: assemble (name, team) the same way the backend does ──────────
+  const cellOf = (row, ref) => {
+    const i = displayColumns.indexOf(ref);
+    return i >= 0 && i < row.length ? String(row[i] ?? '').trim() : '';
+  };
+  const assemble = (row) => {
+    const name = nameMode === 'full'
+      ? cellOf(row, nameColumn)
+      : [cellOf(row, firstNameColumn), cellOf(row, lastNameColumn)]
+          .filter(Boolean).join(' ');
+    return { name, team: cellOf(row, teamColumn) };
+  };
+  const mappingComplete = Boolean(teamColumn) && (
+    nameMode === 'full' ? Boolean(nameColumn)
+                        : Boolean(firstNameColumn) || Boolean(lastNameColumn)
+  );
+  // The serializable mapping object (also drop-in for future saved templates).
+  const mapping = {
+    has_header: hasHeader,
+    name_mode: nameMode,
+    name_column: nameMode === 'full' ? (nameColumn || null) : null,
+    first_name_column: nameMode === 'split' ? (firstNameColumn || null) : null,
+    last_name_column: nameMode === 'split' ? (lastNameColumn || null) : null,
+    team_column: teamColumn || null,
+  };
+
+  const ColumnSelect = ({ label, value, onChange }) => (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
+      <span className="muted">{label}</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">— pick a column —</option>
+        {displayColumns.map((c, i) => (
+          <option key={i} value={c}>{c || `(blank ${i + 1})`}</option>
+        ))}
+      </select>
+    </label>
+  );
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -158,8 +209,89 @@ export default function PlayerRosterModal({ job, onClose }) {
               </table>
             </div>
             <p className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-              Showing up to 5 of {dataRowCount} rows. Column mapping comes next.
+              Showing up to 5 of {dataRowCount} rows.
             </p>
+          </section>
+        )}
+
+        {/* ── Map columns ─────────────────────────────────────────────── */}
+        {inspected && (
+          <section style={{ marginBottom: 16 }}>
+            <h3 style={{ marginBottom: 8 }}>Map columns</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              <b>Name</b> and <b>team</b> are required. Other columns (parent
+              contact, etc.) are ignored.
+            </p>
+
+            <div className="wizard-choices" style={{ marginBottom: 10 }}>
+              <button
+                className={nameMode === 'full' ? 'primary' : ''}
+                onClick={() => setNameMode('full')}
+              >
+                Full name in one column
+              </button>
+              <button
+                className={nameMode === 'split' ? 'primary' : ''}
+                onClick={() => setNameMode('split')}
+              >
+                Separate first / last columns
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+              {nameMode === 'full'
+                ? ColumnSelect({ label: 'Name column', value: nameColumn,
+                                 onChange: setNameColumn })
+                : (
+                  <>
+                    {ColumnSelect({ label: 'First-name column', value: firstNameColumn,
+                                    onChange: setFirstNameColumn })}
+                    {ColumnSelect({ label: 'Last-name column', value: lastNameColumn,
+                                    onChange: setLastNameColumn })}
+                  </>
+                )}
+              {ColumnSelect({ label: 'Team column', value: teamColumn,
+                              onChange: setTeamColumn })}
+            </div>
+            {nameMode === 'split' && (
+              <p className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Map at least one — a last-name-only roster is valid.
+              </p>
+            )}
+
+            {/* Live assembled preview */}
+            {mappingComplete && (
+              <div style={{ marginTop: 12 }}>
+                <p className="muted" style={{ margin: '0 0 4px' }}>Result preview:</p>
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="roster-preview">
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '4px 8px' }}>Name</th>
+                        <th style={{ textAlign: 'left', padding: '4px 8px' }}>Team</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {previewRows.slice(0, 5).map((row, ri) => {
+                        const { name, team } = assemble(row);
+                        return (
+                          <tr key={ri}>
+                            <td style={{ padding: '3px 8px',
+                              color: name ? 'inherit' : 'var(--warn-text, #d97706)' }}>
+                              {name || '⚠ (missing)'}
+                            </td>
+                            <td style={{ padding: '3px 8px',
+                              color: team ? 'inherit' : 'var(--warn-text, #d97706)' }}>
+                              {team || '⚠ (missing)'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </section>
         )}
       </div>
