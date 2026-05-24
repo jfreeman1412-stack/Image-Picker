@@ -37,6 +37,11 @@ export default function PlayerRosterModal({ job, onClose }) {
   const [validating, setValidating] = useState(false);
   const [report, setReport] = useState(null);          // dry-run response body
   const [validateError, setValidateError] = useState(null);
+  // Commit.
+  const [committing, setCommitting] = useState(false);
+  const [commitResult, setCommitResult] = useState(null);  // success summary
+  const [commitError, setCommitError] = useState(null);
+  const [replaceConfirm, setReplaceConfirm] = useState(null); // 409 {count,message}
 
   // ── ESC closes ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -86,6 +91,7 @@ export default function PlayerRosterModal({ job, onClose }) {
   // operator can't upload against a stale "valid" report.
   useEffect(() => {
     setReport(null); setValidateError(null);
+    setCommitResult(null); setCommitError(null); setReplaceConfirm(null);
   }, [nameMode, nameColumn, firstNameColumn, lastNameColumn, teamColumn,
       hasHeader, columns]);
 
@@ -155,6 +161,40 @@ export default function PlayerRosterModal({ job, onClose }) {
       setValidateError(e.message || String(e));
     } finally {
       setValidating(false);
+    }
+  };
+
+  // ── Commit (replace this shoot's roster) ──────────────────────────────────
+  const commit = async (confirmReplace = false) => {
+    setCommitting(true);
+    setCommitError(null);
+    try {
+      const res = await fetch(`/api/players/roster/${job.id}/mapped`, {
+        method: 'POST',
+        body: buildForm({ confirm_replace: confirmReplace ? 'true' : 'false' }),
+      });
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        if (body?.detail?.error === 'references_exist') {
+          setReplaceConfirm(body.detail);   // wait for the confirm step
+          return;
+        }
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const d = body?.detail;
+        throw new Error(
+          (d && d.message)
+          || (d?.row_errors ? 'Roster no longer valid — re-validate.' : null)
+          || `Upload failed (HTTP ${res.status}).`,
+        );
+      }
+      setReplaceConfirm(null);
+      setCommitResult(await res.json());
+    } catch (e) {
+      setCommitError(e.message || String(e));
+    } finally {
+      setCommitting(false);
     }
   };
 
@@ -343,17 +383,62 @@ export default function PlayerRosterModal({ job, onClose }) {
           <section style={{ marginBottom: 4 }}>
             <div className="actions" style={{ gap: 8 }}>
               <button
-                className="primary"
-                disabled={!mappingComplete || validating}
+                disabled={!mappingComplete || validating || committing}
                 onClick={validate}
                 title={mappingComplete ? '' : 'Map name + team first'}
               >
                 {validating ? 'Validating…' : 'Validate'}
               </button>
+              <button
+                className="primary"
+                disabled={!report?.ok || committing || !!commitResult}
+                onClick={() => commit(false)}
+                title={report?.ok ? '' : 'Validate a clean roster first'}
+              >
+                {committing ? 'Uploading…' : 'Upload roster'}
+              </button>
             </div>
 
             {validateError && (
               <p className="error" style={{ marginTop: 8 }}>{validateError}</p>
+            )}
+            {commitError && (
+              <p className="error" style={{ marginTop: 8 }}>{commitError}</p>
+            )}
+
+            {/* Replace guard: photos were already captured for this shoot. */}
+            {replaceConfirm && !commitResult && (
+              <div style={{ marginTop: 10 }}>
+                <p className="warn" style={{ margin: 0 }}>
+                  {replaceConfirm.message} Replacing the roster won't delete those
+                  photos, but may change which player they line up with.
+                </p>
+                <div className="actions" style={{ gap: 8, marginTop: 6 }}>
+                  <button onClick={() => setReplaceConfirm(null)}>Cancel</button>
+                  <button
+                    className="danger-btn"
+                    disabled={committing}
+                    onClick={() => commit(true)}
+                  >
+                    {committing ? 'Replacing…' : 'Replace anyway'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {commitResult && (
+              <div style={{ marginTop: 10 }}>
+                <p style={{ color: 'var(--success)', margin: 0 }}>
+                  ✓ Roster uploaded — <b>{commitResult.memberships_loaded}</b>{' '}
+                  player{commitResult.memberships_loaded === 1 ? '' : 's'} across{' '}
+                  <b>{commitResult.distinct_teams}</b> team
+                  {commitResult.distinct_teams === 1 ? '' : 's'}
+                  {commitResult.coaches > 0 && ` · ${commitResult.coaches} coach${commitResult.coaches === 1 ? '' : 'es'}`}.
+                </p>
+                <div className="actions" style={{ gap: 8, marginTop: 6 }}>
+                  <button className="primary" onClick={onClose}>Done</button>
+                </div>
+              </div>
             )}
 
             {report && report.ok && (

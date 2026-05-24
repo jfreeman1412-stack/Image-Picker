@@ -166,11 +166,11 @@ export default function JobDetail() {
           </button>
           <button
             onClick={() => setShowRoster(true)}
-            title="Upload roster CSV and review cross-team mismatches"
+            title="Cross-check roster: flags wrong-team photos after the pipeline runs (separate from the Player roster)"
           >
             {rosterSummary?.entries_loaded > 0
-              ? `Roster · ${rosterSummary.mismatch_count} mismatch${rosterSummary.mismatch_count === 1 ? '' : 'es'}`
-              : 'Upload roster'}
+              ? `Cross-check · ${rosterSummary.mismatch_count} mismatch${rosterSummary.mismatch_count === 1 ? '' : 'es'}`
+              : 'Roster cross-check'}
           </button>
           <button
             onClick={() => setShowPlayerRoster(true)}
