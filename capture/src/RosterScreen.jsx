@@ -13,7 +13,7 @@ import { useMemo } from 'react';
 export default function RosterScreen({
   job, items, referencedPlayerIds, status, error,
   teamFilter, search, needsPhotoOnly,
-  onTeamFilter, onSearch, onNeedsPhotoOnly,
+  onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
   onReload, onBack,
 }) {
   const teams = useMemo(
@@ -108,19 +108,21 @@ export default function RosterScreen({
             {filtered.map((m) => {
               const captured = referencedPlayerIds.has(m.player_id);
               return (
-                <li key={`${m.player_id}-${m.team}`} className="roster-row">
-                  <div className="roster-row-main">
-                    <span className="roster-name">{m.name}</span>
-                    {m.is_coach ? <span className="tag">Coach</span> : null}
-                  </div>
-                  <div className="roster-row-meta">
-                    <span className="roster-team">{m.team}</span>
-                    {captured && (
-                      <span className="badge-check" title="Has a photo for this shoot">
-                        ✓
-                      </span>
-                    )}
-                  </div>
+                <li key={`${m.player_id}-${m.team}`}>
+                  <button className="roster-row" onClick={() => onPickPlayer(m)}>
+                    <div className="roster-row-main">
+                      <span className="roster-name">{m.name}</span>
+                      {m.is_coach ? <span className="tag">Coach</span> : null}
+                    </div>
+                    <div className="roster-row-meta">
+                      <span className="roster-team">{m.team}</span>
+                      {captured && (
+                        <span className="badge-check" title="Has a photo for this shoot">
+                          ✓
+                        </span>
+                      )}
+                    </div>
+                  </button>
                 </li>
               );
             })}

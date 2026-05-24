@@ -64,12 +64,32 @@ export default function App() {
 
   const backToShoots = () => {
     setSelectedJob(null);
+    setSelectedPlayer(null);
     setRoster([]);
     setReferencedPlayerIds(new Set());
     setTeamFilter('');           // fresh filters for the next shoot
     setSearch('');
     setNeedsPhotoOnly(false);
     setView('shoots');
+  };
+
+  // Tap a roster row → capture for that player.
+  const pickPlayer = (member) => {
+    setSelectedPlayer(member);
+    setView('capture');
+  };
+
+  // Capture succeeded → mark ✓ live (no refetch) and return to the roster with
+  // filter state intact (it lives here). Decisions 5 + 6.
+  const onCaptured = (playerId) => {
+    setReferencedPlayerIds((prev) => new Set(prev).add(playerId));
+    setSelectedPlayer(null);
+    setView('roster');
+  };
+
+  const cancelCapture = () => {
+    setSelectedPlayer(null);
+    setView('roster');
   };
 
   if (view === 'shoots') {
@@ -97,18 +117,24 @@ export default function App() {
         onTeamFilter={setTeamFilter}
         onSearch={setSearch}
         onNeedsPhotoOnly={setNeedsPhotoOnly}
+        onPickPlayer={pickPlayer}
         onReload={() => setReloadKey((k) => k + 1)}
         onBack={backToShoots}
       />
     );
   }
 
-  // view === 'capture' — unreachable until Section 6 wires player selection.
+  // view === 'capture'
   return (
     <CaptureScreen
       job={selectedJob}
       player={selectedPlayer}
-      onDone={() => setView('roster')}
+      alreadyCaptured={
+        selectedPlayer ? referencedPlayerIds.has(selectedPlayer.player_id) : false
+      }
+      onSaved={onCaptured}
+      onCancel={cancelCapture}
+      onGone={backToShoots}
     />
   );
 }

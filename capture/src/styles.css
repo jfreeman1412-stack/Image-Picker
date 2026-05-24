@@ -234,7 +234,36 @@ body {
   pointer-events: none;
 }
 .topbar-title { font-size: 0.95rem; font-weight: 600; }
-.topbar-target { font-size: 0.85rem; color: var(--text-muted); }
+.topbar-target { font-size: 0.85rem; color: #fff; font-weight: 600; }
+
+/* Capture-screen back control. The .topbar is pointer-events:none so it never
+ * blocks the shutter; this button re-enables events just for itself. */
+.topbar-back {
+  pointer-events: auto;
+  padding: 0;
+  font-size: 0.9rem;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* "Already has a photo — will replace" notice, under the top bar. */
+.replace-banner {
+  position: absolute;
+  top: max(56px, calc(env(safe-area-inset-top) + 50px));
+  left: 16px;
+  right: 16px;
+  z-index: 3;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: rgba(245, 176, 86, 0.92);   /* --warn, opaque enough to read */
+  color: #1a1205;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: center;
+  pointer-events: none;
+}
 
 /* ── Non-camera screens (Section 2 picker; Sections 3–4 roster) ─────────────
  * The camera screen is full-bleed + fixed; the picker/roster screens are normal
@@ -366,9 +395,17 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  width: 100%;
   padding: 14px 20px;
+  border: none;
   border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
+.roster-row:active { background: var(--bg-elev-1); }
 
 .roster-row-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .roster-name { font-size: 1.02rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

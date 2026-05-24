@@ -1,19 +1,24 @@
-// Capture screen — the B.1 camera + capture/upload machine, extracted from the
-// old single-screen App so B.2's App can switch between shoot picker → roster →
-// capture (Decision 5). DORMANT until Section 6: it still targets
-// VITE_REF_PLAYER_ID and POSTs like B.1. Section 6 rewires it to target the
-// selected player/shoot (props) via the scoped-replace endpoint and removes the
-// env var (Decision 3). See ../PHASE_B2_ROSTER_CAPTURE.md.
+// Section 6 — capture for the selected player. Reuses B.1's useCamera + the
+// capture/review/upload state machine, now targeting the chosen player + shoot
+// via the SHOOT-SCOPED replace endpoint (Decisions 2 & 4): retake replaces only
+// this shoot's photo, other shoots untouched, and a failed gate keeps the
+// existing one. No VITE_REF_PLAYER_ID (Decision 3) — the target comes from props.
+//
+// Props: job {id,name}, player {player_id,name,team,is_coach},
+//   alreadyCaptured (bool — show the "will replace" affordance),
+//   onSaved(playerId) — App marks ✓ live + returns to the roster,
+//   onCancel() — back to the roster without uploading,
+//   onGone() — hard 404 (player/shoot gone), back to the shoot picker.
+// See ../PHASE_B2_ROSTER_CAPTURE.md.
 import { useEffect, useState } from 'react';
 import useCamera from './useCamera.js';
 
-const PLAYER_ID = import.meta.env.VITE_REF_PLAYER_ID;
-
-export default function CaptureScreen() {
+export default function CaptureScreen({
+  job, player, alreadyCaptured, onSaved, onCancel, onGone,
+}) {
   const { videoRef, status, error } = useCamera();
   const [shot, setShot] = useState(null);               // { blob, url } | null
-  const [upload, setUpload] = useState('idle');         // idle | uploading | success | error
-  const [result, setResult] = useState(null);           // success summary dict | null
+  const [upload, setUpload] = useState('idle');         // idle | uploading | error
   const [uploadError, setUploadError] = useState(null); // { kind, message } | null
 
   // Free the captured object URL when the shot changes or the screen unmounts.
@@ -41,47 +46,36 @@ export default function CaptureScreen() {
     );
   };
 
-  // Back to a live preview, ready to shoot again (Retake / Capture another).
+  // Back to a live preview, ready to shoot again (Retake).
   const reset = () => {
     setShot(null);          // effect cleanup revokes the URL
     setUpload('idle');
-    setResult(null);
     setUploadError(null);
   };
 
   const sendUpload = async () => {
     if (!shot) return;
-    if (!PLAYER_ID) {
-      setUploadError({
-        kind: 'not_found',
-        message:
-          'VITE_REF_PLAYER_ID is not set. Point capture/.env at a real player id ' +
-          'and restart the dev server.',
-      });
-      setUpload('error');
-      return;
-    }
     setUpload('uploading');
     setUploadError(null);
     try {
       const fd = new FormData();
       fd.append('file', shot.blob, 'capture.jpg');
-      const res = await fetch(`/api/players/${PLAYER_ID}/references`, {
-        method: 'POST',
-        body: fd,
-      });
+      // Shoot-scoped replace: sets this player's single reference FOR this shoot.
+      const res = await fetch(
+        `/api/players/${player.player_id}/references/shoot/${job.id}`,
+        { method: 'PUT', body: fd },
+      );
       if (!res.ok) {
-        // 400 quality gate → detail is { error, message }; 404 → detail is a string.
         const body = await res.json().catch(() => ({}));
         const code = body?.detail?.error;
         if (res.status === 404) {
+          // Player or shoot no longer exists — selection is stale.
           setUploadError({
-            kind: 'not_found',
-            message:
-              `Player #${PLAYER_ID} wasn’t found on the server. Set ` +
-              `VITE_REF_PLAYER_ID to a real player id (see README) and restart.`,
+            kind: 'gone',
+            message: 'This player or shoot no longer exists on the server. Go back and reselect.',
           });
         } else if (code) {
+          // Quality gate (no_face / multiple_faces / low_confidence / face_too_small).
           setUploadError({ kind: 'quality', code, message: body.detail.message });
         } else {
           setUploadError({
@@ -94,8 +88,9 @@ export default function CaptureScreen() {
         setUpload('error');
         return;
       }
-      setResult(await res.json());
-      setUpload('success');
+      // Success → mark ✓ live and auto-return to the roster (no tap, per spec).
+      // This unmounts CaptureScreen, so don't set any further state here.
+      onSaved(player.player_id);
     } catch {
       setUploadError({
         kind: 'network',
@@ -109,10 +104,10 @@ export default function CaptureScreen() {
   const capturing = live && !shot;
   const reviewing = live && shot && upload === 'idle';
   const uploading = live && shot && upload === 'uploading';
-  const succeeded = live && shot && upload === 'success';
   const failed = live && shot && upload === 'error';
-  // Network/unknown failures can retry the same blob; a quality rejection or a
-  // missing player needs a fresh shot (or a config fix), so only Retake there.
+  const isGone = failed && uploadError?.kind === 'gone';
+  // Network/unknown failures can retry the same blob; a quality rejection needs
+  // a fresh shot (Retake); a stale selection (gone) needs to go back.
   const retryable = failed && (uploadError?.kind === 'network' || uploadError?.kind === 'other');
 
   return (
@@ -120,13 +115,19 @@ export default function CaptureScreen() {
       <video ref={videoRef} className="camera-video" autoPlay playsInline muted />
 
       <header className="topbar">
-        <span className="topbar-title">Reference capture</span>
-        <span className="topbar-target" title={`POST /api/players/${PLAYER_ID}/references`}>
-          {PLAYER_ID ? `→ player #${PLAYER_ID}` : 'no player set'}
+        <button className="topbar-back" onClick={onCancel}>← Roster</button>
+        <span className="topbar-target">
+          {player ? `${player.name} · ${player.team}` : ''}
         </span>
       </header>
 
       {shot && <img className="shot-image" src={shot.url} alt="Captured photo" />}
+
+      {(capturing || reviewing) && alreadyCaptured && (
+        <div className="replace-banner">
+          {player?.name} already has a photo for this shoot — this will replace it.
+        </div>
+      )}
 
       {capturing && (
         <div className="frame-overlay" aria-hidden="true">
@@ -144,31 +145,27 @@ export default function CaptureScreen() {
       {reviewing && (
         <div className="controls">
           <button className="btn ghost" onClick={reset}>Retake</button>
-          <button className="btn" onClick={sendUpload}>Use photo</button>
+          <button className="btn" onClick={sendUpload}>
+            {alreadyCaptured ? 'Replace photo' : 'Use photo'}
+          </button>
         </div>
       )}
 
       {uploading && <div className="status-pill">Uploading…</div>}
 
-      {succeeded && result && (
-        <div className="result-panel">
-          <p className="result-line success">✓ Saved as player #{result.player_id}</p>
-          <p className="result-meta">
-            detection {Number(result.det_score).toFixed(2)}
-            {result.face_area_ratio != null &&
-              ` · face ${(result.face_area_ratio * 100).toFixed(1)}% of frame`}
-          </p>
-          <button className="btn" onClick={reset}>Capture another</button>
-        </div>
-      )}
-
       {failed && uploadError && (
         <div className="result-panel">
           <p className="result-line warn">{uploadError.message}</p>
           <div className="controls-inline">
-            <button className="btn ghost" onClick={reset}>Retake</button>
-            {retryable && (
-              <button className="btn" onClick={sendUpload}>Try again</button>
+            {isGone ? (
+              <button className="btn" onClick={onGone}>Back to shoots</button>
+            ) : (
+              <>
+                <button className="btn ghost" onClick={reset}>Retake</button>
+                {retryable && (
+                  <button className="btn" onClick={sendUpload}>Try again</button>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -183,7 +180,10 @@ export default function CaptureScreen() {
         <div className="camera-overlay">
           <div className="camera-message">
             <p>{error.message}</p>
-            <button className="btn" onClick={() => window.location.reload()}>Reload</button>
+            <div className="controls-inline">
+              <button className="btn ghost" onClick={onCancel}>Back</button>
+              <button className="btn" onClick={() => window.location.reload()}>Reload</button>
+            </div>
           </div>
         </div>
       )}
