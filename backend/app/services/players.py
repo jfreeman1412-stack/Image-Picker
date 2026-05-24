@@ -12,6 +12,8 @@ adds on top of the Phase 6 format: a name starting `Coach-` flags a coach.
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
 
 from fastapi import HTTPException
@@ -104,3 +106,32 @@ def load_shoot_roster_from_text(db: DbSession, job_id: int, text: str) -> dict:
         logger.info("[shoot roster job %s] skipped line %d: %s", job_id, line_no, reason)
     summary["entries_skipped"] = len(skips)  # malformed/blank CSV rows
     return summary
+
+
+# ── Phase C.1: mapping-aware roster upload ────────────────────────────────
+# A header-aware, arbitrary-column path that sits IN FRONT OF the positional
+# load above. The desktop operator maps each CSV's columns to the canonical
+# fields (name + team), we validate strictly, then feed the same
+# `replace_shoot_memberships` core — the positional endpoint stays untouched.
+# See PHASE_C1_ROSTER_UPLOAD.md.
+
+
+def inspect_roster_csv(text: str, *, sample_size: int = 5) -> dict:
+    """Read an arbitrary CSV so the mapping UI can build its column dropdowns.
+
+    Returns the first non-blank row's cells as `columns` (the candidate
+    header), up to `sample_size` following rows as `sample_rows`, and
+    `total_rows` (non-blank rows, the first row included). Uses the `csv`
+    module so a quoted comma stays inside one cell. Pure / no DB — tests drive
+    it directly. Whether row 1 is actually a header is the caller's call (the
+    `has_header` toggle); this function does not decide that.
+    """
+    reader = csv.reader(io.StringIO(text))
+    rows = [row for row in reader if any(cell.strip() for cell in row)]
+    if not rows:
+        return {"columns": [], "sample_rows": [], "total_rows": 0}
+    return {
+        "columns": [cell.strip() for cell in rows[0]],
+        "sample_rows": [list(row) for row in rows[1:1 + sample_size]],
+        "total_rows": len(rows),
+    }

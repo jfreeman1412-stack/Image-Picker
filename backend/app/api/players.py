@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
 from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
-from app.services.players import load_shoot_roster_from_text
+from app.services.players import inspect_roster_csv, load_shoot_roster_from_text
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,26 @@ def delete_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
     n = db.query(PlayerMembership).filter_by(job_id=job_id).delete()
     db.commit()
     return {"deleted": n}
+
+
+# ── Phase C.1: mapping-aware roster upload ────────────────────────────────
+# `/inspect` reads an arbitrary CSV's columns for the desktop mapping UI; the
+# commit (`/mapped`) lands in a later section. Both are extra-segment routes
+# under `/roster/...`, declared before the dynamic `/{player_id}` route below.
+
+@router.post("/roster/{job_id}/inspect")
+async def inspect_roster(
+    job_id: int,
+    file: UploadFile = File(...),
+    db: DbSession = Depends(get_db),
+):
+    """Return an uploaded roster CSV's columns + a few sample rows so the
+    mapping UI can build its dropdowns. Reads only; writes nothing. 404 if the
+    job is missing."""
+    if db.query(Job).get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    data = await file.read()
+    return inspect_roster_csv(decode_bytes(data))
 
 
 # ── global player query ──────────────────────────────────────────────────

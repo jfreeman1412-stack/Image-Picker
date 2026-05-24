@@ -483,3 +483,64 @@ def test_reference_status_empty_when_no_refs_for_shoot(client):
 def test_reference_status_unknown_job_404(client):
     res = client.get("/api/players/roster/99999/reference-status")
     assert res.status_code == 404
+
+
+# ── Phase C.1 Section 1: roster CSV inspect ───────────────────────────────
+
+from app.services.players import inspect_roster_csv  # noqa: E402
+
+
+def test_inspect_returns_columns_samples_and_count():
+    text = (
+        "First,Last,Team,Parent Email\n"
+        "Ava,Nguyen,Lions,a@x.com\n"
+        "Mason,Reyes,Lions,b@x.com\n"
+        "Sofia,Petrov,Tigers,c@x.com\n"
+    )
+    out = inspect_roster_csv(text)
+    assert out["columns"] == ["First", "Last", "Team", "Parent Email"]
+    assert out["sample_rows"][0] == ["Ava", "Nguyen", "Lions", "a@x.com"]
+    assert len(out["sample_rows"]) == 3       # the 3 data rows (sample_size>=3)
+    assert out["total_rows"] == 4             # header included; blank rows dropped
+
+
+def test_inspect_quoted_comma_stays_one_cell():
+    """Proves we parse with the csv module, not str.split(',')."""
+    text = 'Name,Team\n"Carter, Jr.",Bears\n'
+    out = inspect_roster_csv(text)
+    assert out["columns"] == ["Name", "Team"]
+    assert out["sample_rows"][0] == ["Carter, Jr.", "Bears"]
+
+
+def test_inspect_empty_csv():
+    assert inspect_roster_csv("\n\n") == {
+        "columns": [], "sample_rows": [], "total_rows": 0,
+    }
+
+
+def test_inspect_sample_size_caps_rows():
+    text = "H1,H2\n" + "".join(f"a{i},b{i}\n" for i in range(20))
+    out = inspect_roster_csv(text, sample_size=5)
+    assert len(out["sample_rows"]) == 5
+    assert out["total_rows"] == 21            # header + 20 data rows
+
+
+def test_inspect_endpoint_200(client):
+    job_id = client.job_a_id
+    csv_bytes = b"Player Name,Team\nEleanor-Pederson,10U-Black-Softball\n"
+    res = client.post(
+        f"/api/players/roster/{job_id}/inspect",
+        files={"file": ("roster.csv", csv_bytes, "text/csv")},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["columns"] == ["Player Name", "Team"]
+    assert body["total_rows"] == 2
+
+
+def test_inspect_endpoint_unknown_job_404(client):
+    res = client.post(
+        "/api/players/roster/99999/inspect",
+        files={"file": ("r.csv", b"A,B\n", "text/csv")},
+    )
+    assert res.status_code == 404
