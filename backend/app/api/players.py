@@ -15,15 +15,19 @@ See PHASE_A1_ROSTER_MODEL.md.
 Static `/roster/...` routes are declared BEFORE the dynamic `/{player_id}`
 route so FastAPI matches them correctly.
 """
+import json
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
 from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
-from app.services.players import inspect_roster_csv, load_shoot_roster_from_text
+from app.services.players import (
+    build_validation_report, inspect_roster_csv, load_shoot_roster_from_text,
+    parse_mapped_roster, replace_shoot_memberships,
+)
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -126,6 +130,78 @@ async def inspect_roster(
         raise HTTPException(404, "Job not found")
     data = await file.read()
     return inspect_roster_csv(decode_bytes(data))
+
+
+def _captured_reference_warning(db: DbSession, job_id: int) -> dict:
+    """How many players already have a reference photo captured FOR this shoot
+    (`captured_job_id == job_id`) — the guard before a roster replace. Reuses
+    the same scope key as the B.2 reference-status endpoint."""
+    count = (
+        db.query(ReferenceFace.player_id)
+        .filter(ReferenceFace.captured_job_id == job_id)
+        .distinct()
+        .count()
+    )
+    if count == 0:
+        message = ""
+    elif count == 1:
+        message = "1 player already has a reference photo captured for this shoot."
+    else:
+        message = (f"{count} players already have reference photos captured "
+                   "for this shoot.")
+    return {"count": count, "message": message}
+
+
+@router.post("/roster/{job_id}/mapped")
+async def upload_mapped_roster(
+    job_id: int,
+    file: UploadFile = File(...),
+    mapping: str = Form(...),
+    dry_run: bool = Form(False),
+    confirm_replace: bool = Form(False),
+    db: DbSession = Depends(get_db),
+):
+    """Upload a roster via an explicit column mapping (Phase C.1).
+
+    `mapping` is a JSON object (name_mode + columns + has_header — see
+    PHASE_C1_ROSTER_UPLOAD.md). `dry_run=true` validates and returns the report
+    without writing. On a real commit: an incomplete mapping or any invalid row
+    → **400** carrying the same report; if reference photos already exist for
+    this shoot and `confirm_replace` isn't set → **409**; otherwise the job's
+    memberships are replaced via the unchanged A.1 core and the summary
+    returned. 404 if the job is missing. **Player identity and reference photos
+    are preserved on replace** — only `PlayerMembership` rows for this job are
+    rewritten.
+    """
+    if db.query(Job).get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    try:
+        mapping_obj = json.loads(mapping)
+        if not isinstance(mapping_obj, dict):
+            raise ValueError("mapping must be a JSON object")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, detail={
+            "error": "bad_mapping_json", "message": str(exc)})
+
+    text = decode_bytes(await file.read())
+    report = build_validation_report(text, mapping_obj)
+    report["references_warning"] = _captured_reference_warning(db, job_id)
+
+    if dry_run:
+        return report
+    if not report["ok"]:
+        raise HTTPException(400, detail=report)
+    if report["references_warning"]["count"] and not confirm_replace:
+        raise HTTPException(409, detail={
+            "error": "references_exist",
+            "count": report["references_warning"]["count"],
+            "message": report["references_warning"]["message"],
+        })
+
+    canonical, _ = parse_mapped_roster(text, mapping_obj)
+    summary = replace_shoot_memberships(db, job_id, canonical)
+    db.commit()
+    return summary
 
 
 # ── global player query ──────────────────────────────────────────────────

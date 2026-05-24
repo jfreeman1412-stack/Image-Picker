@@ -685,3 +685,163 @@ def test_report_row_errors_block_and_dedupe_invalid_count():
     assert reasons == {"missing_name", "missing_team"}
     for e in rep["row_errors"]:
         assert e["rows"] == [3]
+
+
+# ── Phase C.1 Section 3: mapped commit endpoint + refs-replace guard ──────
+
+import json  # noqa: E402
+
+
+def _post_mapped(client, job_id, csv_text, mapping, *,
+                 dry_run=False, confirm_replace=False):
+    return client.post(
+        f"/api/players/roster/{job_id}/mapped",
+        data={
+            "mapping": json.dumps(mapping),
+            "dry_run": "true" if dry_run else "false",
+            "confirm_replace": "true" if confirm_replace else "false",
+        },
+        files={"file": ("r.csv", csv_text.encode("utf-8"), "text/csv")},
+    )
+
+
+def test_mapped_dry_run_ok_writes_nothing(client):
+    job_id = client.job_a_id
+    csv_text = "Name,Team\nEleanor-Pederson,10U\nCoach-Lions,10U\n"
+    res = _post_mapped(client, job_id, csv_text, _FULL, dry_run=True)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["summary"]["valid_rows"] == 2
+    assert body["summary"]["coaches"] == 1
+    assert body["references_warning"]["count"] == 0
+    # nothing written
+    assert client.get(f"/api/players/roster/{job_id}").json()["memberships_loaded"] == 0
+
+
+def test_mapped_dry_run_reports_bad_rows(client):
+    job_id = client.job_a_id
+    csv_text = "Name,Team\nAva,Lions\nMason,\n"  # row 3 missing team
+    res = _post_mapped(client, job_id, csv_text, _FULL, dry_run=True)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is False
+    by_reason = {e["reason"]: e["rows"] for e in body["row_errors"]}
+    assert by_reason["missing_team"] == [3]
+
+
+def test_mapped_commit_happy_flags_coach(client):
+    job_id = client.job_a_id
+    csv_text = ("Name,Team\nEleanor-Pederson,10U\nJune-Wampach,10U\n"
+                "Coach-Lions,11U\n")
+    res = _post_mapped(client, job_id, csv_text, _FULL)
+    assert res.status_code == 200, res.text
+    assert res.json()["memberships_loaded"] == 3
+    assert res.json()["coaches"] == 1
+    listing = client.get(f"/api/players/roster/{job_id}").json()
+    assert listing["memberships_loaded"] == 3
+    assert [i for i in listing["items"] if i["is_coach"]][0]["name"] == "Coach-Lions"
+
+
+def test_mapped_commit_split_mode_joins(client):
+    job_id = client.job_a_id
+    csv_text = "First,Last,Team\nAva,Nguyen,Lions\n,Solo,Tigers\n"
+    res = _post_mapped(client, job_id, csv_text, _SPLIT)
+    assert res.status_code == 200, res.text
+    names = {i["name"] for i in client.get(f"/api/players/roster/{job_id}").json()["items"]}
+    assert names == {"Ava Nguyen", "Solo"}   # last-name-only kept
+
+
+def test_mapped_commit_bad_rows_400_writes_nothing(client):
+    job_id = client.job_a_id
+    res = _post_mapped(client, job_id, "Name,Team\nAva,\n", _FULL)
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert detail["error"] == "roster_validation"
+    assert detail["row_errors"][0]["reason"] == "missing_team"
+    assert client.get(f"/api/players/roster/{job_id}").json()["memberships_loaded"] == 0
+
+
+def test_mapped_commit_incomplete_mapping_400(client):
+    job_id = client.job_a_id
+    bad_map = {"has_header": True, "name_mode": "full", "name_column": "Name"}  # no team
+    res = _post_mapped(client, job_id, "Name,Team\nAva,Lions\n", bad_map)
+    assert res.status_code == 400
+    assert "team column not mapped" in res.json()["detail"]["mapping_errors"]
+
+
+def test_mapped_commit_bad_json_400(client):
+    job_id = client.job_a_id
+    res = client.post(
+        f"/api/players/roster/{job_id}/mapped",
+        data={"mapping": "not-json", "dry_run": "false", "confirm_replace": "false"},
+        files={"file": ("r.csv", b"Name,Team\nAva,Lions\n", "text/csv")},
+    )
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == "bad_mapping_json"
+
+
+def test_mapped_reupload_replaces_not_appends(client):
+    job_id = client.job_a_id
+    csv_text = "Name,Team\nEleanor-Pederson,10U\nJune-Wampach,10U\n"
+    _post_mapped(client, job_id, csv_text, _FULL)
+    _post_mapped(client, job_id, csv_text, _FULL)   # same again
+    assert client.get(f"/api/players/roster/{job_id}").json()["memberships_loaded"] == 2
+
+
+def test_mapped_unknown_job_404(client):
+    res = _post_mapped(client, 99999, "Name,Team\nAva,Lions\n", _FULL)
+    assert res.status_code == 404
+
+
+def test_mapped_replace_guarded_by_captured_references(client):
+    """A roster replace is blocked with 409 when references were already
+    captured for this shoot, unless confirm_replace is set."""
+    job_id = client.job_a_id
+    _post_mapped(client, job_id, "Name,Team\nEleanor-Pederson,10U\n", _FULL)
+    pid = client.get(f"/api/players/roster/{job_id}").json()["items"][0]["player_id"]
+    _seed_ref(client, pid, job_id)   # a reference captured FOR this shoot
+
+    blocked = _post_mapped(client, job_id, "Name,Team\nJune-Wampach,10U\n", _FULL)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["error"] == "references_exist"
+    assert blocked.json()["detail"]["count"] == 1
+    # roster unchanged by the blocked call
+    assert client.get(f"/api/players/roster/{job_id}").json()["items"][0]["name"] \
+        == "Eleanor-Pederson"
+
+    ok = _post_mapped(client, job_id, "Name,Team\nJune-Wampach,10U\n", _FULL,
+                      confirm_replace=True)
+    assert ok.status_code == 200
+
+
+def test_captured_reference_survives_roster_replace(client):
+    """THE durable-identity invariant: replacing a job's roster re-points
+    memberships only — it never destroys the global Player or its captured
+    reference photos, even when the new roster omits that player."""
+    job_id = client.job_a_id
+    _post_mapped(client, job_id,
+                 "Name,Team\nEleanor-Pederson,10U\nJune-Wampach,10U\n", _FULL)
+    items = client.get(f"/api/players/roster/{job_id}").json()["items"]
+    eleanor = {i["name"]: i["player_id"] for i in items}["Eleanor-Pederson"]
+    _seed_ref(client, eleanor, job_id)   # Eleanor has a captured reference
+
+    # Re-upload a roster that OMITS Eleanor (only June). Confirm past the guard.
+    res = _post_mapped(client, job_id, "Name,Team\nJune-Wampach,10U\n", _FULL,
+                       confirm_replace=True)
+    assert res.status_code == 200, res.text
+
+    s = client.SessionLocal()
+    try:
+        # Player identity preserved (orphaned of a membership, but intact)…
+        player = s.query(Player).filter_by(id=eleanor).one_or_none()
+        assert player is not None and player.display_name == "Eleanor-Pederson"
+        # …her captured reference is untouched (player + shoot provenance intact)…
+        ref = s.query(ReferenceFace).filter_by(player_id=eleanor).one_or_none()
+        assert ref is not None and ref.captured_job_id == job_id
+        # …only her membership for this shoot is gone; June's is present.
+        assert s.query(PlayerMembership).filter_by(
+            job_id=job_id, player_id=eleanor).count() == 0
+        assert s.query(PlayerMembership).filter_by(job_id=job_id).count() == 1
+    finally:
+        s.close()
