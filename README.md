@@ -102,9 +102,32 @@ A cluster is flagged `needs_review` if:
 - Team or panoramic pick failed per rules above, OR
 - The cluster contains an image with no detected face but the user has manually added it.
 
+## Rosters
+
+There are **two** roster CSVs, for two different purposes — both reached from a
+job's page in the desktop app:
+
+- **Player roster** (the *"Player roster"* button) — the per-shoot list of
+  players the reference-photo capture + face-matching system uses. Rosters arrive
+  in many column layouts, so you **map the CSV's columns** to the canonical
+  fields (**name** + **team**; other columns such as parent contact are ignored),
+  the app validates strictly, and on success the roster is written for the shoot.
+  Name can be one full-name column *or* separate first/last columns (a
+  last-name-only row is valid). Re-uploading **replaces** the shoot's roster; if
+  reference photos were already captured for that shoot you're asked to confirm.
+  Coaches are auto-flagged from a `Coach-` name prefix.
+- **Roster cross-check** (the *"Roster cross-check"* button) — a positional
+  `name,team` CSV (no header) used *after* the pipeline runs to flag clusters
+  that landed on the wrong team. A separate system writing a separate table.
+
+Sample player-roster CSVs to try are in [`sample-rosters/`](sample-rosters/):
+`full-name.csv` (one name column + ignored PII columns), `first-last.csv`
+(separate first/last; includes a last-name-only row and a coach), and
+`missing-team.csv` (two rows missing a team — the upload is blocked and the
+error names the offending rows).
+
 ## What this scaffold does NOT include (yet)
 
-- Roster upload / phone-based reference photo capture (future feature).
 - Eyes-open / looking-away quality scoring (v2 — building sort first per Joey's call).
 - Integration with Sytist or the Sportsline Production Dashboard (plug-in later).
 - Authentication. Runs as a local tool.
