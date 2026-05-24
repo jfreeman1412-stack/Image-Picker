@@ -135,3 +135,138 @@ def inspect_roster_csv(text: str, *, sample_size: int = 5) -> dict:
         "sample_rows": [list(row) for row in rows[1:1 + sample_size]],
         "total_rows": len(rows),
     }
+
+
+def validate_mapping(mapping: dict) -> list[str]:
+    """Pre-flight: is the column mapping complete enough to parse rows at all?
+
+    Returns a list of human-readable problems (empty == complete). Required:
+    a team column, plus a name source — for `name_mode == "full"` a name
+    column, for `"split"` at least one of first/last (a last-name-only roster
+    is legitimate).
+    """
+    errors: list[str] = []
+    name_mode = mapping.get("name_mode")
+    if name_mode == "full":
+        if not mapping.get("name_column"):
+            errors.append("name column not mapped")
+    elif name_mode == "split":
+        if not mapping.get("first_name_column") and not mapping.get("last_name_column"):
+            errors.append("map at least one of first-name / last-name column")
+    else:
+        errors.append("name mode must be 'full' or 'split'")
+    if not mapping.get("team_column"):
+        errors.append("team column not mapped")
+    return errors
+
+
+def _resolve_header(records: list[list[str]], has_header: bool):
+    """Return (header, enumerated_data_rows). With a header, row 1 is the
+    header and data rows are numbered from 2 (matching the file/Excel row the
+    operator sees). Headerless rosters get synthetic 'Column N' (1-based)
+    labels and data numbered from 1. Column references in the mapping resolve
+    against `header` either way."""
+    if has_header:
+        header = [c.strip() for c in records[0]]
+        return header, list(enumerate(records[1:], start=2))
+    width = max((len(r) for r in records), default=0)
+    header = [f"Column {i + 1}" for i in range(width)]
+    return header, list(enumerate(records, start=1))
+
+
+def parse_mapped_roster(text: str, mapping: dict):
+    """Apply a column mapping to an arbitrary CSV → canonical `(name, team)`
+    rows + grouped per-row errors. Pure / no DB.
+
+    Returns `(canonical_rows, row_errors)` where `row_errors` is a list of
+    `{reason, label, rows}` (1-based file row numbers). A blank record (all
+    cells empty) is skipped, not errored, mirroring the positional `parse_csv`.
+    Unmapped columns (e.g. parent contact) are never read. Coaches need no
+    special handling here — the `Coach-` flag is derived downstream from the
+    assembled name.
+    """
+    records = list(csv.reader(io.StringIO(text)))
+    if not records:
+        return [], []
+    has_header = bool(mapping.get("has_header", True))
+    header, data = _resolve_header(records, has_header)
+    idx = {name: i for i, name in enumerate(header)}
+
+    def col(ref):
+        return idx.get(ref) if ref else None
+
+    name_mode = mapping.get("name_mode")
+    team_i = col(mapping.get("team_column"))
+    name_i = col(mapping.get("name_column")) if name_mode == "full" else None
+    first_i = col(mapping.get("first_name_column")) if name_mode == "split" else None
+    last_i = col(mapping.get("last_name_column")) if name_mode == "split" else None
+
+    def cell(cells, i):
+        return cells[i].strip() if (i is not None and i < len(cells)) else ""
+
+    canonical: list[tuple[str, str]] = []
+    missing_name: list[int] = []
+    missing_team: list[int] = []
+    for row_no, cells in data:
+        if not any(c.strip() for c in cells):
+            continue  # blank record — skipped, not an error
+        if name_mode == "full":
+            name = cell(cells, name_i)
+        else:
+            name = " ".join(p for p in (cell(cells, first_i), cell(cells, last_i)) if p)
+        team = cell(cells, team_i)
+        ok = True
+        if not name:
+            missing_name.append(row_no); ok = False
+        if not team:
+            missing_team.append(row_no); ok = False
+        if ok:
+            canonical.append((name, team))
+
+    row_errors = []
+    if missing_team:
+        row_errors.append({"reason": "missing_team", "label": "missing a team",
+                           "rows": missing_team})
+    if missing_name:
+        row_errors.append({"reason": "missing_name", "label": "missing a name",
+                           "rows": missing_name})
+    return canonical, row_errors
+
+
+def build_validation_report(text: str, mapping: dict, *, preview_size: int = 10) -> dict:
+    """Strict validation of a mapped roster. Pure / no DB — the endpoint adds
+    `references_warning` (needs the job's captured references). This is the body
+    returned for a dry-run and used as the 400 `detail` when a commit is
+    blocked. An incomplete mapping short-circuits before any row parsing.
+    """
+    mapping_errors = validate_mapping(mapping)
+    if mapping_errors:
+        return {
+            "ok": False,
+            "error": "roster_validation",
+            "mapping_errors": mapping_errors,
+            "row_errors": [],
+            "summary": {"valid_rows": 0, "invalid_rows": 0,
+                        "distinct_teams": 0, "coaches": 0},
+            "preview": [],
+        }
+    canonical, row_errors = parse_mapped_roster(text, mapping)
+    invalid_rows = len({r for e in row_errors for r in e["rows"]})
+    report = {
+        "ok": not row_errors,
+        "mapping_errors": [],
+        "row_errors": row_errors,
+        "summary": {
+            "valid_rows": len(canonical),
+            "invalid_rows": invalid_rows,
+            "distinct_teams": len({normalize_name(t) for _, t in canonical}),
+            "coaches": sum(1 for n, _ in canonical if is_coach_name(n)),
+        },
+        "preview": [
+            {"name": n, "team": t, "is_coach": is_coach_name(n)}
+            for n, t in canonical[:preview_size]
+        ],
+    }
+    if row_errors:
+        report["error"] = "roster_validation"
+    return report

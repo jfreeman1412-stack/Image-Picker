@@ -544,3 +544,144 @@ def test_inspect_endpoint_unknown_job_404(client):
         files={"file": ("r.csv", b"A,B\n", "text/csv")},
     )
     assert res.status_code == 404
+
+
+# ── Phase C.1 Section 2: mapped parse + strict validation ─────────────────
+
+from app.services.players import (  # noqa: E402
+    build_validation_report, parse_mapped_roster, validate_mapping,
+)
+
+_FULL = {"has_header": True, "name_mode": "full",
+         "name_column": "Name", "team_column": "Team"}
+_SPLIT = {"has_header": True, "name_mode": "split",
+          "first_name_column": "First", "last_name_column": "Last",
+          "team_column": "Team"}
+
+
+def test_validate_mapping_complete_and_incomplete():
+    assert validate_mapping(_FULL) == []
+    assert validate_mapping(_SPLIT) == []
+    # full without a name column
+    assert "name column not mapped" in validate_mapping(
+        {"name_mode": "full", "team_column": "Team"})
+    # split with neither first nor last
+    assert any("at least one" in e for e in validate_mapping(
+        {"name_mode": "split", "team_column": "Team"}))
+    # no team
+    assert "team column not mapped" in validate_mapping(
+        {"name_mode": "full", "name_column": "Name"})
+    # bad mode
+    assert any("name mode" in e for e in validate_mapping({"team_column": "Team"}))
+
+
+def test_parse_full_mode_happy():
+    text = "Name,Team\nEleanor-Pederson,10U\nCoach-Lions,10U\n"
+    rows, errs = parse_mapped_roster(text, _FULL)
+    assert rows == [("Eleanor-Pederson", "10U"), ("Coach-Lions", "10U")]
+    assert errs == []
+
+
+def test_parse_split_mode_joins_first_last():
+    text = "First,Last,Team\nAva,Nguyen,Lions\n"
+    rows, errs = parse_mapped_roster(text, _SPLIT)
+    assert rows == [("Ava Nguyen", "Lions")]
+    assert errs == []
+
+
+def test_parse_split_last_name_only_is_valid():
+    text = "First,Last,Team\n,Nguyen,Lions\nAva,,Tigers\n"
+    rows, errs = parse_mapped_roster(text, _SPLIT)
+    assert rows == [("Nguyen", "Lions"), ("Ava", "Tigers")]  # both valid
+    assert errs == []
+
+
+def test_parse_missing_name_and_team_with_excel_row_numbers():
+    # Header is row 1; data rows are 2,3,4,5. A blank record is skipped but
+    # still consumes its row number, so downstream rows keep Excel numbering.
+    text = (
+        "Name,Team\n"          # row 1 (header)
+        "Ava,Lions\n"          # row 2 ok
+        "Mason,\n"             # row 3 missing team
+        "\n"                   # row 4 blank → skipped (not an error)
+        ",Bears\n"             # row 5 missing name
+    )
+    rows, errs = parse_mapped_roster(text, _FULL)
+    assert rows == [("Ava", "Lions")]
+    by_reason = {e["reason"]: e["rows"] for e in errs}
+    assert by_reason["missing_team"] == [3]
+    assert by_reason["missing_name"] == [5]
+
+
+def test_parse_headerless_uses_positional_and_rows_from_one():
+    mapping = {"has_header": False, "name_mode": "full",
+               "name_column": "Column 1", "team_column": "Column 2"}
+    text = "Ava,Lions\n,Tigers\n"          # row 1 ok, row 2 missing name
+    rows, errs = parse_mapped_roster(text, mapping)
+    assert rows == [("Ava", "Lions")]
+    assert errs[0]["reason"] == "missing_name"
+    assert errs[0]["rows"] == [2]
+
+
+def test_parse_ignores_unmapped_pii_columns():
+    text = (
+        "First,Last,Team,Parent Email,Phone\n"
+        "Ava,Nguyen,Lions,a@x.com,555-0100\n"
+    )
+    rows, _ = parse_mapped_roster(text, _SPLIT)
+    assert rows == [("Ava Nguyen", "Lions")]  # PII columns never read
+
+
+def test_parse_quoted_comma_in_team():
+    text = 'Name,Team\nAva,"Lions, A"\n'
+    rows, _ = parse_mapped_roster(text, _FULL)
+    assert rows == [("Ava", "Lions, A")]
+
+
+def test_parse_ragged_short_row_treated_as_missing():
+    text = "Name,Team\nAva\n"  # row 2 has no team cell at all
+    rows, errs = parse_mapped_roster(text, _FULL)
+    assert rows == []
+    assert errs[0]["reason"] == "missing_team" and errs[0]["rows"] == [2]
+
+
+def test_report_ok_summary_and_preview():
+    text = ("Name,Team\nEleanor-Pederson,10U\nJune-Wampach,10U\n"
+            "Coach-Lions,11U\n")
+    rep = build_validation_report(text, _FULL)
+    assert rep["ok"] is True
+    assert rep["row_errors"] == [] and rep["mapping_errors"] == []
+    assert rep["summary"] == {
+        "valid_rows": 3, "invalid_rows": 0, "distinct_teams": 2, "coaches": 1,
+    }
+    assert rep["preview"][0] == {"name": "Eleanor-Pederson", "team": "10U",
+                                 "is_coach": False}
+    assert rep["preview"][2]["is_coach"] is True   # Coach- flagged
+
+
+def test_report_mapping_incomplete_short_circuits():
+    rep = build_validation_report("Name,Team\nAva,Lions\n",
+                                  {"name_mode": "full", "team_column": "Team"})
+    assert rep["ok"] is False
+    assert rep["error"] == "roster_validation"
+    assert "name column not mapped" in rep["mapping_errors"]
+    assert rep["row_errors"] == []   # didn't parse rows
+
+
+def test_report_row_errors_block_and_dedupe_invalid_count():
+    # Row 3 has empty name AND empty team but a non-blank (unmapped) cell, so
+    # it isn't skipped — it lands in BOTH error groups yet counts once.
+    text = (
+        "Name,Team,Note\n"   # row 1 header
+        "Ava,Lions,x\n"      # row 2 ok
+        ",,keep\n"           # row 3 missing name AND team (not blank: 'keep')
+    )
+    rep = build_validation_report(text, _FULL)
+    assert rep["ok"] is False
+    assert rep["error"] == "roster_validation"
+    assert rep["summary"]["valid_rows"] == 1
+    assert rep["summary"]["invalid_rows"] == 1   # row 3 counted once, not twice
+    reasons = {e["reason"] for e in rep["row_errors"]}
+    assert reasons == {"missing_name", "missing_team"}
+    for e in rep["row_errors"]:
+        assert e["rows"] == [3]
