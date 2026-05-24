@@ -6,6 +6,7 @@ import CardMenu from '../components/CardMenu.jsx';
 import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
 import RosterModal from '../components/RosterModal.jsx';
+import PlayerRosterModal from '../components/PlayerRosterModal.jsx';
 
 export default function JobDetail() {
   const { id } = useParams();
@@ -13,6 +14,7 @@ export default function JobDetail() {
   const [job, setJob] = useState(null);
   const [exporting, setExporting] = useState(false);
   const [showRoster, setShowRoster] = useState(false);
+  const [showPlayerRoster, setShowPlayerRoster] = useState(false);
   const [rosterSummary, setRosterSummary] = useState(null); // {entries_loaded, mismatch_count}
   const [running, setRunning] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
@@ -170,6 +172,12 @@ export default function JobDetail() {
               ? `Roster · ${rosterSummary.mismatch_count} mismatch${rosterSummary.mismatch_count === 1 ? '' : 'es'}`
               : 'Upload roster'}
           </button>
+          <button
+            onClick={() => setShowPlayerRoster(true)}
+            title="Upload the player roster (for reference-photo capture & matching)"
+          >
+            Player roster
+          </button>
           <button onClick={() => setExporting(true)}>Export job</button>
           {job.archived
             ? <button className="ghost" onClick={unarchiveJob}>Unarchive job</button>
@@ -245,6 +253,13 @@ export default function JobDetail() {
           job={job}
           onClose={() => setShowRoster(false)}
           onChanged={() => { loadRosterSummary(); load(); }}
+        />
+      )}
+
+      {showPlayerRoster && (
+        <PlayerRosterModal
+          job={job}
+          onClose={() => setShowPlayerRoster(false)}
         />
       )}
 
