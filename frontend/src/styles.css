@@ -633,6 +633,11 @@ label { color: var(--text); }
   max-width: 560px;
   width: 100%;
   box-shadow: var(--shadow-3);
+  /* Cap to the viewport (backdrop has 24px padding each side) and scroll the
+     content when it's taller — long roster mapping/preview panels used to
+     overflow off-screen with no scrollbar. */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
 }
 .modal-panel h2 { margin-top: 0; font-weight: 600; }
 .modal-panel .form-row { margin: 10px 0; gap: 14px; }
