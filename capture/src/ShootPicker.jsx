@@ -1,7 +1,9 @@
-// Section 2 — shoot picker. The cold-start screen: fetch the list of shoots
-// from GET /api/jobs (a bare array, archived excluded by default) and let the
-// volunteer choose one. Picking a shoot hands {id, name} up to App, which
-// advances to the roster view. See ../PHASE_B2_ROSTER_CAPTURE.md.
+// Section 2 — shoot picker. The cold-start screen: fetch the capture-ready
+// shoots from GET /api/jobs?stage=capture (a bare array: not archived, a roster
+// attached, no images imported yet) and let the volunteer choose one. Picking a
+// shoot hands {id, name} up to App, which advances to the roster view. The list
+// self-manages — a shoot drops off once its photos are imported. See
+// ../PHASE_B2_ROSTER_CAPTURE.md and PHASE_C2_PRESHOOT_JOB.md.
 import { useEffect, useState } from 'react';
 
 export default function ShootPicker({ onPick }) {
@@ -13,7 +15,7 @@ export default function ShootPicker({ onPick }) {
     setStatus('loading');
     setError(null);
     try {
-      const res = await fetch('/api/jobs');
+      const res = await fetch('/api/jobs?stage=capture');
       if (!res.ok) throw new Error(`Couldn’t load shoots (HTTP ${res.status}).`);
       const data = await res.json();
       setJobs(Array.isArray(data) ? data : []);
@@ -42,7 +44,8 @@ export default function ShootPicker({ onPick }) {
 
         {status === 'ready' && jobs.length === 0 && (
           <p className="muted">
-            No shoots found. Create one in the editor app and load a roster, then reload.
+            No shoots ready for capture. In the editor app, create a shoot and
+            load its roster — shoots appear here until their photos are imported.
           </p>
         )}
 
