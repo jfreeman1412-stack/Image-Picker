@@ -380,3 +380,53 @@ def test_create_shoot_appears_in_list_as_zero_team(client):
     row = next(j for j in listing if j["id"] == jid)
     assert row["session_count"] == 0
     assert row["image_count"] == 0
+
+
+# ── Phase C.2 Section 3: import images into an existing job ───────────────
+
+def test_import_images_into_shoot_ingests_teams(client, tmp_path):
+    jid = client.post("/api/jobs/shoot", json={"name": "Late Images"}).json()["job_id"]
+    root = _make_job_tree(tmp_path, ["TeamA", "TeamB"])
+
+    r = client.post(f"/api/jobs/{jid}/import-images", json={
+        "root_path": str(root), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["ingest_total"] == 2
+
+    # TestClient ran the background ingest synchronously.
+    status = client.get(f"/api/jobs/{jid}/ingest-status").json()
+    assert status["status"] == "done"
+    detail = client.get(f"/api/jobs/{jid}").json()
+    assert {s["name"] for s in detail["sessions"]} == {"TeamA", "TeamB"}
+
+
+def test_import_images_404_unknown_job(client, tmp_path):
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    r = client.post("/api/jobs/999999/import-images", json={
+        "root_path": str(root), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 404
+
+
+def test_import_images_400_missing_folder(client):
+    jid = client.post("/api/jobs/shoot", json={"name": "S"}).json()["job_id"]
+    r = client.post(f"/api/jobs/{jid}/import-images", json={
+        "root_path": r"Z:\nope", "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 400
+
+
+def test_import_images_409_when_teams_already_exist(client, tmp_path):
+    jid = client.post("/api/jobs/shoot", json={"name": "Once Only"}).json()["job_id"]
+    root = _make_job_tree(tmp_path, ["TeamA"])
+    body = {"root_path": str(root), "has_lines": False,
+            "image_subfolder_name": None, "auto_run": False}
+    assert client.post(f"/api/jobs/{jid}/import-images", json=body).status_code == 200
+    # Second import is refused — the job already has teams (guard precedes the
+    # folder check, so reusing the same folder still 409s on the session count).
+    r = client.post(f"/api/jobs/{jid}/import-images", json=body)
+    assert r.status_code == 409

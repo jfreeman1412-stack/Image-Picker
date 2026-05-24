@@ -118,6 +118,15 @@ class CreateShootRequest(BaseModel):
     root_path: Optional[str] = None
 
 
+class ImportImagesRequest(BaseModel):
+    """Phase C.2 — bring images into an existing (image-less) job. Same shape as
+    CreateJobRequest minus `name`; reuses the exact ingest path."""
+    root_path: str
+    has_lines: bool
+    image_subfolder_name: Optional[str] = None
+    auto_run: bool = True
+
+
 def _iter_team_folders(root: Path, has_lines: bool):
     """Yield team folders given the wizard's structural choice."""
     if has_lines:
@@ -277,6 +286,43 @@ def create_shoot(payload: CreateShootRequest, db: DbSession = Depends(get_db)):
     db.commit()
     db.refresh(job)
     return {"job_id": job.id}
+
+
+@router.post("/{job_id}/import-images")
+def import_images(
+    job_id: int, payload: ImportImagesRequest, background: BackgroundTasks,
+    db: DbSession = Depends(get_db),
+):
+    """Ingest images into an EXISTING job (Phase C.2) — the back half of the
+    wizard, run later against a job created image-less via /shoot. Reuses the
+    exact `_ingest_job` background task. 404 if the job is missing; 400 if the
+    folder is missing; 409 if the job already has teams (no double-ingest —
+    re-import is out of scope). Returns the same shape as job creation so the
+    wizard's ingest-status polling works unchanged."""
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.sessions:
+        raise HTTPException(409, "This job already has imported teams")
+    root = Path(payload.root_path)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(400, f"Folder not found: {payload.root_path}")
+
+    team_total = sum(1 for _ in _iter_team_folders(root, payload.has_lines))
+    job.root_path = str(root.resolve())
+    job.has_lines = 1 if payload.has_lines else 0
+    job.image_subfolder_name = payload.image_subfolder_name
+    job.ingest_status = "pending"
+    job.ingest_progress = 0
+    job.ingest_total = team_total
+    job.ingest_error = None
+    db.commit()
+
+    background.add_task(
+        _ingest_job, job.id, root, payload.has_lines,
+        payload.image_subfolder_name, payload.auto_run,
+    )
+    return {"job_id": job.id, "ingest_total": team_total}
 
 
 @router.get("/{job_id}/ingest-status")
