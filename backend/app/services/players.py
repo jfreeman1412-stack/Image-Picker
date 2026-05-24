@@ -62,23 +62,37 @@ def replace_shoot_memberships(db: DbSession, job_id: int, rows) -> dict:
     db.query(PlayerMembership).filter_by(job_id=job_id).delete(synchronize_session=False)
     players_created = players_existing = memberships_loaded = 0
     rows_skipped_blank_name = coaches = 0
+    duplicate_memberships_collapsed = 0
     teams: set[str] = set()
+    # One membership per (player, team) per shoot — the uq_membership_job_player_team
+    # constraint forbids the same person on the same team twice. Real rosters
+    # repeat rows (commonly a coach listed once per team, or a plain data-entry
+    # dup), which would otherwise hit that constraint and crash the insert, so
+    # collapse exact (player, norm_team) repeats here. A player on two DIFFERENT
+    # teams is NOT a duplicate (distinct norm_team) and still yields two rows.
+    seen: set[tuple[int, str]] = set()
     for raw_name, team_name in rows:
+        norm_team = normalize_name(team_name)
         player, created = upsert_player(db, raw_name)
         if player is None:
             rows_skipped_blank_name += 1
             continue
+        key = (player.id, norm_team)
+        if key in seen:
+            duplicate_memberships_collapsed += 1
+            continue
+        seen.add(key)
         players_created += int(created)
         players_existing += int(not created)
         coach = is_coach_name(raw_name)
         db.add(PlayerMembership(
             player_id=player.id, job_id=job_id,
-            team_name=team_name, norm_team=normalize_name(team_name),
+            team_name=team_name, norm_team=norm_team,
             is_coach=1 if coach else 0,
         ))
         memberships_loaded += 1
         coaches += int(coach)
-        teams.add(normalize_name(team_name))
+        teams.add(norm_team)
     db.flush()
     return {
         "players_created": players_created,
@@ -87,6 +101,7 @@ def replace_shoot_memberships(db: DbSession, job_id: int, rows) -> dict:
         "coaches": coaches,
         "distinct_teams": len(teams),
         "rows_skipped_blank_name": rows_skipped_blank_name,
+        "duplicate_memberships_collapsed": duplicate_memberships_collapsed,
     }
 
 
@@ -252,19 +267,33 @@ def build_validation_report(text: str, mapping: dict, *, preview_size: int = 10)
         }
     canonical, row_errors = parse_mapped_roster(text, mapping)
     invalid_rows = len({r for e in row_errors for r in e["rows"]})
+    # Mirror the write path's dedup (one membership per player+team) so the
+    # preview and counts match what the commit will actually load — otherwise a
+    # green "N players" wouldn't equal the deduped rows the DB stores.
+    seen: set[tuple[str, str]] = set()
+    deduped: list[tuple[str, str]] = []
+    duplicate_rows_collapsed = 0
+    for name, team in canonical:
+        key = (normalize_name(name), normalize_name(team))
+        if key in seen:
+            duplicate_rows_collapsed += 1
+            continue
+        seen.add(key)
+        deduped.append((name, team))
     report = {
         "ok": not row_errors,
         "mapping_errors": [],
         "row_errors": row_errors,
         "summary": {
-            "valid_rows": len(canonical),
+            "valid_rows": len(deduped),
             "invalid_rows": invalid_rows,
-            "distinct_teams": len({normalize_name(t) for _, t in canonical}),
-            "coaches": sum(1 for n, _ in canonical if is_coach_name(n)),
+            "distinct_teams": len({normalize_name(t) for _, t in deduped}),
+            "coaches": sum(1 for n, _ in deduped if is_coach_name(n)),
+            "duplicate_rows_collapsed": duplicate_rows_collapsed,
         },
         "preview": [
             {"name": n, "team": t, "is_coach": is_coach_name(n)}
-            for n, t in canonical[:preview_size]
+            for n, t in deduped[:preview_size]
         ],
     }
     if row_errors:

@@ -435,6 +435,12 @@ export default function PlayerRosterModal({ job, onClose }) {
                   {commitResult.distinct_teams === 1 ? '' : 's'}
                   {commitResult.coaches > 0 && ` · ${commitResult.coaches} coach${commitResult.coaches === 1 ? '' : 'es'}`}.
                 </p>
+                {commitResult.duplicate_memberships_collapsed > 0 && (
+                  <p className="muted" style={{ margin: '4px 0 0' }}>
+                    {commitResult.duplicate_memberships_collapsed} duplicate row
+                    {commitResult.duplicate_memberships_collapsed === 1 ? '' : 's'} merged.
+                  </p>
+                )}
                 <div className="actions" style={{ gap: 8, marginTop: 6 }}>
                   <button className="primary" onClick={onClose}>Done</button>
                 </div>
@@ -451,6 +457,13 @@ export default function PlayerRosterModal({ job, onClose }) {
                   {report.summary.coaches > 0 &&
                     ` · ${report.summary.coaches} coach${report.summary.coaches === 1 ? '' : 'es'}`}.
                 </p>
+                {report.summary.duplicate_rows_collapsed > 0 && (
+                  <p className="muted" style={{ margin: '4px 0 0' }}>
+                    {report.summary.duplicate_rows_collapsed} duplicate row
+                    {report.summary.duplicate_rows_collapsed === 1 ? '' : 's'} (same
+                    player + team) will be merged.
+                  </p>
+                )}
                 {report.references_warning?.count > 0 && (
                   <p className="warn" style={{ marginTop: 6 }}>
                     {report.references_warning.message}{' '}

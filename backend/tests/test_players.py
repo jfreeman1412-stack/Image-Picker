@@ -653,6 +653,7 @@ def test_report_ok_summary_and_preview():
     assert rep["row_errors"] == [] and rep["mapping_errors"] == []
     assert rep["summary"] == {
         "valid_rows": 3, "invalid_rows": 0, "distinct_teams": 2, "coaches": 1,
+        "duplicate_rows_collapsed": 0,
     }
     assert rep["preview"][0] == {"name": "Eleanor-Pederson", "team": "10U",
                                  "is_coach": False}
@@ -813,6 +814,54 @@ def test_mapped_replace_guarded_by_captured_references(client):
     ok = _post_mapped(client, job_id, "Name,Team\nJune-Wampach,10U\n", _FULL,
                       confirm_replace=True)
     assert ok.status_code == 200
+
+
+# ── Phase C.1 fix: duplicate (player, team) rows collapse, never 500 ──────
+
+def test_replace_collapses_duplicate_player_team(db):
+    """Same person on the same team twice → one membership, no IntegrityError
+    (the uq_membership_job_player_team constraint that crashed real rosters)."""
+    job = _job(db)
+    rows = [("Coach-Squirt", "Squirt-B2-White"),
+            ("Coach-Squirt", "Squirt-B2-White"),   # exact repeat (the 500 case)
+            ("Ava-Nguyen", "Squirt-B2-White")]
+    summary = replace_shoot_memberships(db, job.id, rows)
+    db.commit()
+    assert summary["memberships_loaded"] == 2
+    assert summary["duplicate_memberships_collapsed"] == 1
+    assert db.query(PlayerMembership).filter_by(job_id=job.id).count() == 2
+
+
+def test_replace_same_player_two_teams_not_collapsed(db):
+    """A player on two DIFFERENT teams is not a duplicate — both kept."""
+    job = _job(db)
+    summary = replace_shoot_memberships(
+        db, job.id, [("Jack-Smith", "TeamX"), ("Jack-Smith", "TeamY")])
+    db.commit()
+    assert summary["memberships_loaded"] == 2
+    assert summary["duplicate_memberships_collapsed"] == 0
+    assert db.query(Player).count() == 1
+
+
+def test_mapped_commit_dedups_duplicate_rows(client):
+    """The real-roster 500 reproduction: a coach listed twice on a team now
+    commits cleanly with the duplicate collapsed."""
+    job_id = client.job_a_id
+    csv_text = ("Name,Team\nCoach-Squirt,Squirt-B2-White\n"
+                "Coach-Squirt,Squirt-B2-White\nAva-Nguyen,Squirt-B2-White\n")
+    res = _post_mapped(client, job_id, csv_text, _FULL)
+    assert res.status_code == 200, res.text     # was 500 before the fix
+    assert res.json()["memberships_loaded"] == 2
+    assert res.json()["duplicate_memberships_collapsed"] == 1
+
+
+def test_dry_run_reports_collapsed_duplicates(client):
+    job_id = client.job_a_id
+    csv_text = "Name,Team\nCoach-Squirt,Squirt-B2-White\nCoach-Squirt,Squirt-B2-White\n"
+    body = _post_mapped(client, job_id, csv_text, _FULL, dry_run=True).json()
+    assert body["ok"] is True
+    assert body["summary"]["valid_rows"] == 1
+    assert body["summary"]["duplicate_rows_collapsed"] == 1
 
 
 def test_captured_reference_survives_roster_replace(client):
