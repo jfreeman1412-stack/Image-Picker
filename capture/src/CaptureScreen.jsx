@@ -14,12 +14,14 @@ import { useEffect, useState } from 'react';
 import useCamera from './useCamera.js';
 
 export default function CaptureScreen({
-  job, player, alreadyCaptured, onSaved, onCancel, onGone,
+  job, player, alreadyCaptured, onSaved, onCancel, onGone, onRemoved,
 }) {
   const { videoRef, status, error } = useCamera();
   const [shot, setShot] = useState(null);               // { blob, url } | null
   const [upload, setUpload] = useState('idle');         // idle | uploading | error
   const [uploadError, setUploadError] = useState(null); // { kind, message } | null
+  const [removePhase, setRemovePhase] = useState('none'); // none|confirm|removing|error
+  const [removeError, setRemoveError] = useState(null);
 
   // Free the captured object URL when the shot changes or the screen unmounts.
   useEffect(() => {
@@ -100,6 +102,29 @@ export default function CaptureScreen({
     }
   };
 
+  // Remove this player's photo FOR THIS shoot (Decision 6). Confirmation-gated;
+  // on success App clears the ✓ live and returns to the roster.
+  const doRemove = async () => {
+    setRemovePhase('removing');
+    setRemoveError(null);
+    try {
+      const res = await fetch(
+        `/api/players/${player.player_id}/references/shoot/${job.id}`,
+        { method: 'DELETE' },
+      );
+      if (!res.ok) {
+        setRemoveError(`Couldn’t remove the photo (HTTP ${res.status}).`);
+        setRemovePhase('error');
+        return;
+      }
+      // Unmounts CaptureScreen — don't set further state here.
+      onRemoved(player.player_id);
+    } catch {
+      setRemoveError('Remove failed — check the connection and try again.');
+      setRemovePhase('error');
+    }
+  };
+
   const live = status === 'live';
   const capturing = live && !shot;
   const reviewing = live && shot && upload === 'idle';
@@ -125,7 +150,12 @@ export default function CaptureScreen({
 
       {(capturing || reviewing) && alreadyCaptured && (
         <div className="replace-banner">
-          {player?.name} already has a photo for this shoot — this will replace it.
+          <span>{player?.name} already has a photo for this shoot — this will replace it.</span>
+          {capturing && (
+            <button className="banner-remove" onClick={() => setRemovePhase('confirm')}>
+              Remove photo instead
+            </button>
+          )}
         </div>
       )}
 
@@ -152,6 +182,37 @@ export default function CaptureScreen({
       )}
 
       {uploading && <div className="status-pill">Uploading…</div>}
+      {removePhase === 'removing' && <div className="status-pill">Removing…</div>}
+
+      {removePhase === 'confirm' && (
+        <div className="confirm-overlay">
+          <div className="confirm-card">
+            <p className="confirm-text">
+              Remove {player?.name}’s photo for this shoot? This can’t be undone.
+            </p>
+            <div className="controls-inline">
+              <button className="btn ghost" onClick={() => setRemovePhase('none')}>
+                Cancel
+              </button>
+              <button className="btn danger" onClick={doRemove}>Remove photo</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removePhase === 'error' && (
+        <div className="confirm-overlay">
+          <div className="confirm-card">
+            <p className="result-line warn">{removeError}</p>
+            <div className="controls-inline">
+              <button className="btn ghost" onClick={() => setRemovePhase('none')}>
+                Cancel
+              </button>
+              <button className="btn danger" onClick={doRemove}>Try again</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {failed && uploadError && (
         <div className="result-panel">

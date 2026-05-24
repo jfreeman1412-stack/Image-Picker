@@ -92,6 +92,19 @@ export default function App() {
     setView('roster');
   };
 
+  // Photo removed for this shoot → clear ✓ live (no refetch) and return to the
+  // roster with filters intact (Decision 6). The player reappears if the
+  // needs-photo filter is on.
+  const onRemoved = (playerId) => {
+    setReferencedPlayerIds((prev) => {
+      const next = new Set(prev);
+      next.delete(playerId);
+      return next;
+    });
+    setSelectedPlayer(null);
+    setView('roster');
+  };
+
   if (view === 'shoots') {
     return (
       <ShootPicker
@@ -135,6 +148,7 @@ export default function App() {
       onSaved={onCaptured}
       onCancel={cancelCapture}
       onGone={backToShoots}
+      onRemoved={onRemoved}
     />
   );
 }

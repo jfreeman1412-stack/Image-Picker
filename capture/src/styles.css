@@ -10,6 +10,7 @@
   --accent-strong: #3b82f6;
   --success:       #34d399;
   --warn:          #f5b056;
+  --danger:        #f0666e;
   --radius:        8px;
   --radius-lg:     12px;
 }
@@ -255,6 +256,10 @@ body {
   left: 16px;
   right: 16px;
   z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
   padding: 8px 12px;
   border-radius: var(--radius);
   background: rgba(245, 176, 86, 0.92);   /* --warn, opaque enough to read */
@@ -262,8 +267,49 @@ body {
   font-size: 0.85rem;
   font-weight: 600;
   text-align: center;
-  pointer-events: none;
+  pointer-events: none;                   /* the button below re-enables itself */
 }
+
+/* "Remove photo instead" — re-enables pointer events inside the non-interactive
+ * banner. */
+.banner-remove {
+  pointer-events: auto;
+  padding: 5px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  background: var(--danger);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+/* Confirm dialog (Remove-photo) — dim full-screen backdrop + centered card. */
+.confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.confirm-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: min(360px, 100%);
+  padding: 22px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  text-align: center;
+}
+.confirm-text { margin: 0; line-height: 1.45; }
+
+.btn.danger { background: var(--danger); }
 
 /* ── Non-camera screens (Section 2 picker; Sections 3–4 roster) ─────────────
  * The camera screen is full-bleed + fixed; the picker/roster screens are normal
