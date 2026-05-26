@@ -1,27 +1,40 @@
-// Section 6 — capture for the selected player. Reuses B.1's useCamera + the
-// capture/review/upload state machine, now targeting the chosen player + shoot
-// via the SHOOT-SCOPED replace endpoint (Decisions 2 & 4): retake replaces only
-// this shoot's photo, other shoots untouched, and a failed gate keeps the
-// existing one. No VITE_REF_PLAYER_ID (Decision 3) — the target comes from props.
+// Capture for the selected player. Reuses B.1's useCamera + the capture/review
+// state machine, but Phase B.3 changes what "Use photo" does: it no longer
+// uploads. It COMPRESSES the frame (≤1600px long edge, q0.85 — Decision 1) and
+// banks it to the durable local queue (Decision 2). A single drainer (§5) uploads
+// it whenever connected; good service drains it in ~1s, so online it still feels
+// instant. There is deliberately NO direct-upload path here — that's the
+// "one mechanism, not two modes" rule.
+//
+// Server-side quality (400) / gone (404) handling is GONE from this screen —
+// there's no network call at capture time. Those rejections surface at drain time
+// in the roster's "Needs attention" view (§6).
 //
 // Props: job {id,name}, player {player_id,name,team,is_coach},
-//   alreadyCaptured (bool — show the "will replace" affordance),
-//   onSaved(playerId) — App marks ✓ live + returns to the roster,
-//   onCancel() — back to the roster without uploading,
-//   onGone() — hard 404 (player/shoot gone), back to the shoot picker.
-// See ../PHASE_B2_ROSTER_CAPTURE.md.
+//   isSynced (bool — a synced server reference exists for this shoot),
+//   queueItem ({id,…}|null — a not-yet-synced local capture for this player),
+//   onQueued() — App refreshes the queue + returns to the roster,
+//   onCancel() — back to the roster without capturing,
+//   onRemoved(playerId) — photo removed (pending dropped locally, or synced deleted).
+// See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useEffect, useState } from 'react';
 import useCamera from './useCamera.js';
+import { enqueueCapture, removeQueueItem } from './db.js';
+
+const MAX_EDGE = 1600;     // downscale long edge (Decision 1)
+const JPEG_QUALITY = 0.85;
 
 export default function CaptureScreen({
-  job, player, alreadyCaptured, onSaved, onCancel, onGone, onRemoved,
+  job, player, isSynced, queueItem, onQueued, onCancel, onRemoved,
 }) {
   const { videoRef, status, error } = useCamera();
   const [shot, setShot] = useState(null);               // { blob, url } | null
-  const [upload, setUpload] = useState('idle');         // idle | uploading | error
-  const [uploadError, setUploadError] = useState(null); // { kind, message } | null
+  const [save, setSave] = useState('idle');             // idle | saving | error
+  const [saveError, setSaveError] = useState(null);     // string | null
   const [removePhase, setRemovePhase] = useState('none'); // none|confirm|removing|error
   const [removeError, setRemoveError] = useState(null);
+
+  const alreadyCaptured = isSynced || !!queueItem;
 
   // Free the captured object URL when the shot changes or the screen unmounts.
   useEffect(() => {
@@ -29,12 +42,16 @@ export default function CaptureScreen({
     return () => URL.revokeObjectURL(shot.url);
   }, [shot]);
 
+  // Draw the current frame, downscaled, to a JPEG (Decision 1: ≤1600px @ q0.85).
   const capture = () => {
     const video = videoRef.current;
     if (!video) return;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) return; // metadata not ready yet
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return; // metadata not ready yet
+    const scale = Math.min(1, MAX_EDGE / Math.max(vw, vh));
+    const w = Math.round(vw * scale);
+    const h = Math.round(vh * scale);
     const canvas = document.createElement('canvas');
     canvas.width = w;
     canvas.height = h;
@@ -44,96 +61,81 @@ export default function CaptureScreen({
         if (blob) setShot({ blob, url: URL.createObjectURL(blob) });
       },
       'image/jpeg',
-      0.92,
+      JPEG_QUALITY,
     );
   };
 
   // Back to a live preview, ready to shoot again (Retake).
   const reset = () => {
     setShot(null);          // effect cleanup revokes the URL
-    setUpload('idle');
-    setUploadError(null);
+    setSave('idle');
+    setSaveError(null);
   };
 
-  const sendUpload = async () => {
+  // Bank the capture to the durable queue (no network). enqueueCapture replaces
+  // any not-yet-synced item for this (player, shoot), so a retake supersedes it.
+  const saveCapture = async () => {
     if (!shot) return;
-    setUpload('uploading');
-    setUploadError(null);
+    setSave('saving');
+    setSaveError(null);
     try {
-      const fd = new FormData();
-      fd.append('file', shot.blob, 'capture.jpg');
-      // Shoot-scoped replace: sets this player's single reference FOR this shoot.
-      const res = await fetch(
-        `/api/players/${player.player_id}/references/shoot/${job.id}`,
-        { method: 'PUT', body: fd },
-      );
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        const code = body?.detail?.error;
-        if (res.status === 404) {
-          // Player or shoot no longer exists — selection is stale.
-          setUploadError({
-            kind: 'gone',
-            message: 'This player or shoot no longer exists on the server. Go back and reselect.',
-          });
-        } else if (code) {
-          // Quality gate (no_face / multiple_faces / low_confidence / face_too_small).
-          setUploadError({ kind: 'quality', code, message: body.detail.message });
-        } else {
-          setUploadError({
-            kind: 'other',
-            message:
-              (typeof body?.detail === 'string' && body.detail) ||
-              `Upload failed (HTTP ${res.status}).`,
-          });
-        }
-        setUpload('error');
-        return;
-      }
-      // Success → mark ✓ live and auto-return to the roster (no tap, per spec).
-      // This unmounts CaptureScreen, so don't set any further state here.
-      onSaved(player.player_id);
-    } catch {
-      setUploadError({
-        kind: 'network',
-        message: 'Upload failed — check the connection and try again.',
+      const bytes = await shot.blob.arrayBuffer();
+      await enqueueCapture({
+        playerId: player.player_id,
+        jobId: job.id,
+        playerName: player.name,
+        team: player.team,
+        bytes,
+        mime: 'image/jpeg',
+        capturedAt: Date.now(),
       });
-      setUpload('error');
+      // Unmounts this screen — don't set further state here.
+      onQueued();
+    } catch (e) {
+      setSaveError(
+        e && e.name === 'QuotaExceededError'
+          ? 'Storage is full — sync queued photos to free space, then try again.'
+          : 'Couldn’t save the photo on this device. Try again.',
+      );
+      setSave('error');
     }
   };
 
-  // Remove this player's photo FOR THIS shoot (Decision 6). Confirmation-gated;
-  // on success App clears the ✓ live and returns to the roster.
+  // Remove this player's photo for this shoot. A not-yet-synced local capture is
+  // dropped offline-safe (no network); a SYNCED reference needs the server (B.2
+  // behavior — removing a synced photo offline is deferred).
   const doRemove = async () => {
     setRemovePhase('removing');
     setRemoveError(null);
     try {
+      if (queueItem) {
+        await removeQueueItem(queueItem.id);
+        onRemoved(player.player_id); // unmounts — stop here
+        return;
+      }
       const res = await fetch(
         `/api/players/${player.player_id}/references/shoot/${job.id}`,
         { method: 'DELETE' },
       );
-      if (!res.ok) {
+      if (!res.ok && res.status !== 404) {
         setRemoveError(`Couldn’t remove the photo (HTTP ${res.status}).`);
         setRemovePhase('error');
         return;
       }
-      // Unmounts CaptureScreen — don't set further state here.
-      onRemoved(player.player_id);
+      onRemoved(player.player_id); // 404 ⇒ already gone ⇒ treat as removed
     } catch {
-      setRemoveError('Remove failed — check the connection and try again.');
+      setRemoveError(
+        'Couldn’t remove the photo — a synced photo needs a connection. Try again when online.',
+      );
       setRemovePhase('error');
     }
   };
 
   const live = status === 'live';
   const capturing = live && !shot;
-  const reviewing = live && shot && upload === 'idle';
-  const uploading = live && shot && upload === 'uploading';
-  const failed = live && shot && upload === 'error';
-  const isGone = failed && uploadError?.kind === 'gone';
-  // Network/unknown failures can retry the same blob; a quality rejection needs
-  // a fresh shot (Retake); a stale selection (gone) needs to go back.
-  const retryable = failed && (uploadError?.kind === 'network' || uploadError?.kind === 'other');
+  const reviewing = live && shot && save === 'idle';
+  const saving = live && shot && save === 'saving';
+  const failed = live && shot && save === 'error';
 
   return (
     <main className="camera-screen">
@@ -175,13 +177,13 @@ export default function CaptureScreen({
       {reviewing && (
         <div className="controls">
           <button className="btn ghost" onClick={reset}>Retake</button>
-          <button className="btn" onClick={sendUpload}>
+          <button className="btn" onClick={saveCapture}>
             {alreadyCaptured ? 'Replace photo' : 'Use photo'}
           </button>
         </div>
       )}
 
-      {uploading && <div className="status-pill">Uploading…</div>}
+      {saving && <div className="status-pill">Saving…</div>}
       {removePhase === 'removing' && <div className="status-pill">Removing…</div>}
 
       {removePhase === 'confirm' && (
@@ -214,20 +216,12 @@ export default function CaptureScreen({
         </div>
       )}
 
-      {failed && uploadError && (
+      {failed && saveError && (
         <div className="result-panel">
-          <p className="result-line warn">{uploadError.message}</p>
+          <p className="result-line warn">{saveError}</p>
           <div className="controls-inline">
-            {isGone ? (
-              <button className="btn" onClick={onGone}>Back to shoots</button>
-            ) : (
-              <>
-                <button className="btn ghost" onClick={reset}>Retake</button>
-                {retryable && (
-                  <button className="btn" onClick={sendUpload}>Try again</button>
-                )}
-              </>
-            )}
+            <button className="btn ghost" onClick={reset}>Retake</button>
+            <button className="btn" onClick={saveCapture}>Try again</button>
           </div>
         </div>
       )}

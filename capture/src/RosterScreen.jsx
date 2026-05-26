@@ -1,8 +1,8 @@
-// Phase B.3 §3 — the roster list, now showing an "Offline — cached …" line when
-// the roster is served from the IndexedDB cache. The two-state badges and the
-// sync UI arrive in §4–6; here the badge is still B.2's single captured-✓.
-// Presentational: items, the ✓ Set, and the filter state live in App (lifted).
-// See ../PHASE_B3_OFFLINE_CAPTURE.md.
+// Phase B.3 §4 — two-state ✓ per player: synced (green ✓, from the server status)
+// vs pending (amber ↑, a queued local capture), rendered independently (a synced
+// player with a queued retake shows both), plus a "N waiting to sync" line.
+// "Needs photo only" hides both (a queued capture is no longer "needs photo").
+// The sync UI + needs-attention arrive in §5–6. See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useMemo } from 'react';
 
 function formatAgo(ts) {
@@ -17,7 +17,8 @@ function formatAgo(ts) {
 }
 
 export default function RosterScreen({
-  job, items, referencedPlayerIds, fromCache, cachedAt, status, error,
+  job, items, referencedPlayerIds, pendingPlayerIds, pendingCount,
+  fromCache, cachedAt, status, error,
   teamFilter, search, needsPhotoOnly,
   onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
   onReload, onBack,
@@ -32,10 +33,14 @@ export default function RosterScreen({
     return items.filter((m) => {
       if (teamFilter && m.team !== teamFilter) return false;
       if (q && !m.name.toLowerCase().includes(q)) return false;
-      if (needsPhotoOnly && referencedPlayerIds.has(m.player_id)) return false;
+      // "Needs photo" = no synced AND no pending capture.
+      if (needsPhotoOnly
+        && (referencedPlayerIds.has(m.player_id) || pendingPlayerIds.has(m.player_id))) {
+        return false;
+      }
       return true;
     });
-  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds]);
+  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds, pendingPlayerIds]);
 
   const ready = status === 'ready';
   const hasRoster = ready && items.length > 0;
@@ -58,6 +63,12 @@ export default function RosterScreen({
         {fromCache && (
           <p className="offline-line" title={cachedAt ? new Date(cachedAt).toLocaleString() : ''}>
             ⚠︎ Offline — roster cached {formatAgo(cachedAt)}
+          </p>
+        )}
+
+        {pendingCount > 0 && (
+          <p className="sync-line">
+            {pendingCount} photo{pendingCount === 1 ? '' : 's'} waiting to sync
           </p>
         )}
 
@@ -118,7 +129,8 @@ export default function RosterScreen({
         {hasRoster && filtered.length > 0 && (
           <ul className="roster-list">
             {filtered.map((m) => {
-              const captured = referencedPlayerIds.has(m.player_id);
+              const synced = referencedPlayerIds.has(m.player_id);
+              const pending = pendingPlayerIds.has(m.player_id);
               return (
                 <li key={`${m.player_id}-${m.team}`}>
                   <button className="roster-row" onClick={() => onPickPlayer(m)}>
@@ -128,10 +140,13 @@ export default function RosterScreen({
                     </div>
                     <div className="roster-row-meta">
                       <span className="roster-team">{m.team}</span>
-                      {captured && (
-                        <span className="badge-check" title="Has a photo for this shoot">
-                          ✓
-                        </span>
+                      {/* Independent badges: a synced player with a queued retake
+                          shows ✓ AND ↑. */}
+                      {synced && (
+                        <span className="badge-check" title="Synced">✓</span>
+                      )}
+                      {pending && (
+                        <span className="badge-pending" title="Captured — waiting to sync">↑</span>
                       )}
                     </div>
                   </button>

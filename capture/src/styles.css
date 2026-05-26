@@ -541,3 +541,23 @@ body {
   white-space: nowrap;
 }
 .link-download:active { opacity: 0.7; }
+
+/* ── Phase B.3 §4: two-state badges + waiting-to-sync line ───────────────────
+ * synced (green, .badge-check) vs pending (amber) vs failed (red, used in §6).
+ * Same circular shape as .badge-check. */
+.badge-pending,
+.badge-failed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--bg);
+  border-radius: 50%;
+}
+.badge-pending { background: var(--warn); }
+.badge-failed { background: var(--danger); color: #fff; }
+
+.sync-line { margin: 0; color: var(--accent); font-size: 0.82rem; font-weight: 600; }
