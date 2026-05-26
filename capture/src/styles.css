@@ -561,3 +561,21 @@ body {
 .badge-failed { background: var(--danger); color: #fff; }
 
 .sync-line { margin: 0; color: var(--accent); font-size: 0.82rem; font-weight: 600; }
+
+/* ── Phase B.3 §5: sync bar (drain progress / Sync now / confirmation) ──────── */
+.sync-line.success { color: var(--success); }
+
+.sync-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+.link-sync {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.link-sync:active { opacity: 0.8; }

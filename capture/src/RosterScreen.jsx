@@ -1,8 +1,8 @@
-// Phase B.3 §4 — two-state ✓ per player: synced (green ✓, from the server status)
-// vs pending (amber ↑, a queued local capture), rendered independently (a synced
-// player with a queued retake shows both), plus a "N waiting to sync" line.
-// "Needs photo only" hides both (a queued capture is no longer "needs photo").
-// The sync UI + needs-attention arrive in §5–6. See ../PHASE_B3_OFFLINE_CAPTURE.md.
+// Phase B.3 §5 — the roster gains the sync bar: while the drainer runs it shows
+// "Syncing X of N…"; otherwise "N waiting to sync" + a "Sync now" button, or a
+// "Synced N ✓" confirmation after a drain. Two-state badges (synced ✓ / pending
+// ↑) as in §4. Needs-attention + storage warning arrive in §6.
+// See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useMemo } from 'react';
 
 function formatAgo(ts) {
@@ -18,10 +18,10 @@ function formatAgo(ts) {
 
 export default function RosterScreen({
   job, items, referencedPlayerIds, pendingPlayerIds, pendingCount,
-  fromCache, cachedAt, status, error,
+  fromCache, cachedAt, syncing, syncProgress, lastSummary, status, error,
   teamFilter, search, needsPhotoOnly,
   onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
-  onReload, onBack,
+  onSyncNow, onReload, onBack,
 }) {
   const teams = useMemo(
     () => Array.from(new Set(items.map((m) => m.team))).sort((a, b) => a.localeCompare(b)),
@@ -66,11 +66,22 @@ export default function RosterScreen({
           </p>
         )}
 
-        {pendingCount > 0 && (
+        {syncing && syncProgress.total > 0 ? (
           <p className="sync-line">
-            {pendingCount} photo{pendingCount === 1 ? '' : 's'} waiting to sync
+            Syncing {Math.min(syncProgress.done + 1, syncProgress.total)} of {syncProgress.total}…
           </p>
-        )}
+        ) : pendingCount > 0 ? (
+          <div className="sync-bar">
+            <span className="sync-line">
+              {pendingCount} photo{pendingCount === 1 ? '' : 's'} waiting to sync
+            </span>
+            <button className="link-sync" onClick={onSyncNow}>Sync now</button>
+          </div>
+        ) : lastSummary && lastSummary.synced > 0 ? (
+          <p className="sync-line success">
+            Synced {lastSummary.synced} photo{lastSummary.synced === 1 ? '' : 's'} ✓
+          </p>
+        ) : null}
 
         {hasRoster && (
           <div className="roster-filters">

@@ -1,14 +1,16 @@
-// Phase B.3 §4 — unified capture: a capture ENQUEUES locally instead of
-// uploading (Decision 2). App derives a two-state ✓ — synced (from the server
-// status) vs pending (a queued local capture) — and a "waiting to sync" count,
-// all from (cached status) ∪ (the local queue), so it survives close/reopen. The
-// drainer that uploads the queue arrives in §5. See ../PHASE_B3_OFFLINE_CAPTURE.md.
+// Phase B.3 §5 — the drainer. A single useSyncQueue hook uploads the queue
+// whenever connected (mount / online / after enqueue / "Sync now" / periodic),
+// flipping ✓ amber→green live and keeping the offline cache correct. Sync-time
+// failures are kept in the queue; §6 surfaces them. See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import ShootPicker from './ShootPicker.jsx';
 import RosterScreen from './RosterScreen.jsx';
 import CaptureScreen from './CaptureScreen.jsx';
+import useSyncQueue from './useSyncQueue.js';
+import { SYNC_RESULT } from './syncQueue.js';
 import {
-  QUEUE_STATUS, putRoster, getRoster, listQueueMetaByJob, countPending,
+  QUEUE_STATUS, putRoster, getRoster, markRosterSynced,
+  listQueueMetaByJob, countPending,
 } from './db.js';
 
 export default function App() {
@@ -25,8 +27,7 @@ export default function App() {
   const [fromCache, setFromCache] = useState(false);        // roster served offline
   const [cachedAt, setCachedAt] = useState(null);           // when it was cached
 
-  // Local queue view for the CURRENT shoot (metadata only — no photo bytes) plus
-  // a global "waiting to sync" count. Refreshed after enqueue/remove + on load.
+  // Local queue view for the CURRENT shoot (metadata only) + a global pending count.
   const [queueMeta, setQueueMeta] = useState([]);
   const [pendingCount, setPendingCount] = useState(0);
 
@@ -44,6 +45,24 @@ export default function App() {
     setQueueMeta(meta);
     setPendingCount(pending);
   }, [selectedJob]);
+
+  // Each item the drainer resolves: a SYNC flips ✓ green live (current shoot) and
+  // updates the cached roster so an offline reopen still shows it captured.
+  const handleItemResult = useCallback((item, result) => {
+    if (result !== SYNC_RESULT.SYNCED) return;
+    markRosterSynced(item.jobId, item.playerId);
+    if (item.jobId === selectedJob?.id) {
+      setReferencedPlayerIds((prev) => new Set(prev).add(item.playerId));
+    }
+  }, [selectedJob]);
+
+  const { syncing, progress, lastSummary, syncNow } = useSyncQueue({
+    active: pendingCount > 0,
+    onItemResult: handleItemResult,
+  });
+
+  // Reconcile the local queue view whenever a drain finishes (and on mount).
+  useEffect(() => { if (!syncing) refreshQueue(); }, [syncing, refreshQueue]);
 
   // Fetch the roster + shoot-scoped ✓ status when the chosen shoot changes (or a
   // reload is requested). Online: render + CACHE for offline. Offline (fetch
@@ -126,10 +145,11 @@ export default function App() {
     setView('capture');
   };
 
-  // Capture banked → player now PENDING. Refresh the queue view and return to the
-  // roster with filters intact.
+  // Capture banked → player now PENDING. Refresh, kick a drain (uploads at once
+  // on good service; no-op offline), return to the roster with filters intact.
   const onQueued = () => {
     refreshQueue();
+    syncNow();
     setSelectedPlayer(null);
     setView('roster');
   };
@@ -171,6 +191,9 @@ export default function App() {
         pendingCount={pendingCount}
         fromCache={fromCache}
         cachedAt={cachedAt}
+        syncing={syncing}
+        syncProgress={progress}
+        lastSummary={lastSummary}
         status={rosterStatus}
         error={rosterError}
         teamFilter={teamFilter}
@@ -180,6 +203,7 @@ export default function App() {
         onSearch={setSearch}
         onNeedsPhotoOnly={setNeedsPhotoOnly}
         onPickPlayer={pickPlayer}
+        onSyncNow={syncNow}
         onReload={() => setReloadKey((k) => k + 1)}
         onBack={backToShoots}
       />

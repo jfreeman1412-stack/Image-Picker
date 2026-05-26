@@ -152,6 +152,23 @@ export async function getRoster(jobId) {
   return d.get('rosters', jobId);
 }
 
+/**
+ * Mark a player as synced in the CACHED roster too, so the offline view stays
+ * correct between online refreshes: after a drain removes the queue item, the
+ * cached status set is what tells an offline reopen the player has a photo.
+ */
+export async function markRosterSynced(jobId, playerId) {
+  const d = await db();
+  const tx = d.transaction('rosters', 'readwrite');
+  const r = await tx.store.get(jobId);
+  if (r) {
+    const set = new Set(r.statusIds || []);
+    set.add(playerId);
+    await tx.store.put({ ...r, statusIds: [...set] });
+  }
+  await tx.done;
+}
+
 /** The set of jobIds with a cached roster — drives the picker's "Ready offline" badge. */
 export async function getCachedRosterJobIds() {
   const d = await db();
