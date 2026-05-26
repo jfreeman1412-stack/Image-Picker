@@ -1,17 +1,23 @@
-// Section 3 — the roster list for the selected shoot, with shoot-specific ✓
-// badges. Section 4 — team filter + name search + "needs photo only" toggle,
-// all stacking (AND), defaulting to the full unfiltered roster.
-//
-// Presentational: the membership items, the captured-✓ Set, AND the filter
-// state are all held in App (lifted, Decision 5) and passed in as props, so
-// they survive the round-trip to the capture screen and update live afterward.
-// The filtered view + the team list are derived here (pure functions of props).
-// Tapping a player to capture arrives in Section 6. See
-// ../PHASE_B2_ROSTER_CAPTURE.md.
+// Phase B.3 §3 — the roster list, now showing an "Offline — cached …" line when
+// the roster is served from the IndexedDB cache. The two-state badges and the
+// sync UI arrive in §4–6; here the badge is still B.2's single captured-✓.
+// Presentational: items, the ✓ Set, and the filter state live in App (lifted).
+// See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useMemo } from 'react';
 
+function formatAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return `${Math.round(h / 24)} d ago`;
+}
+
 export default function RosterScreen({
-  job, items, referencedPlayerIds, status, error,
+  job, items, referencedPlayerIds, fromCache, cachedAt, status, error,
   teamFilter, search, needsPhotoOnly,
   onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
   onReload, onBack,
@@ -48,6 +54,12 @@ export default function RosterScreen({
             </span>
           )}
         </div>
+
+        {fromCache && (
+          <p className="offline-line" title={cachedAt ? new Date(cachedAt).toLocaleString() : ''}>
+            ⚠︎ Offline — roster cached {formatAgo(cachedAt)}
+          </p>
+        )}
 
         {hasRoster && (
           <div className="roster-filters">

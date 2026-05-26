@@ -483,3 +483,61 @@ body {
   background: var(--success);
   border-radius: 50%;
 }
+
+/* ── Phase B.3 §3: offline cache + shoot-picker readiness ───────────────────── */
+.offline-line { margin: 0; color: var(--warn); font-size: 0.82rem; }
+.small { font-size: 0.8rem; }
+
+/* Shoot picker list — a tappable list with a per-shoot offline-readiness control.
+ * The row's pick area and the download action are SEPARATE buttons (no nested
+ * interactives). */
+.shoot-list { list-style: none; margin: 0; padding: 0; }
+
+.shoot-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.shoot-row:last-child { border-bottom: none; }
+
+.shoot-row-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+.shoot-pick {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.shoot-pick:active { opacity: 0.7; }
+.shoot-name { font-size: 1.02rem; }
+
+.shoot-action { flex: none; }
+
+.ready-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--success);
+  border: 1px solid var(--success);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.link-download {
+  padding: 4px 4px;
+  font-size: 0.8rem;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.link-download:active { opacity: 0.7; }

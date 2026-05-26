@@ -1,17 +1,12 @@
-// Phase B.2 — the capture app's top-level view switch (routerless; Decision 5).
-// App owns the cross-screen state — the selected shoot/player, the roster, and
-// the captured-✓ Set (and, from Section 4, the filter state) — so it all
-// survives the round-trip to the capture screen and updates live afterward.
-//
-//   shoots → (pick a shoot)  → roster → (pick a player) → capture → roster …
-//
-// Section 3 wires: fetch the roster + shoot-scoped reference-status on
-// shoot-select and render the list with ✓ badges. Sections 4–7 add filters and
-// capture/remove. See ../PHASE_B2_ROSTER_CAPTURE.md.
+// Phase B.3 §3 — offline roster cache. App caches the roster + shoot-scoped ✓
+// status on shoot-select and, when the fetch fails (offline), serves the cached
+// copy. The capture model is still B.2's (a successful upload marks ✓ live); the
+// local queue + drainer arrive in §4–5. See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useEffect, useState } from 'react';
 import ShootPicker from './ShootPicker.jsx';
 import RosterScreen from './RosterScreen.jsx';
 import CaptureScreen from './CaptureScreen.jsx';
+import { putRoster, getRoster } from './db.js';
 
 export default function App() {
   const [view, setView] = useState('shoots');             // shoots | roster | capture
@@ -24,6 +19,8 @@ export default function App() {
   const [rosterStatus, setRosterStatus] = useState('loading'); // loading|ready|error
   const [rosterError, setRosterError] = useState(null);
   const [reloadKey, setReloadKey] = useState(0);            // bump to refetch
+  const [fromCache, setFromCache] = useState(false);        // roster served offline
+  const [cachedAt, setCachedAt] = useState(null);           // when it was cached
 
   // Filter state, lifted here too (Decision 5) so it's preserved when the user
   // captures a player and returns. Default = all teams / empty search / off.
@@ -31,9 +28,9 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [needsPhotoOnly, setNeedsPhotoOnly] = useState(false);
 
-  // Fetch the roster + shoot-scoped ✓ status whenever the chosen shoot changes
-  // (or a manual reload is requested). Kept in App so a later capture can update
-  // the ✓ Set in place without a refetch, and filters/state survive navigation.
+  // Fetch the roster + shoot-scoped ✓ status when the chosen shoot changes (or a
+  // reload is requested). Online: render + CACHE for offline. Offline (fetch
+  // fails): fall back to the cached copy.
   useEffect(() => {
     if (!selectedJob) return undefined;
     let cancelled = false;
@@ -50,13 +47,27 @@ export default function App() {
         const rosterBody = await r1.json();
         const statusBody = await r2.json();
         if (cancelled) return;
-        setRoster(rosterBody.items || []);
-        setReferencedPlayerIds(new Set(statusBody.player_ids_with_references || []));
+        const items = rosterBody.items || [];
+        const statusIds = statusBody.player_ids_with_references || [];
+        setRoster(items);
+        setReferencedPlayerIds(new Set(statusIds));
+        setFromCache(false);
+        setCachedAt(null);
         setRosterStatus('ready');
+        putRoster({ jobId: selectedJob.id, name: selectedJob.name, items, statusIds });
       } catch (e) {
+        const cached = await getRoster(selectedJob.id).catch(() => null);
         if (cancelled) return;
-        setRosterError(e.message || 'Couldn’t reach the server. Check the connection.');
-        setRosterStatus('error');
+        if (cached) {
+          setRoster(cached.items || []);
+          setReferencedPlayerIds(new Set(cached.statusIds || []));
+          setFromCache(true);
+          setCachedAt(cached.cachedAt || null);
+          setRosterStatus('ready');
+        } else {
+          setRosterError(e.message || 'Couldn’t reach the server. Check the connection.');
+          setRosterStatus('error');
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -67,6 +78,8 @@ export default function App() {
     setSelectedPlayer(null);
     setRoster([]);
     setReferencedPlayerIds(new Set());
+    setFromCache(false);
+    setCachedAt(null);
     setTeamFilter('');           // fresh filters for the next shoot
     setSearch('');
     setNeedsPhotoOnly(false);
@@ -80,7 +93,7 @@ export default function App() {
   };
 
   // Capture succeeded → mark ✓ live (no refetch) and return to the roster with
-  // filter state intact (it lives here). Decisions 5 + 6.
+  // filter state intact (it lives here).
   const onCaptured = (playerId) => {
     setReferencedPlayerIds((prev) => new Set(prev).add(playerId));
     setSelectedPlayer(null);
@@ -92,9 +105,7 @@ export default function App() {
     setView('roster');
   };
 
-  // Photo removed for this shoot → clear ✓ live (no refetch) and return to the
-  // roster with filters intact (Decision 6). The player reappears if the
-  // needs-photo filter is on.
+  // Photo removed for this shoot → clear ✓ live and return to the roster.
   const onRemoved = (playerId) => {
     setReferencedPlayerIds((prev) => {
       const next = new Set(prev);
@@ -122,6 +133,8 @@ export default function App() {
         job={selectedJob}
         items={roster}
         referencedPlayerIds={referencedPlayerIds}
+        fromCache={fromCache}
+        cachedAt={cachedAt}
         status={rosterStatus}
         error={rosterError}
         teamFilter={teamFilter}
