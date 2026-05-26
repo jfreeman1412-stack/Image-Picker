@@ -1,20 +1,33 @@
-// Phase B.3 §5 — the drainer. A single useSyncQueue hook uploads the queue
-// whenever connected (mount / online / after enqueue / "Sync now" / periodic),
-// flipping ✓ amber→green live and keeping the offline cache correct. Sync-time
-// failures are kept in the queue; §6 surfaces them. See ../PHASE_B3_OFFLINE_CAPTURE.md.
+// The capture app's top-level view switch (routerless; B.2 Decision 5). App owns
+// the cross-screen state — selected shoot/player, the roster, the synced-✓ set,
+// the filter state — so it survives navigation and updates live.
+//
+//   shoots → (pick a shoot) → roster → (pick a player) → capture → roster …
+//                                   ↘ (needs attention) ↗
+//
+// Phase B.3 offline spine:
+//  • the roster + ✓ status are CACHED on select and read back offline (§3);
+//  • a capture ENQUEUES locally instead of uploading (§4);
+//  • a single DRAINER uploads the queue whenever connected (§5), flipping ✓
+//    amber→green live; sync-time rejections land in "Needs attention" (§6).
+// App derives a two-state ✓ (synced / pending / failed) from (cached server
+// status) ∪ (the local queue). See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import ShootPicker from './ShootPicker.jsx';
 import RosterScreen from './RosterScreen.jsx';
 import CaptureScreen from './CaptureScreen.jsx';
+import NeedsAttention from './NeedsAttention.jsx';
 import useSyncQueue from './useSyncQueue.js';
 import { SYNC_RESULT } from './syncQueue.js';
 import {
   QUEUE_STATUS, putRoster, getRoster, markRosterSynced,
-  listQueueMetaByJob, countPending,
+  listQueueMetaByJob, countPending, removeQueueItem, storageEstimate,
 } from './db.js';
 
+const STORAGE_WARN = 0.8; // surface a warning past 80% of quota (§6)
+
 export default function App() {
-  const [view, setView] = useState('shoots');             // shoots | roster | capture
+  const [view, setView] = useState('shoots');             // shoots|roster|capture|attention
   const [selectedJob, setSelectedJob] = useState(null);     // { id, name }
   const [selectedPlayer, setSelectedPlayer] = useState(null);
 
@@ -27,30 +40,35 @@ export default function App() {
   const [fromCache, setFromCache] = useState(false);        // roster served offline
   const [cachedAt, setCachedAt] = useState(null);           // when it was cached
 
-  // Local queue view for the CURRENT shoot (metadata only) + a global pending count.
+  // Local queue view for the CURRENT shoot (metadata only — no photo bytes), a
+  // global "waiting to sync" count, and storage headroom. Refreshed after
+  // enqueue/remove/drain + on load.
   const [queueMeta, setQueueMeta] = useState([]);
   const [pendingCount, setPendingCount] = useState(0);
+  const [storageInfo, setStorageInfo] = useState(null);
 
-  // Filter state, lifted (Decision 5) so it survives the capture round-trip.
+  // Filter state, lifted (B.2 Decision 5) so it survives the capture round-trip.
   const [teamFilter, setTeamFilter] = useState('');
   const [search, setSearch] = useState('');
   const [needsPhotoOnly, setNeedsPhotoOnly] = useState(false);
 
   const refreshQueue = useCallback(async () => {
     const jobId = selectedJob?.id;
-    const [meta, pending] = await Promise.all([
+    const [meta, pending, est] = await Promise.all([
       jobId != null ? listQueueMetaByJob(jobId) : Promise.resolve([]),
       countPending(),
+      storageEstimate(),
     ]);
     setQueueMeta(meta);
     setPendingCount(pending);
+    setStorageInfo(est);
   }, [selectedJob]);
 
   // Each item the drainer resolves: a SYNC flips ✓ green live (current shoot) and
   // updates the cached roster so an offline reopen still shows it captured.
   const handleItemResult = useCallback((item, result) => {
     if (result !== SYNC_RESULT.SYNCED) return;
-    markRosterSynced(item.jobId, item.playerId);
+    markRosterSynced(item.jobId, item.playerId); // keep the offline cache correct
     if (item.jobId === selectedJob?.id) {
       setReferencedPlayerIds((prev) => new Set(prev).add(item.playerId));
     }
@@ -120,11 +138,26 @@ export default function App() {
     ),
     [queueMeta],
   );
+  const failedItems = useMemo(
+    () => queueMeta.filter(
+      (i) => i.status === QUEUE_STATUS.FAILED_QUALITY || i.status === QUEUE_STATUS.FAILED_GONE,
+    ),
+    [queueMeta],
+  );
+  const failedPlayerIds = useMemo(
+    () => new Set(failedItems.map((i) => i.playerId)),
+    [failedItems],
+  );
   const queueItemByPlayer = useMemo(() => {
     const m = new Map();
     for (const i of queueMeta) m.set(i.playerId, i);
     return m;
   }, [queueMeta]);
+
+  const storageWarning = useMemo(() => {
+    if (!storageInfo || !storageInfo.ratio || storageInfo.ratio < STORAGE_WARN) return null;
+    return `Storage ${Math.round(storageInfo.ratio * 100)}% full — sync soon to free space.`;
+  }, [storageInfo]);
 
   const backToShoots = () => {
     setSelectedJob(null);
@@ -170,6 +203,17 @@ export default function App() {
     setView('roster');
   };
 
+  // Re-shoot a failed item: target that player and capture afresh (enqueue
+  // replaces the failed queue item). Discard: drop it (the only non-200 delete).
+  const reshootFailed = (item) => {
+    setSelectedPlayer({ player_id: item.playerId, name: item.playerName, team: item.team });
+    setView('capture');
+  };
+  const discardFailed = async (item) => {
+    await removeQueueItem(item.id);
+    refreshQueue();
+  };
+
   if (view === 'shoots') {
     return (
       <ShootPicker
@@ -181,6 +225,18 @@ export default function App() {
     );
   }
 
+  if (view === 'attention') {
+    return (
+      <NeedsAttention
+        job={selectedJob}
+        items={failedItems}
+        onReshoot={reshootFailed}
+        onDiscard={discardFailed}
+        onBack={() => setView('roster')}
+      />
+    );
+  }
+
   if (view === 'roster') {
     return (
       <RosterScreen
@@ -188,9 +244,12 @@ export default function App() {
         items={roster}
         referencedPlayerIds={referencedPlayerIds}
         pendingPlayerIds={pendingPlayerIds}
+        failedPlayerIds={failedPlayerIds}
         pendingCount={pendingCount}
+        attentionCount={failedItems.length}
         fromCache={fromCache}
         cachedAt={cachedAt}
+        storageWarning={storageWarning}
         syncing={syncing}
         syncProgress={progress}
         lastSummary={lastSummary}
@@ -204,6 +263,7 @@ export default function App() {
         onNeedsPhotoOnly={setNeedsPhotoOnly}
         onPickPlayer={pickPlayer}
         onSyncNow={syncNow}
+        onOpenAttention={() => setView('attention')}
         onReload={() => setReloadKey((k) => k + 1)}
         onBack={backToShoots}
       />

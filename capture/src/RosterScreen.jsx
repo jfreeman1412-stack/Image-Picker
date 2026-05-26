@@ -1,8 +1,14 @@
-// Phase B.3 §5 — the roster gains the sync bar: while the drainer runs it shows
-// "Syncing X of N…"; otherwise "N waiting to sync" + a "Sync now" button, or a
-// "Synced N ✓" confirmation after a drain. Two-state badges (synced ✓ / pending
-// ↑) as in §4. Needs-attention + storage warning arrive in §6.
-// See ../PHASE_B3_OFFLINE_CAPTURE.md.
+// The roster list for the selected shoot. Phase B.3 surfaces the offline state:
+//  • a TWO-STATE badge per player — synced (green ✓) vs pending (amber ↑, captured
+//    + waiting to sync) vs failed (red !, needs attention §6) — derived in App
+//    from (cached server status) ∪ (the local queue);
+//  • a "N waiting to sync" line (the device backlog);
+//  • an "Offline — cached …" line when the roster is served from cache (§3).
+// "Needs photo only" hides both synced and pending (a queued capture is no longer
+// "needs photo"); failed players stay visible — they still need a usable photo.
+//
+// Presentational: membership items, the badge sets, and the filter state all live
+// in App (lifted) and arrive as props. See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import { useMemo } from 'react';
 
 function formatAgo(ts) {
@@ -17,11 +23,12 @@ function formatAgo(ts) {
 }
 
 export default function RosterScreen({
-  job, items, referencedPlayerIds, pendingPlayerIds, pendingCount,
-  fromCache, cachedAt, syncing, syncProgress, lastSummary, status, error,
+  job, items, referencedPlayerIds, pendingPlayerIds, failedPlayerIds, pendingCount,
+  attentionCount, fromCache, cachedAt, storageWarning,
+  syncing, syncProgress, lastSummary, status, error,
   teamFilter, search, needsPhotoOnly,
   onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
-  onSyncNow, onReload, onBack,
+  onSyncNow, onOpenAttention, onReload, onBack,
 }) {
   const teams = useMemo(
     () => Array.from(new Set(items.map((m) => m.team))).sort((a, b) => a.localeCompare(b)),
@@ -33,7 +40,7 @@ export default function RosterScreen({
     return items.filter((m) => {
       if (teamFilter && m.team !== teamFilter) return false;
       if (q && !m.name.toLowerCase().includes(q)) return false;
-      // "Needs photo" = no synced AND no pending capture.
+      // "Needs photo" = no synced AND no pending capture (failed still needs one).
       if (needsPhotoOnly
         && (referencedPlayerIds.has(m.player_id) || pendingPlayerIds.has(m.player_id))) {
         return false;
@@ -66,6 +73,8 @@ export default function RosterScreen({
           </p>
         )}
 
+        {storageWarning && <p className="offline-line">⚠︎ {storageWarning}</p>}
+
         {syncing && syncProgress.total > 0 ? (
           <p className="sync-line">
             Syncing {Math.min(syncProgress.done + 1, syncProgress.total)} of {syncProgress.total}…
@@ -82,6 +91,13 @@ export default function RosterScreen({
             Synced {lastSummary.synced} photo{lastSummary.synced === 1 ? '' : 's'} ✓
           </p>
         ) : null}
+
+        {attentionCount > 0 && (
+          <button className="attention-line" onClick={onOpenAttention}>
+            ⚠ {attentionCount} photo{attentionCount === 1 ? '' : 's'}
+            {attentionCount === 1 ? ' needs' : ' need'} attention →
+          </button>
+        )}
 
         {hasRoster && (
           <div className="roster-filters">
@@ -142,6 +158,7 @@ export default function RosterScreen({
             {filtered.map((m) => {
               const synced = referencedPlayerIds.has(m.player_id);
               const pending = pendingPlayerIds.has(m.player_id);
+              const failed = failedPlayerIds.has(m.player_id);
               return (
                 <li key={`${m.player_id}-${m.team}`}>
                   <button className="roster-row" onClick={() => onPickPlayer(m)}>
@@ -152,12 +169,16 @@ export default function RosterScreen({
                     <div className="roster-row-meta">
                       <span className="roster-team">{m.team}</span>
                       {/* Independent badges: a synced player with a queued retake
-                          shows ✓ AND ↑. */}
+                          shows ✓ AND ↑ (pending/failed are mutually exclusive per
+                          item, so at most one of those two ever shows). */}
                       {synced && (
                         <span className="badge-check" title="Synced">✓</span>
                       )}
                       {pending && (
                         <span className="badge-pending" title="Captured — waiting to sync">↑</span>
+                      )}
+                      {failed && (
+                        <span className="badge-failed" title="Sync failed — see “needs attention”">!</span>
                       )}
                     </div>
                   </button>
