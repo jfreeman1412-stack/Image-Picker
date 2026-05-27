@@ -1,7 +1,7 @@
 """SQLite + SQLAlchemy session management."""
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 logger = logging.getLogger(__name__)
@@ -14,6 +14,25 @@ engine = create_engine(
     f"sqlite:///{DB_PATH}",
     connect_args={"check_same_thread": False},
 )
+
+
+# Phase B.5 §0 — concurrency hardening for multi-tablet sync. Real shoots run
+# three capture tablets that may all sync at once; with the default rollback
+# journal a second concurrent writer can hit "database is locked". WAL lets
+# readers and one writer coexist, and busy_timeout makes a contended writer wait
+# briefly rather than fail immediately. Set per-connection at connect time (WAL
+# is a durable property of the DB file; busy_timeout is per-connection).
+# Additive — no schema change — and it also hardens plain B.3 reference sync.
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, connection_record):  # noqa: ARG001
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=10000")  # 10s: wait on a lock, don't fail
+    finally:
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

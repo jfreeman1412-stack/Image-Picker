@@ -14,7 +14,7 @@
 import { openDB } from 'idb';
 
 const DB_NAME = 'player-sort-capture';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // v2 (B.5): adds the `localPlayers` store for walk-ups
 
 // Queue item status lifecycle:
 //   pending        — captured + durably queued, not yet uploaded
@@ -40,15 +40,26 @@ let _dbPromise = null;
 function db() {
   if (!_dbPromise) {
     _dbPromise = openDB(DB_NAME, DB_VERSION, {
-      upgrade(d) {
-        const queue = d.createObjectStore('queue', { keyPath: 'id' });
-        queue.createIndex('by-capturedAt', 'capturedAt'); // FIFO drain order
-        queue.createIndex('by-job', 'jobId');             // this shoot's items
-        queue.createIndex('by-job-player', ['jobId', 'playerId']); // retake lookup
-        queue.createIndex('by-status', 'status');         // cheap pending count
-        d.createObjectStore('blobs', { keyPath: 'id' });  // id → { id, bytes, mime }
-        d.createObjectStore('rosters', { keyPath: 'jobId' });
-        d.createObjectStore('shoots', { keyPath: 'id' });
+      // Version-aware so an existing v1 install (queued photos + cached rosters)
+      // upgrades to v2 WITHOUT dropping data — we only ADD the new store.
+      upgrade(d, oldVersion) {
+        if (oldVersion < 1) {
+          const queue = d.createObjectStore('queue', { keyPath: 'id' });
+          queue.createIndex('by-capturedAt', 'capturedAt'); // FIFO drain order
+          queue.createIndex('by-job', 'jobId');             // this shoot's items
+          queue.createIndex('by-job-player', ['jobId', 'playerId']); // retake lookup
+          queue.createIndex('by-status', 'status');         // cheap pending count
+          d.createObjectStore('blobs', { keyPath: 'id' });  // id → { id, bytes, mime }
+          d.createObjectStore('rosters', { keyPath: 'jobId' });
+          d.createObjectStore('shoots', { keyPath: 'id' });
+        }
+        if (oldVersion < 2) {
+          // B.5: walk-up players added at the shoot. Keyed by a client uuid
+          // (localId); `realPlayerId` is filled once the server creates the
+          // Player at sync. Queue items for a walk-up carry playerId = localId.
+          const lp = d.createObjectStore('localPlayers', { keyPath: 'localId' });
+          lp.createIndex('by-job', 'jobId');
+        }
       },
     });
   }
@@ -190,6 +201,51 @@ export async function putShoots(shoots) {
 export async function getShoots() {
   const d = await db();
   return d.getAll('shoots');
+}
+
+// ── local (walk-up) players — added at the shoot, reconciled at sync (B.5) ────
+// A walk-up is a not-on-roster kid added on the spot. It lives here with a client
+// uuid (localId) until the drainer creates the real server Player and records its
+// id (realPlayerId). The capture is queued against the localId; the drainer
+// resolves localId → realPlayerId before uploading the reference. See
+// ../PHASE_B5_WALKUP_PLAYER.md.
+
+export async function addLocalPlayer({ jobId, name, team, isCoach = false }) {
+  const d = await db();
+  const localId = uuid();
+  const rec = {
+    localId, jobId, name, team,
+    isCoach: !!isCoach,
+    createdAt: Date.now(),
+    realPlayerId: null, // set once the server creates the Player (sync time)
+  };
+  await d.put('localPlayers', rec);
+  return rec;
+}
+
+/** This shoot's local walk-up players (merged into the roster view in App). */
+export async function listLocalPlayersByJob(jobId) {
+  const d = await db();
+  return d.getAllFromIndex('localPlayers', 'by-job', IDBKeyRange.only(jobId));
+}
+
+export async function getLocalPlayer(localId) {
+  const d = await db();
+  return d.get('localPlayers', localId);
+}
+
+/** Record the real server player_id once the walk-up has been created server-side. */
+export async function setLocalPlayerReal(localId, realPlayerId) {
+  const d = await db();
+  const tx = d.transaction('localPlayers', 'readwrite');
+  const rec = await tx.store.get(localId);
+  if (rec) await tx.store.put({ ...rec, realPlayerId });
+  await tx.done;
+}
+
+export async function removeLocalPlayer(localId) {
+  const d = await db();
+  await d.delete('localPlayers', localId);
 }
 
 // ── storage durability (Decision 1 / Section 6) ──────────────────────────────

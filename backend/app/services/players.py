@@ -17,6 +17,7 @@ import io
 import logging
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
 from app.models.db_models import Job, Player, PlayerMembership
@@ -299,3 +300,62 @@ def build_validation_report(text: str, mapping: dict, *, preview_size: int = 10)
     if row_errors:
         report["error"] = "roster_validation"
     return report
+
+
+# ── Phase B.5: add a single walk-up player to a shoot ─────────────────────
+# A NOT-on-roster player added at the shoot. Unlike replace_shoot_memberships
+# (which wipes the job's roster), this inserts ONE membership additively, so it
+# never disturbs the existing roster. Idempotent + concurrency-safe: identity is
+# the global norm_name (find-or-create) and (job, player, norm_team) is unique,
+# so re-sends and concurrent same-name adds from multiple tablets converge to
+# one Player + one membership. See PHASE_B5_WALKUP_PLAYER.md.
+
+
+def add_walkup_player(db: DbSession, job_id: int, name: str, team: str) -> dict:
+    """Additively add one (name, team) to a shoot. Find-or-create the global
+    Player by normalized name, then insert a single PlayerMembership unless
+    (job, player, norm_team) already exists. The caller verifies the job exists
+    (404) and that name/team are non-blank (400). Commits; returns a summary.
+
+    Race-safe: if a concurrent tablet created the same Player (unique norm_name)
+    or membership first, the IntegrityError is caught and the operation re-runs
+    against the now-committed rows — convergent, never a duplicate or a 500.
+    """
+    norm_team = normalize_name(team)
+
+    def _resolve_and_commit():
+        player, created = upsert_player(db, name)
+        if player is None:
+            # normalize_name(name) was empty (e.g. only separators); caller
+            # validated non-blank, but guard so we never write a junk Player.
+            raise ValueError("Player name is empty after normalization.")
+        existing = (
+            db.query(PlayerMembership)
+            .filter_by(job_id=job_id, player_id=player.id, norm_team=norm_team)
+            .one_or_none()
+        )
+        membership_created = False
+        if existing is None:
+            db.add(PlayerMembership(
+                player_id=player.id, job_id=job_id,
+                team_name=team, norm_team=norm_team,
+                is_coach=1 if is_coach_name(name) else 0,
+            ))
+            membership_created = True
+        db.commit()
+        return player, created, membership_created
+
+    try:
+        player, created, membership_created = _resolve_and_commit()
+    except IntegrityError:
+        db.rollback()
+        player, created, membership_created = _resolve_and_commit()
+
+    return {
+        "player_id": player.id,
+        "name": player.display_name,
+        "team": team,
+        "is_coach": is_coach_name(name),
+        "created": created,
+        "membership_created": membership_created,
+    }

@@ -399,6 +399,30 @@ body {
  * narrow phones. */
 .roster-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
+/* Phase B.5 — add a walk-up player. */
+.walkup-add { margin-top: 6px; }
+.link-add {
+  padding: 4px 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.link-add:active { opacity: 0.7; }
+.walkup-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.walkup-form .filter-search { min-width: 140px; }
+
 .filter-select, .filter-search {
   padding: 9px 12px;
   font-size: 0.95rem;

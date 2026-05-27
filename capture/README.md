@@ -32,6 +32,29 @@ A.2/B.2 endpoint whenever a connection is available.
 - **Roster works offline.** A shoot's roster + ✓ status are cached when opened
   online (or pre-staged with **Download for offline**); offline the picker shows
   **"Ready offline ✓"** and the roster reads from cache.
+- **Walk-up players (B.5).** A kid not on the roster can be added on the spot with
+  **+ Add player** (name + a team picked from the roster or typed new), fully
+  offline; they capture like anyone else and are created on the server + attached
+  at sync.
+
+## Walk-up players (B.5 — not-on-roster adds)
+
+At a shoot a kid sometimes isn't on the roster. Tap **+ Add player** on the roster
+screen, enter a name and a team (an existing team or **+ New team…**), and capture
+as usual — **no connection required.**
+
+- The walk-up is stored locally with a client id and merged into the roster; the
+  capture queues against it like any other.
+- At sync the drainer first **creates the real player** on the server (the additive
+  `POST /api/players/roster/<job>/walkup`, idempotent by normalized name), then
+  uploads the reference to that player — so a walk-up ends up **indistinguishable
+  from a CSV-roster player** and flows into matching.
+- **Multi-tablet safe.** Each tablet's walk-up has its own local id and the server
+  dedups by name, so the same kid added on two tablets converges to **one** player
+  (last capture wins), never a duplicate. A walk-up added on one tablet isn't
+  visible on the others until everyone syncs.
+- A failed walk-up (e.g. the shoot was deleted server-side) lands in **Needs
+  attention**; **Discard** there also removes the local walk-up.
 
 ## Run it (development, on the laptop)
 
@@ -168,5 +191,19 @@ modern phone won't surface either.
 10. **~500-photo soak** *(target tablet)* — queue ~500 compressed captures offline
     → storage stays under quota, the pressure warning fires near the ceiling,
     then a full drain completes with **no loss** (server count == captured count).
+11. **Walk-up add offline** — **+ Add player** (one with an existing team, one with
+    a typed-new team) → both appear in the roster and capture → pending; survive
+    close/reopen + device restart.
+12. **Walk-up syncs on reconnect** — reconnect → each walk-up is created on the
+    server then its reference uploads → green ✓; `GET /api/players/roster/<job>`
+    now lists them and `GET /api/players/<id>/references` shows exactly one ref.
+13. **Three-tablet concurrent sync** *(target tablets)* — all three tablets capture
+    disjoint roster players + a couple of walk-ups offline, then return and let them
+    drain **at the same time** → every reference lands, server counts == captured
+    counts, **no duplicate players** and **no "database is locked"**.
+14. **Same walk-up on two tablets** — add the same kid (same name) on two tablets;
+    after both sync the desktop shows **one** player with one reference (a typed
+    *different* team on each yields one player with two team memberships — not a
+    bug). Mid-create kill/relaunch → completes with no duplicate.
 
 There is **no JS test runner** (per B.1/B.2) — this checklist is the verification.

@@ -22,6 +22,7 @@ import { SYNC_RESULT } from './syncQueue.js';
 import {
   QUEUE_STATUS, putRoster, getRoster, markRosterSynced,
   listQueueMetaByJob, countPending, removeQueueItem, storageEstimate,
+  addLocalPlayer, listLocalPlayersByJob, removeLocalPlayer, getLocalPlayer,
 } from './db.js';
 
 const STORAGE_WARN = 0.8; // surface a warning past 80% of quota (§6)
@@ -47,6 +48,10 @@ export default function App() {
   const [pendingCount, setPendingCount] = useState(0);
   const [storageInfo, setStorageInfo] = useState(null);
 
+  // Local walk-up players for the CURRENT shoot (B.5): added on-device, merged
+  // into the roster, reconciled to real server players at sync.
+  const [localPlayers, setLocalPlayers] = useState([]);
+
   // Filter state, lifted (B.2 Decision 5) so it survives the capture round-trip.
   const [teamFilter, setTeamFilter] = useState('');
   const [search, setSearch] = useState('');
@@ -64,6 +69,11 @@ export default function App() {
     setStorageInfo(est);
   }, [selectedJob]);
 
+  const refreshLocalPlayers = useCallback(async () => {
+    const jobId = selectedJob?.id;
+    setLocalPlayers(jobId != null ? await listLocalPlayersByJob(jobId) : []);
+  }, [selectedJob]);
+
   // Each item the drainer resolves: a SYNC flips ✓ green live (current shoot) and
   // updates the cached roster so an offline reopen still shows it captured.
   const handleItemResult = useCallback((item, result) => {
@@ -79,8 +89,11 @@ export default function App() {
     onItemResult: handleItemResult,
   });
 
-  // Reconcile the local queue view whenever a drain finishes (and on mount).
-  useEffect(() => { if (!syncing) refreshQueue(); }, [syncing, refreshQueue]);
+  // Reconcile the local queue + walk-up records whenever a drain finishes (and
+  // on mount) — post-sync this picks up realPlayerId for server-wins de-dup.
+  useEffect(() => {
+    if (!syncing) { refreshQueue(); refreshLocalPlayers(); }
+  }, [syncing, refreshQueue, refreshLocalPlayers]);
 
   // Fetch the roster + shoot-scoped ✓ status when the chosen shoot changes (or a
   // reload is requested). Online: render + CACHE for offline. Offline (fetch
@@ -129,6 +142,9 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selectedJob, reloadKey, refreshQueue]);
 
+  // Load this shoot's local walk-up players (offline-readable; no network).
+  useEffect(() => { refreshLocalPlayers(); }, [refreshLocalPlayers, reloadKey]);
+
   // Per-player queue state for the CURRENT shoot, from the lightweight metadata.
   const pendingPlayerIds = useMemo(
     () => new Set(
@@ -159,12 +175,30 @@ export default function App() {
     return `Storage ${Math.round(storageInfo.ratio * 100)}% full — sync soon to free space.`;
   }, [storageInfo]);
 
+  // The roster the screen shows = server memberships + local walk-ups. Once a
+  // walk-up has synced (its realPlayerId appears in the refetched server
+  // roster), drop the local copy so it shows once — server wins (§5).
+  const mergedItems = useMemo(() => {
+    const serverIds = new Set(roster.map((m) => m.player_id));
+    const locals = localPlayers
+      .filter((lp) => !(lp.realPlayerId != null && serverIds.has(lp.realPlayerId)))
+      .map((lp) => ({
+        player_id: lp.localId,
+        name: lp.name,
+        team: lp.team,
+        is_coach: lp.isCoach,
+        is_walkup: true,
+      }));
+    return [...roster, ...locals];
+  }, [roster, localPlayers]);
+
   const backToShoots = () => {
     setSelectedJob(null);
     setSelectedPlayer(null);
     setRoster([]);
     setReferencedPlayerIds(new Set());
     setQueueMeta([]);
+    setLocalPlayers([]);
     setFromCache(false);
     setCachedAt(null);
     setTeamFilter('');           // fresh filters for the next shoot
@@ -175,6 +209,22 @@ export default function App() {
 
   const pickPlayer = (member) => {
     setSelectedPlayer(member);
+    setView('capture');
+  };
+
+  // B.5 — add a walk-up locally (no network), then jump straight to capturing
+  // their photo. A `Coach-` name prefix flags a coach, same as the CSV roster.
+  // The capture enqueues against rec.localId; the drainer creates the real
+  // server player and remaps at sync time (§4).
+  const addWalkup = async ({ name, team }) => {
+    const rec = await addLocalPlayer({
+      jobId: selectedJob.id, name, team, isCoach: /^coach-/i.test(name.trim()),
+    });
+    setLocalPlayers((prev) => [...prev, rec]);
+    setSelectedPlayer({
+      player_id: rec.localId, name: rec.name, team: rec.team,
+      is_coach: rec.isCoach, is_walkup: true,
+    });
     setView('capture');
   };
 
@@ -211,7 +261,12 @@ export default function App() {
   };
   const discardFailed = async (item) => {
     await removeQueueItem(item.id);
+    // B.5 — a discarded walk-up also drops its local record (it never became a
+    // confirmed capture). A normal roster player has no local record → no-op.
+    const local = await getLocalPlayer(item.playerId).catch(() => null);
+    if (local) await removeLocalPlayer(item.playerId);
     refreshQueue();
+    refreshLocalPlayers();
   };
 
   if (view === 'shoots') {
@@ -241,7 +296,7 @@ export default function App() {
     return (
       <RosterScreen
         job={selectedJob}
-        items={roster}
+        items={mergedItems}
         referencedPlayerIds={referencedPlayerIds}
         pendingPlayerIds={pendingPlayerIds}
         failedPlayerIds={failedPlayerIds}
@@ -262,6 +317,7 @@ export default function App() {
         onSearch={setSearch}
         onNeedsPhotoOnly={setNeedsPhotoOnly}
         onPickPlayer={pickPlayer}
+        onAddWalkup={addWalkup}
         onSyncNow={syncNow}
         onOpenAttention={() => setView('attention')}
         onReload={() => setReloadKey((k) => k + 1)}

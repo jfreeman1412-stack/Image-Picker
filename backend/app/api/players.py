@@ -19,14 +19,15 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
 from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
 from app.services.players import (
-    build_validation_report, inspect_roster_csv, load_shoot_roster_from_text,
-    parse_mapped_roster, replace_shoot_memberships,
+    add_walkup_player, build_validation_report, inspect_roster_csv,
+    load_shoot_roster_from_text, parse_mapped_roster, replace_shoot_memberships,
 )
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
@@ -202,6 +203,42 @@ async def upload_mapped_roster(
     summary = replace_shoot_memberships(db, job_id, canonical)
     db.commit()
     return summary
+
+
+# ── Phase B.5: add one walk-up player (additive — does NOT wipe the roster) ──
+
+class WalkupRequest(BaseModel):
+    name: str
+    team: str
+
+
+@router.post("/roster/{job_id}/walkup")
+def add_walkup(
+    job_id: int,
+    payload: WalkupRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Add ONE not-on-roster player to this shoot (a walk-up), additively —
+    unlike the CSV upload it does not replace the roster. Finds-or-creates the
+    global Player by normalized name and inserts a single PlayerMembership.
+    Idempotent + race-safe (see services.add_walkup_player): re-sends and
+    concurrent same-name adds from multiple tablets converge to one Player +
+    membership. 404 if the job is missing; 400 if name/team is blank."""
+    if db.query(Job).get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    name = (payload.name or "").strip()
+    team = (payload.team or "").strip()
+    if not name:
+        raise HTTPException(400, detail={
+            "error": "missing_name", "message": "Player name is required."})
+    if not team:
+        raise HTTPException(400, detail={
+            "error": "missing_team", "message": "Team is required."})
+    try:
+        return add_walkup_player(db, job_id, name, team)
+    except ValueError as exc:
+        raise HTTPException(400, detail={
+            "error": "invalid_name", "message": str(exc)})
 
 
 # ── global player query ──────────────────────────────────────────────────

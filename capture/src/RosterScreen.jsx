@@ -9,7 +9,7 @@
 //
 // Presentational: membership items, the badge sets, and the filter state all live
 // in App (lifted) and arrive as props. See ../PHASE_B3_OFFLINE_CAPTURE.md.
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 
 function formatAgo(ts) {
   if (!ts) return '';
@@ -27,7 +27,7 @@ export default function RosterScreen({
   attentionCount, fromCache, cachedAt, storageWarning,
   syncing, syncProgress, lastSummary, status, error,
   teamFilter, search, needsPhotoOnly,
-  onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer,
+  onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer, onAddWalkup,
   onSyncNow, onOpenAttention, onReload, onBack,
 }) {
   const teams = useMemo(
@@ -51,6 +51,25 @@ export default function RosterScreen({
 
   const ready = status === 'ready';
   const hasRoster = ready && items.length > 0;
+
+  // B.5 — walk-up add form (local UI state; the new player is created in App).
+  const [adding, setAdding] = useState(false);
+  const [waName, setWaName] = useState('');
+  const [waTeam, setWaTeam] = useState('');
+  const [waNewTeam, setWaNewTeam] = useState('');
+  const [waErr, setWaErr] = useState(null);
+
+  const closeAdd = () => {
+    setAdding(false); setWaName(''); setWaTeam(''); setWaNewTeam(''); setWaErr(null);
+  };
+  const submitWalkup = () => {
+    const name = waName.trim();
+    const team = (waTeam === '__new__' ? waNewTeam : waTeam).trim();
+    if (!name) { setWaErr('Enter a player name.'); return; }
+    if (!team) { setWaErr('Choose or type a team.'); return; }
+    closeAdd();
+    onAddWalkup({ name, team });   // App creates the walk-up + opens its capture
+  };
 
   return (
     <main className="screen roster-screen">
@@ -128,6 +147,52 @@ export default function RosterScreen({
             >
               Needs photo
             </button>
+          </div>
+        )}
+
+        {ready && (
+          <div className="walkup-add">
+            {!adding ? (
+              <button type="button" className="link-add" onClick={() => setAdding(true)}>
+                + Add player
+              </button>
+            ) : (
+              <div className="walkup-form">
+                <input
+                  className="filter-search"
+                  value={waName}
+                  onChange={(e) => setWaName(e.target.value)}
+                  placeholder="Player name"
+                  aria-label="Walk-up player name"
+                />
+                <select
+                  className="filter-select"
+                  value={waTeam}
+                  onChange={(e) => setWaTeam(e.target.value)}
+                  aria-label="Walk-up team"
+                >
+                  <option value="">Choose team…</option>
+                  {teams.map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                  <option value="__new__">+ New team…</option>
+                </select>
+                {waTeam === '__new__' && (
+                  <input
+                    className="filter-search"
+                    value={waNewTeam}
+                    onChange={(e) => setWaNewTeam(e.target.value)}
+                    placeholder="New team name"
+                    aria-label="New team name"
+                  />
+                )}
+                <div className="controls-inline">
+                  <button type="button" className="btn ghost" onClick={closeAdd}>Cancel</button>
+                  <button type="button" className="btn" onClick={submitWalkup}>Add &amp; capture</button>
+                </div>
+                {waErr && <p className="result-line warn small">{waErr}</p>}
+              </div>
+            )}
           </div>
         )}
       </header>

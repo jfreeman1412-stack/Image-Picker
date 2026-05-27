@@ -15,6 +15,7 @@
 // See ../PHASE_B3_OFFLINE_CAPTURE.md.
 import {
   QUEUE_STATUS, listQueueMeta, getCaptureBytes, updateQueueItem, removeQueueItem,
+  getLocalPlayer, setLocalPlayerReal,
 } from './db.js';
 
 // Per-item outcome — drives the live ✓ and the §6 "Needs attention" surfacing.
@@ -75,11 +76,67 @@ export async function drainOnce({ onProgress, onItemResult } = {}) {
   }
 }
 
+// Phase B.5 — map a queue item to its real server player_id. A normal roster
+// capture already carries a real (int) id, so this is a no-op for it. A walk-up
+// carries a client localId: if its server Player was already created, reuse the
+// stored realPlayerId; otherwise create it now via the additive /walkup endpoint
+// (idempotent by norm_name) and remember the id. Returns { playerId } on
+// success, { retry } for network/5xx (try later), or { failed, error } for a
+// kept rejection. See ../PHASE_B5_WALKUP_PLAYER.md.
+async function resolveServerPlayerId(item) {
+  const local = await getLocalPlayer(item.playerId).catch(() => null);
+  if (!local) return { playerId: item.playerId };          // roster player: real id
+  if (local.realPlayerId != null) return { playerId: local.realPlayerId };
+  try {
+    const res = await fetch(`/api/players/roster/${item.jobId}/walkup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: item.playerName, team: item.team }),
+    });
+    if (res.ok) {
+      const body = await res.json();
+      await setLocalPlayerReal(item.playerId, body.player_id);
+      return { playerId: body.player_id };
+    }
+    if (res.status === 404) {
+      return { failed: SYNC_RESULT.FAILED_GONE,
+        error: 'This shoot no longer exists on the server.' };
+    }
+    if (res.status === 400) {
+      const body = await res.json().catch(() => ({}));
+      return { failed: SYNC_RESULT.FAILED_QUALITY,
+        error: body?.detail?.message || 'Could not add this player on the server.' };
+    }
+    return { retry: true, error: `Add-player failed (HTTP ${res.status}).` };
+  } catch {
+    return { retry: true, error: 'No connection.' };
+  }
+}
+
+
 async function uploadItem(item) {
   await updateQueueItem(item.id, {
     status: QUEUE_STATUS.UPLOADING,
     attempts: (item.attempts || 0) + 1,
   });
+
+  // B.5 — resolve the target player first. A walk-up is queued against a client
+  // localId; create (or look up) its real server Player before the reference can
+  // attach. A sub-step of THIS item — no second queue op-type — and both the
+  // create and the reference PUT are idempotent, so a crash/retry between them
+  // is safe (re-create returns the same Player; re-PUT replaces).
+  const resolved = await resolveServerPlayerId(item);
+  if (resolved.retry) {
+    await updateQueueItem(item.id, {
+      status: QUEUE_STATUS.PENDING, lastError: resolved.error || 'No connection.',
+    });
+    return SYNC_RESULT.RETRY;
+  }
+  if (resolved.failed) {
+    await updateQueueItem(item.id, { status: resolved.failed, lastError: resolved.error });
+    return resolved.failed;
+  }
+  const playerId = resolved.playerId;
 
   const rec = await getCaptureBytes(item.id).catch(() => null);
   if (!rec || !rec.bytes) {
@@ -96,7 +153,7 @@ async function uploadItem(item) {
     const fd = new FormData();
     fd.append('file', blob, 'capture.jpg');
     const res = await fetch(
-      `/api/players/${item.playerId}/references/shoot/${item.jobId}`,
+      `/api/players/${playerId}/references/shoot/${item.jobId}`,
       { method: 'PUT', body: fd },
     );
     if (res.ok) {

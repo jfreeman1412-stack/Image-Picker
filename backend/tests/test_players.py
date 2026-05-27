@@ -843,6 +843,121 @@ def test_replace_same_player_two_teams_not_collapsed(db):
     assert db.query(Player).count() == 1
 
 
+# ── Phase B.5: walk-up player (additive add, no roster wipe) ──────────────
+
+def test_walkup_creates_and_is_idempotent(client):
+    job_id = client.job_a_id
+    r = client.post(f"/api/players/roster/{job_id}/walkup",
+                    json={"name": "Walkup-Kid", "team": "Walkups"})
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["created"] is True and b["membership_created"] is True
+    assert b["is_coach"] is False
+    pid = b["player_id"]
+    items = client.get(f"/api/players/roster/{job_id}").json()["items"]
+    assert any(i["player_id"] == pid and i["team"] == "Walkups" for i in items)
+
+    # Re-send the same walk-up: same player, nothing duplicated.
+    b2 = client.post(f"/api/players/roster/{job_id}/walkup",
+                     json={"name": "Walkup-Kid", "team": "Walkups"}).json()
+    assert b2["player_id"] == pid
+    assert b2["created"] is False and b2["membership_created"] is False
+    items2 = client.get(f"/api/players/roster/{job_id}").json()["items"]
+    assert sum(1 for i in items2 if i["player_id"] == pid) == 1
+
+
+def test_walkup_additive_does_not_wipe_roster(client):
+    """A walk-up adds one membership without touching the existing roster."""
+    job_id = client.job_a_id
+    client.post(f"/api/players/roster/{job_id}",
+                files={"file": ("r.csv", SAMPLE_CSV.encode("utf-8"), "text/csv")})
+    before = client.get(f"/api/players/roster/{job_id}").json()["memberships_loaded"]
+    client.post(f"/api/players/roster/{job_id}/walkup",
+                json={"name": "Late-Arrival", "team": "11UA-Baseball"})
+    after = client.get(f"/api/players/roster/{job_id}").json()["memberships_loaded"]
+    assert after == before + 1   # the 8 CSV rows are intact, plus the walk-up
+
+
+def test_walkup_reuses_existing_global_player(client):
+    # Seed the player on shoot B via CSV, then walk them up on shoot A.
+    client.post(f"/api/players/roster/{client.job_b_id}",
+                files={"file": ("r.csv", b"Eleanor-Pederson,Team-X\n", "text/csv")})
+    before = client.get("/api/players", params={"q": "eleanor"}).json()["total"]
+    r = client.post(f"/api/players/roster/{client.job_a_id}/walkup",
+                    json={"name": "Eleanor-Pederson", "team": "Lions"})
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] is False                      # reused the Player
+    after = client.get("/api/players", params={"q": "eleanor"}).json()["total"]
+    assert after == before                                   # no duplicate Player
+
+
+def test_walkup_same_player_two_teams(client):
+    job_id = client.job_a_id
+    a = client.post(f"/api/players/roster/{job_id}/walkup",
+                    json={"name": "Two-Team-Kid", "team": "Red"}).json()
+    b = client.post(f"/api/players/roster/{job_id}/walkup",
+                    json={"name": "Two-Team-Kid", "team": "Blue"}).json()
+    assert a["player_id"] == b["player_id"]
+    assert b["membership_created"] is True
+    teams = sorted(i["team"] for i in
+                   client.get(f"/api/players/roster/{job_id}").json()["items"]
+                   if i["player_id"] == a["player_id"])
+    assert teams == ["Blue", "Red"]
+
+
+def test_walkup_coach_prefix(client):
+    r = client.post(f"/api/players/roster/{client.job_a_id}/walkup",
+                    json={"name": "Coach-Taylor", "team": "Reds"})
+    assert r.status_code == 200, r.text
+    assert r.json()["is_coach"] is True
+
+
+def test_walkup_blank_name_or_team_400(client):
+    job_id = client.job_a_id
+    r1 = client.post(f"/api/players/roster/{job_id}/walkup",
+                     json={"name": "   ", "team": "Reds"})
+    assert r1.status_code == 400 and r1.json()["detail"]["error"] == "missing_name"
+    r2 = client.post(f"/api/players/roster/{job_id}/walkup",
+                     json={"name": "Sam-Jones", "team": ""})
+    assert r2.status_code == 400 and r2.json()["detail"]["error"] == "missing_team"
+
+
+def test_walkup_unknown_job_404(client):
+    r = client.post("/api/players/roster/99999/walkup",
+                    json={"name": "Sam-Jones", "team": "Reds"})
+    assert r.status_code == 404
+
+
+def test_walkup_recovers_from_concurrent_create_race(db, monkeypatch):
+    """Simulate two tablets creating the same walk-up at once: the first
+    upsert raises the norm_name UNIQUE IntegrityError; the endpoint rolls back,
+    re-queries, and reuses the existing Player — no 500, no duplicate."""
+    from app.services import players as players_svc
+
+    job = _job(db)
+    existing = Player(norm_name=normalize_name("Walkup-Kid"),
+                      display_name="Walkup-Kid")
+    db.add(existing); db.commit(); db.refresh(existing)
+
+    real_upsert = players_svc.upsert_player
+    calls = {"n": 0}
+
+    def flaky_upsert(dbs, raw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntegrityError("INSERT INTO players", {},
+                                 Exception("UNIQUE constraint failed: players.norm_name"))
+        return real_upsert(dbs, raw)
+
+    monkeypatch.setattr(players_svc, "upsert_player", flaky_upsert)
+
+    result = players_svc.add_walkup_player(db, job.id, "Walkup-Kid", "Red")
+    assert result["player_id"] == existing.id
+    assert result["created"] is False
+    assert calls["n"] == 2                               # raised once, retried once
+    assert db.query(Player).filter_by(norm_name="walkupkid").count() == 1
+
+
 def test_mapped_commit_dedups_duplicate_rows(client):
     """The real-roster 500 reproduction: a coach listed twice on a team now
     commits cleanly with the duplicate collapsed."""
