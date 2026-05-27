@@ -118,81 +118,84 @@ export default function RosterScreen({
           </button>
         )}
 
-        {hasRoster && (
+        {ready && (hasRoster || !adding) && (
           <div className="roster-filters">
-            <select
-              className="filter-select"
-              value={teamFilter}
-              onChange={(e) => onTeamFilter(e.target.value)}
-              aria-label="Filter by team"
-            >
-              <option value="">All teams</option>
-              {teams.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-            <input
-              className="filter-search"
-              type="search"
-              value={search}
-              onChange={(e) => onSearch(e.target.value)}
-              placeholder="Search name…"
-              aria-label="Search by name"
-            />
-            <button
-              type="button"
-              className={needsPhotoOnly ? 'pill active' : 'pill'}
-              aria-pressed={needsPhotoOnly}
-              onClick={() => onNeedsPhotoOnly(!needsPhotoOnly)}
-            >
-              Needs photo
-            </button>
-          </div>
-        )}
-
-        {ready && (
-          <div className="walkup-add">
-            {!adding ? (
-              <button type="button" className="link-add" onClick={() => setAdding(true)}>
-                + Add player
-              </button>
-            ) : (
-              <div className="walkup-form">
-                <input
-                  className="filter-search"
-                  value={waName}
-                  onChange={(e) => setWaName(e.target.value)}
-                  placeholder="Player name"
-                  aria-label="Walk-up player name"
-                />
+            {hasRoster && (
+              <>
                 <select
                   className="filter-select"
-                  value={waTeam}
-                  onChange={(e) => setWaTeam(e.target.value)}
-                  aria-label="Walk-up team"
+                  value={teamFilter}
+                  onChange={(e) => onTeamFilter(e.target.value)}
+                  aria-label="Filter by team"
                 >
-                  <option value="">Choose team…</option>
+                  <option value="">All teams</option>
                   {teams.map((t) => (
                     <option key={t} value={t}>{t}</option>
                   ))}
-                  <option value="__new__">+ New team…</option>
                 </select>
-                {waTeam === '__new__' && (
-                  <input
-                    className="filter-search"
-                    value={waNewTeam}
-                    onChange={(e) => setWaNewTeam(e.target.value)}
-                    placeholder="New team name"
-                    aria-label="New team name"
-                  />
-                )}
-                <div className="controls-inline">
-                  <button type="button" className="btn ghost" onClick={closeAdd}>Cancel</button>
-                  <button type="button" className="btn" onClick={submitWalkup}>Add &amp; capture</button>
-                </div>
-                {waErr && <p className="result-line warn small">{waErr}</p>}
-              </div>
+                <input
+                  className="filter-search"
+                  type="search"
+                  value={search}
+                  onChange={(e) => onSearch(e.target.value)}
+                  placeholder="Search name…"
+                  aria-label="Search by name"
+                />
+                <button
+                  type="button"
+                  className={needsPhotoOnly ? 'pill active' : 'pill'}
+                  aria-pressed={needsPhotoOnly}
+                  onClick={() => onNeedsPhotoOnly(!needsPhotoOnly)}
+                >
+                  Needs photo
+                </button>
+              </>
             )}
+            {/* Primary ACTION (filled blue), in the same row as the filters but
+                deliberately NOT styled like the .pill toggles. */}
+            {!adding && (
+              <button type="button" className="btn-add" onClick={() => setAdding(true)}>
+                + Add player
+              </button>
+            )}
+          </div>
+        )}
+
+        {ready && adding && (
+          <div className="walkup-form">
+            <input
+              className="filter-search"
+              value={waName}
+              onChange={(e) => setWaName(e.target.value)}
+              placeholder="Player name"
+              aria-label="Walk-up player name"
+            />
+            <select
+              className="filter-select"
+              value={waTeam}
+              onChange={(e) => setWaTeam(e.target.value)}
+              aria-label="Walk-up team"
+            >
+              <option value="">Choose team…</option>
+              {teams.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+              <option value="__new__">+ New team…</option>
+            </select>
+            {waTeam === '__new__' && (
+              <input
+                className="filter-search"
+                value={waNewTeam}
+                onChange={(e) => setWaNewTeam(e.target.value)}
+                placeholder="New team name"
+                aria-label="New team name"
+              />
+            )}
+            <div className="controls-inline">
+              <button type="button" className="btn ghost" onClick={closeAdd}>Cancel</button>
+              <button type="button" className="btn" onClick={submitWalkup}>Add &amp; capture</button>
+            </div>
+            {waErr && <p className="result-line warn small">{waErr}</p>}
           </div>
         )}
       </header>
