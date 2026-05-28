@@ -70,9 +70,16 @@ def ingest_folder(db: DbSession, session_id: int, folder: Path) -> int:
             path=str(path.resolve()),
             filename=path.name,
             capture_time=capture_time,
-            copyright_tag=copyright_tag,
+            # C.3 Decision 2 (universal copyright suppression): copyright is
+            # deprecated as a labeling source — face match always wins, and
+            # unmatched clusters fall back to "Player {id}". Never populate
+            # the column so the labeling stage produces nothing and
+            # cluster_matching's unconditional set on high-tier is the only
+            # path that names a cluster. Reading copyright via _read_exif is
+            # left intact (still useful for capture_time, and harmless here).
+            copyright_tag=None,
         )
-        for path, (capture_time, copyright_tag) in zip(paths, exifs)
+        for path, (capture_time, _copyright_unused) in zip(paths, exifs)
     ])
     db.commit()
     logger.info("[ingest] team %s: %d files in %.1fs",

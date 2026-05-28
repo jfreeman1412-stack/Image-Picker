@@ -119,26 +119,34 @@ def test_gap_fill_no_copyright(db):
     assert (c.review_reason or "") == ""        # no flag on the clean path
 
 
-def test_agree_no_flag(db):
+def test_match_overwrites_agreeing_copyright(db):
+    """C.3 Decision 2: match always sets source='match', even when the
+    pre-existing copyright label happened to agree with the match name.
+    Was: source left as 'copyright' on agreement. Now: match owns the label."""
     job, sess = _job_session(db)
     _player(db, "Alice", refs=[1.0], job_id=job.id)
-    c = _cluster(db, sess, [QUERY], auto_label="Alice")   # copyright agrees
+    c = _cluster(db, sess, [QUERY], auto_label="Alice")   # pre-seeded agrees
     _run(db, sess)
     db.refresh(c)
     assert c.auto_label == "Alice"
-    assert c.auto_label_source != "match"       # left as-is (copyright origin)
+    assert c.auto_label_source == "match"       # match wins, source=match
     assert "match_label_conflict" not in (c.review_reason or "")
 
 
-def test_conflict_keeps_copyright_and_flags(db):
+def test_match_overrides_disagreeing_copyright_no_flag(db):
+    """C.3 Decision 2 (precedence flip): a pre-existing copyright label that
+    DISAGREES with the match is OVERWRITTEN by the match name — no
+    match_label_conflict flag (it no longer fires under the new precedence).
+    Was: copyright won the conflict and the cluster carried the flag."""
     job, sess = _job_session(db)
     alice = _player(db, "Alice", refs=[1.0], job_id=job.id)
-    c = _cluster(db, sess, [QUERY], auto_label="Bob")     # copyright disagrees
+    c = _cluster(db, sess, [QUERY], auto_label="Bob")     # pre-seeded disagrees
     _run(db, sess)
     db.refresh(c)
     assert c.matched_player_id == alice.id
-    assert c.auto_label == "Bob"                # copyright wins
-    assert "match_label_conflict" in (c.review_reason or "")
+    assert c.auto_label == "Alice"              # match wins
+    assert c.auto_label_source == "match"
+    assert "match_label_conflict" not in (c.review_reason or "")
 
 
 def test_low_tier_flag_no_label(db):
@@ -273,13 +281,20 @@ def test_empty_cluster_left_untouched(db):
 
 
 def test_rerun_idempotent(db):
+    """Re-running matching converges to the same label. Under C.3 Decision 2
+    a disagreeing pre-existing auto_label is overwritten to the match name
+    on the first run; the second run is a no-op (same write). No flag
+    accumulates across reruns (the match_label_conflict flag is gone)."""
     job, sess = _job_session(db)
     _player(db, "Bob", refs=[1.0], job_id=job.id)
-    c = _cluster(db, sess, [QUERY], auto_label="Carl")   # conflict → flag
+    c = _cluster(db, sess, [QUERY], auto_label="Carl")   # pre-seeded disagrees
     _run(db, sess)
     db.refresh(c)
+    assert c.auto_label == "Bob"                 # match wins on first run
+    assert c.auto_label_source == "match"
     first = c.review_reason
     _run(db, sess)
     db.refresh(c)
-    assert c.review_reason == first
-    assert (c.review_reason or "").count("match_label_conflict") == 1
+    assert c.review_reason == first              # idempotent across reruns
+    assert c.auto_label == "Bob"
+    assert "match_label_conflict" not in (c.review_reason or "")

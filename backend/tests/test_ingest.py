@@ -195,3 +195,58 @@ def test_read_png_metadata_direct_call(tmp_path):
     _make_png_with_metadata(path, Copyright="DirectCall")
     _, copyright_tag = _read_png_metadata(path)
     assert copyright_tag == "DirectCall"
+
+
+# ── C.3 Decision 2: universal copyright suppression at ingest ────────────────
+
+
+def test_ingest_folder_stores_copyright_tag_as_none(tmp_path):
+    """ingest_folder must NEVER populate Image.copyright_tag, even when the
+    source EXIF/PNG metadata carries one. Copyright is deprecated as a
+    labeling source under C.3 Decision 2; match-or-'Player {id}' is the only
+    label path. The reader (_read_exif) still extracts the value (it's also
+    used for capture_time); the ingest layer just doesn't store the copyright
+    onto the Image row."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db import Base
+    from app.models.db_models import Image, Job
+    from app.models.db_models import Session as DbSess
+    from app.services.ingest import ingest_folder
+
+    folder = tmp_path / "team-folder"
+    folder.mkdir()
+    _make_png_with_metadata(folder / "a.png", Copyright="Quinn-Gentz")
+    _make_png_with_exif_chunk(folder / "b.png", "Studio Photos")
+    # Sanity: the EXIF reader still sees the copyright (its job is unchanged).
+    assert _read_exif(folder / "a.png")[1] == "Quinn-Gentz"
+    assert _read_exif(folder / "b.png")[1] == "Studio Photos"
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'ingest-c3.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SL = sessionmaker(bind=engine)
+    db = SL()
+    try:
+        job = Job(name="t", root_path=str(folder))
+        db.add(job); db.commit(); db.refresh(job)
+        sess = DbSess(job_id=job.id, name="team",
+                      source_path=str(folder), status="pending")
+        db.add(sess); db.commit(); db.refresh(sess)
+
+        n = ingest_folder(db, sess.id, folder)
+        assert n == 2
+
+        images = db.query(Image).filter_by(session_id=sess.id).all()
+        assert len(images) == 2
+        for img in images:
+            assert img.copyright_tag is None, (
+                f"{img.filename}: copyright_tag={img.copyright_tag!r}; "
+                "must be None under C.3 Decision 2."
+            )
+    finally:
+        db.close()
+        engine.dispose()

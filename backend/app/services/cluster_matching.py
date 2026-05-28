@@ -21,7 +21,6 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.models.db_models import Cluster, Face, PlayerMembership, ReferenceFace
 from app.services import matching
-from app.services.roster import normalize_name
 from app.services.roster_check import session_norm_team
 
 logger = logging.getLogger(__name__)
@@ -85,15 +84,15 @@ def match_session_clusters(db: DbSession, session) -> None:
         if result["tier"] == "high":
             pid = result["player_id"]
             name = result["player_name"]
-            if not (c.auto_label or "").strip():
-                # Gap-fill: no copyright tag → adopt the matched name cleanly.
-                # (NOT an error; the future steady state has no copyright.)
-                c.auto_label = name
-                c.auto_label_source = "match"
-            elif normalize_name(c.auto_label) != normalize_name(name or ""):
-                # Copyright present and disagrees → copyright wins, flag it.
-                c.review_reason = _add_flag(c.review_reason, "match_label_conflict")
-            # (agree → leave the copyright auto_label + source untouched, no flag)
+            # C.3 Decision 2: face match ALWAYS wins. Previously copyright won
+            # on conflict (flagged match_label_conflict) and "agree" left the
+            # source as "copyright" — both demoted good matches when a stray
+            # EXIF copyright leaked in. Now the match name unconditionally
+            # takes the label. Rosters and face-reference photos reign;
+            # copyright is no longer a labeling source (also suppressed at
+            # ingest, so this branch normally writes onto a None auto_label).
+            c.auto_label = name
+            c.auto_label_source = "match"
 
             # Coach promotion (decision 3): roster-scope only, promote-only.
             # manual_coach_override still wins downstream via is_coach_for_sort().
