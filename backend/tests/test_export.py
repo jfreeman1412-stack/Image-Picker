@@ -7,6 +7,7 @@ POST returns, so by the time we poll, status == 'done'. Both the request DB
 (get_db override) and the background DB (jobs.SessionLocal) point at one
 temp SQLite file.
 """
+import errno
 from datetime import datetime
 from pathlib import Path
 
@@ -329,3 +330,156 @@ def test_export_404(ctx):
     client, SL, tmp_path = ctx
     assert client.post("/api/jobs/99999/export", json={}).status_code == 404
     assert client.get("/api/jobs/99999/export-status").status_code == 404
+
+
+# ── Export hardening (2026-05-28) ─────────────────────────────────────────────
+# Three fixes pair-bound by the same job-28 failure: (a) _safe_copy2 EINVAL
+# retry+fallback, (b) per-file fault tolerance in _run_export (no cascade-abort
+# on a single bad copy), (c) default role='individual' for Issue 5 orphans.
+
+
+def test_safe_copy2_succeeds_first_try(tmp_path):
+    from app.api.jobs import _safe_copy2
+    src = tmp_path / "src.jpg"; src.write_bytes(b"hi")
+    dst = tmp_path / "dst.jpg"
+    _safe_copy2(src, dst)
+    assert dst.read_bytes() == b"hi"
+
+
+def test_safe_copy2_retries_einval_then_falls_back_to_copyfile(tmp_path, monkeypatch):
+    """Transient SMB EINVAL on copy2 → 3 retries → fall back to copyfile so
+    bytes still land (metadata is non-essential)."""
+    from app.api import jobs as jobs_mod
+    from app.api.jobs import _safe_copy2
+
+    src = tmp_path / "s.jpg"; src.write_bytes(b"payload")
+    dst = tmp_path / "d.jpg"
+    calls = {"copy2": 0, "copyfile": 0}
+
+    def fake_copy2(s, d):
+        calls["copy2"] += 1
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    def fake_copyfile(s, d):
+        calls["copyfile"] += 1
+        Path(d).write_bytes(Path(s).read_bytes())
+
+    monkeypatch.setattr(jobs_mod.shutil, "copy2", fake_copy2)
+    monkeypatch.setattr(jobs_mod.shutil, "copyfile", fake_copyfile)
+    monkeypatch.setattr(jobs_mod.time, "sleep", lambda _x: None)   # speed up backoff
+
+    _safe_copy2(src, dst)
+
+    assert calls["copy2"] == 3                # all retries exhausted
+    assert calls["copyfile"] == 1             # then fell back
+    assert dst.read_bytes() == b"payload"     # bytes landed
+
+
+def test_safe_copy2_non_einval_raises_immediately(tmp_path, monkeypatch):
+    """A non-EINVAL OSError (e.g. ENOENT) is NOT retried — we must not mask
+    unrelated failures (missing source, permission, disk full, …)."""
+    from app.api import jobs as jobs_mod
+    from app.api.jobs import _safe_copy2
+
+    src = tmp_path / "s.jpg"; src.write_bytes(b"x")
+    dst = tmp_path / "d.jpg"
+    calls = {"copy2": 0}
+
+    def fake_copy2(s, d):
+        calls["copy2"] += 1
+        raise OSError(errno.ENOENT, "No such file")
+
+    monkeypatch.setattr(jobs_mod.shutil, "copy2", fake_copy2)
+
+    with pytest.raises(OSError) as exc_info:
+        _safe_copy2(src, dst)
+    assert exc_info.value.errno == errno.ENOENT
+    assert calls["copy2"] == 1                # no retry on non-EINVAL
+
+
+def test_export_continues_past_per_file_failure_no_cascade(ctx, monkeypatch):
+    """A failing _copy_one in session A must NOT abort session B (the job-28
+    cascade-abort bug). The job runs to completion; the failed file is
+    recorded in export_result.failures; status='error' signals 'needs
+    attention'; every other file actually landed on disk."""
+    client, SL, tmp_path = ctx
+    from app.api import jobs as jobs_mod
+
+    jid, root = _build_job(SL, tmp_path, team_specs=[
+        {"name": "Team A", "images": [
+            {"filename": "a1.jpg", "role": "individual"},
+            {"filename": "a2.jpg", "role": "team"},        # <- we'll fail this one
+            {"filename": "a3.jpg", "role": "individual"},
+        ]},
+        {"name": "Team B", "images": [
+            {"filename": "b1.jpg", "role": "individual"},
+            {"filename": "b2.jpg", "role": "panoramic"},
+            {"filename": "b3.jpg", "role": "individual"},
+        ]},
+    ])
+
+    real_copy_one = jobs_mod._copy_one
+
+    def flaky(src, website_dst, secondary_dst, mode):
+        if Path(src).name == "a2.jpg":
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real_copy_one(src, website_dst, secondary_dst, mode)
+
+    monkeypatch.setattr(jobs_mod, "_copy_one", flaky)
+
+    _export(client, jid)
+    s = client.get(f"/api/jobs/{jid}/export-status").json()
+    res = s["result"]
+
+    # Job ran to completion across BOTH sessions despite the failure on a2.
+    assert s["status"] == "error", s            # signals failures, didn't abort
+    assert res["files_failed"] == 1
+    assert res["files_copied"] == 5              # 6 attempted - 1 failed
+    assert len(res["failures"]) == 1
+    assert res["failures"][0]["role"] == "team"
+    assert "a2.jpg" in res["failures"][0]["src"]
+
+    out = Path(res["output_path"])
+    # The failed file's destination is absent.
+    assert not (out / "To_be_Cropped" / "Team A" / "a2.jpg").exists()
+    # Every other file in BOTH teams actually landed (no cascade abort).
+    for team, fn in [("Team A", "a1.jpg"), ("Team A", "a3.jpg"),
+                     ("Team B", "b1.jpg"), ("Team B", "b2.jpg"),
+                     ("Team B", "b3.jpg")]:
+        assert (out / "To_be_Cropped" / team / fn).exists(), f"{team}/{fn} missing"
+
+
+def test_export_includes_orphan_image_as_individual(ctx):
+    """Issue 5: an image with NO ImageRole (orphan from clustering, e.g. a
+    single-image team folder's lone coach photo) must still ship to
+    To_be_Cropped as an individual — not silently skipped."""
+    client, SL, tmp_path = ctx
+    jid, root = _build_job(SL, tmp_path, team_specs=[
+        {"name": "Coach Only", "images": [
+            {"filename": "coach.jpg"},     # NO role -> orphan
+        ]},
+        {"name": "Team B", "images": [     # a normal team alongside
+            {"filename": "b1.jpg", "role": "individual"},
+            {"filename": "b2.jpg", "role": "team"},
+        ]},
+    ])
+
+    post = _export(client, jid)
+    assert post.status_code == 200
+    assert post.json()["export_total"] == 3   # orphan counted in total now
+
+    s = client.get(f"/api/jobs/{jid}/export-status").json()
+    assert s["status"] == "done", s
+    res = s["result"]
+    assert res["files_copied"] == 3
+    assert res["files_failed"] == 0
+
+    out = Path(res["output_path"])
+    # Orphan landed in To_be_Cropped (treated as individual).
+    assert (out / "To_be_Cropped" / "Coach Only" / "coach.jpg").exists()
+    # No secondary copy (individual role doesn't trigger team/pano).
+    assert not (out / "Team Images" / "Coach Only" / "coach.jpg").exists()
+    assert not (out / "Pano Images" / "Coach Only" / "coach.jpg").exists()
+    # Normal team still works.
+    assert (out / "To_be_Cropped" / "Team B" / "b1.jpg").exists()
+    assert (out / "Team Images" / "Team B" / "b2.jpg").exists()

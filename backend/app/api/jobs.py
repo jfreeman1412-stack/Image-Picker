@@ -15,6 +15,7 @@ POST   /api/jobs/{id}/archive          soft-hide a job
 POST   /api/jobs/{id}/unarchive        restore an archived job
 DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 """
+import errno
 import json
 import logging
 import shutil
@@ -715,11 +716,15 @@ def _exportable_sessions(job: Job):
 
 def _count_export_files(db: DbSession, sessions) -> int:
     """Non-rejected images across the given sessions — the progress
-    denominator (one primary copy/move op per image)."""
+    denominator (one primary copy/move op per image). Images with no
+    ImageRole row are treated as 'individual' by the export (Issue 5
+    orphans), so they're counted too — otherwise export_total would
+    undercount and the progress bar wouldn't match what gets copied."""
     all_ids = [img.id for s in sessions for img in s.images]
     role_map = _best_role_map(db, all_ids)
     return sum(
-        1 for r in role_map.values() if r is not None and r != "rejected"
+        1 for image_id in all_ids
+        if role_map.get(image_id) != "rejected"
     )
 
 
@@ -786,17 +791,59 @@ def _clear_out_root(out_root: Path) -> None:
                      name=f"export-cleanup-{stale.name}").start()
 
 
+_COPY_RETRY_ATTEMPTS = 3        # transient SMB EINVAL retry budget
+_COPY_RETRY_BACKOFF = 0.5       # seconds (linear backoff factor)
+
+
+def _safe_copy2(src: Path, dst: Path) -> None:
+    """shutil.copy2 with EINVAL tolerance for SMB / UNC shares.
+
+    Real shoots write to a network share that intermittently returns
+    [Errno 22] Invalid argument from `shutil.copy2`'s `copyfile` step (bytes
+    write rejected) or its `copystat` step (timestamps/attrs rejected). Retry
+    up to _COPY_RETRY_ATTEMPTS with a brief linear backoff; on exhaustion fall
+    back to `shutil.copyfile` so the BYTES still land — metadata is
+    non-essential for the customer-facing deliverable, especially for the
+    secondary copy whose primary already carries the same metadata. Any
+    non-EINVAL OSError raises immediately so we never mask an unrelated
+    failure (missing source, permission denied, disk full, …).
+    """
+    last_err: OSError | None = None
+    for attempt in range(_COPY_RETRY_ATTEMPTS):
+        try:
+            shutil.copy2(str(src), str(dst))
+            return
+        except OSError as exc:
+            if exc.errno != errno.EINVAL:
+                raise
+            last_err = exc
+            time.sleep(_COPY_RETRY_BACKOFF * (attempt + 1))
+    try:
+        shutil.copyfile(str(src), str(dst))
+        logger.warning(
+            "[export] copy2 EINVAL exhausted after %d attempts; "
+            "copyfile (bytes-only) succeeded: %s -> %s",
+            _COPY_RETRY_ATTEMPTS, src, dst,
+        )
+    except OSError as final:
+        raise final from last_err
+
+
 def _copy_one(src: Path, website_dst: Path, secondary_dst: Optional[Path],
               mode: str) -> None:
     """One image's full export. The TEAM/PANO secondary copy reads from
     website_dst rather than src, which is required for mode='move' since
-    src no longer exists by then."""
+    src no longer exists by then.
+
+    Both copies go through `_safe_copy2` so transient SMB EINVAL hiccups
+    retry-then-degrade-to-bytes-only instead of aborting the file.
+    """
     if mode == "move":
         shutil.move(str(src), str(website_dst))
     else:
-        shutil.copy2(str(src), str(website_dst))
+        _safe_copy2(src, website_dst)
     if secondary_dst is not None:
-        shutil.copy2(str(website_dst), str(secondary_dst))
+        _safe_copy2(website_dst, secondary_dst)
 
 
 def _resolve_out_root(root: Path, destination_path: str | None) -> Path:
@@ -841,6 +888,7 @@ def _run_export(
             )
             files_copied = 0
             files_skipped_rejected = 0
+            failures: list[dict] = []   # per-file copy failures across the run
 
             for session in to_export:
                 job.export_current_team = session.name
@@ -860,11 +908,16 @@ def _run_export(
                 roles: list[str] = []
                 for image in session.images:
                     role = role_map.get(image.id)
-                    if role is None:
-                        continue
                     if role == "rejected":
                         files_skipped_rejected += 1
                         continue
+                    if role is None:
+                        # Issue 5: orphan image (no cluster → no ImageRole)
+                        # — still ship the photo as an individual so single-
+                        # image team folders (often a lone coach shot) don't
+                        # get silently dropped from the deliverable. See
+                        # memory: clustering-singleton-edge.
+                        role = "individual"
                     src = Path(image.path)
                     if not src.exists():
                         logger.warning("Source missing for export: %s", src)
@@ -884,23 +937,41 @@ def _run_export(
                     _allocate_dests(pano_srcs, pano_team),
                 ))
 
-                # Parallel copy fan-out, sequential progress accounting.
+                # Parallel copy fan-out, sequential progress accounting. Per-file
+                # failures are caught + logged + skipped (B.3-style lossless): the
+                # job continues across ALL sessions and reports failures at the
+                # end. One bad SMB copy never aborts the run.
                 with ThreadPoolExecutor(max_workers=_EXPORT_WORKERS) as ex:
-                    futures = []
+                    futures_meta: dict = {}
                     for src, role, website_dst in zip(srcs, roles, website_dsts):
                         secondary = None
                         if role == "team":
                             secondary = team_dsts.get(str(src))
                         elif role == "panoramic":
                             secondary = pano_dsts.get(str(src))
-                        futures.append(
-                            ex.submit(_copy_one, src, website_dst, secondary, mode)
-                        )
-                    for fut in as_completed(futures):
-                        fut.result()  # re-raise any worker exception
-                        files_copied += 1
-                        # Commit progress every 10 files (network commits aren't free).
-                        if files_copied % 10 == 0:
+                        fut = ex.submit(_copy_one, src, website_dst, secondary, mode)
+                        futures_meta[fut] = (src, role, website_dst, secondary)
+                    for fut in as_completed(futures_meta):
+                        try:
+                            fut.result()
+                            files_copied += 1
+                        except Exception as exc:  # noqa: BLE001 — caught + logged + skipped
+                            src, role, wdst, sec = futures_meta[fut]
+                            failures.append({
+                                "session": session.name,
+                                "role": role,
+                                "src": str(src),
+                                "website_dst": str(wdst),
+                                "secondary_dst": str(sec) if sec else None,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            })
+                            logger.exception(
+                                "[export] copy FAILED (session=%s, role=%s, "
+                                "src=%s)", session.name, role, src,
+                            )
+                        # Commit progress every 10 completions (success OR fail)
+                        # so the UI doesn't stall on bursts of failures.
+                        if (files_copied + len(failures)) % 10 == 0:
                             job.export_progress = files_copied
                             db.commit()
 
@@ -912,20 +983,35 @@ def _run_export(
                     time.monotonic() - session_start,
                 )
 
-            job.export_status = "done"
             job.export_current_team = None
             job.export_progress = files_copied
-            job.export_result = json.dumps({
+            result = {
                 "output_path": str(out_root),
                 "team_count": len(to_export),
                 "files_copied": files_copied,
                 "files_skipped_rejected": files_skipped_rejected,
+                "files_failed": len(failures),
                 "sessions_skipped": sessions_skipped,
-            })
+                "failures": failures,
+            }
+            job.export_result = json.dumps(result)
+            if failures:
+                # Per-file failures DON'T abort the job (the run completed
+                # across all sessions); the status surfaces "needs attention"
+                # so the UI / operator notices, with the per-file detail in
+                # export_result.failures.
+                job.export_status = "error"
+                job.export_error = (
+                    f"{len(failures)} file(s) failed to copy — "
+                    "see export_result.failures for details."
+                )
+            else:
+                job.export_status = "done"
+                job.export_error = None
             db.commit()
             logger.info(
-                "[export] Job %s done: %d files, %d teams",
-                job_id, files_copied, len(to_export),
+                "[export] Job %s complete: %d copied, %d failed, %d teams",
+                job_id, files_copied, len(failures), len(to_export),
             )
         except Exception as exc:  # noqa: BLE001 — surface to the modal
             logger.exception("[export] Job %s failed", job_id)
