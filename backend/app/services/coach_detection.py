@@ -1,14 +1,19 @@
 """Flag clusters as likely coaches.
 
-Two complementary auto-detection signals (logical OR — either alone suffices):
+Three complementary auto-detection signals (logical OR — any one suffices):
 
-  1. Age + low photo count (original) — catches coaches who DO have a few
+  A. Age + low photo count (original) — catches coaches who DO have a few
      solo photos with visible age cues.
-  2. Photo composition — catches coaches whose primary signal is "appears in
+  B. Photo composition — catches coaches whose primary signal is "appears in
      buddy shots, has few/no individual portraits." More reliable than FER
      age estimation; requires the cluster to have at least 2 buddy shots.
+  C. Singleton heuristic (Issue 5) — `image_count == 1`. By workflow rule,
+     every player gets multiple shots (individual + team + pano); the only
+     person who ever gets a single shot is a coach. So in practice a 1-image
+     cluster IS a coach. The off-process kid-arrived-late case (a real
+     singleton that's a player) is handled by the manual override dropdown.
 
-Phase 4.6: rule 2 originally had a third condition,
+Phase 4.6: rule B originally had a third condition,
 `image_count < session_median * 0.7`. It was meant to stop a player with a
 short session from being flagged, but in practice it caught legitimate
 coaches: the real "Nash-Hauer" coach cluster had 2 single + 5 buddy = 7
@@ -19,12 +24,19 @@ so they never look like this. The total-count gate is dropped. The rare
 genuine false positive (a player who only got 2-3 solo shots AND has 2+
 buddy shots) is handled by the manual coach dropdown (Phase 4.5 §3).
 
+Issue 5 (Rule C): added after we discovered that 1-shot coaches were
+silently disappearing from the cluster grid. DBSCAN with min_samples=2
+labels lone faces -1 (noise); face_pipeline now promotes those noise faces
+to singleton Cluster rows, and Rule C tags them as coach so they route to
+both To_be_Cropped and Team Images via assign_roles_coach. Trivially
+satisfies Issue 2's planned `single_face_count >= 1` gate.
+
 Manual override (`Cluster.manual_coach_override`, resolved via
 `Cluster.is_coach_for_sort()`) always wins over whatever this sets — this
 only writes the auto signal `is_likely_coach`.
 
-Known trade-off (rule 1): a coach who happens to get a lot of solo shots
-(>= half the session median) won't be flagged by age. Rule 2 covers most of
+Known trade-off (rule A): a coach who happens to get a lot of solo shots
+(>= half the session median) won't be flagged by age. Rule B covers most of
 those (coaches still show up in buddy shots); the rest the user overrides
 manually.
 """
@@ -53,12 +65,13 @@ def detect_coaches(
       - image_count: int            (total images in cluster)
       - single_face_count: int      (images whose total face count == 1)
       - multi_face_count: int       (images whose total face count >= 2)
-        single_face_count / multi_face_count are optional — when absent the
-        composition rule simply can't fire (back-compat with old callers/tests).
+        single_face_count / multi_face_count are optional — when absent
+        rule B simply can't fire (back-compat with old callers/tests).
 
-    A cluster is a coach if EITHER:
+    A cluster is a coach if ANY of:
       A) median(ages) >= 25 AND image_count <= max(3, session_median * 0.5)
       B) single_face_count <= 3 AND multi_face_count >= 2
+      C) image_count == 1 (singleton — Issue 5)
     """
     count_threshold = max(MIN_COUNT_FLOOR, session_median_count * COUNT_FRACTION_OF_MEDIAN)
 
@@ -81,5 +94,10 @@ def detect_coaches(
             and multi >= MIN_MULTI_FACE_FOR_COACH
         )
 
-        out[cid] = bool(rule_a or rule_b)
+        # Rule C — singleton heuristic (Issue 5). Players always get multiple
+        # shots; a 1-image cluster IS a coach in our workflow. Operator
+        # override handles the off-process kid case.
+        rule_c = count == 1
+
+        out[cid] = bool(rule_a or rule_b or rule_c)
     return out

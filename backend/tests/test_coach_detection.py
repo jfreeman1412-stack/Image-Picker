@@ -129,7 +129,84 @@ def test_both_rules_fire_independently():
 
 
 def test_composition_absent_keeps_old_behavior():
-    """Old callers that don't pass single/multi counts only get rule A."""
-    data = [{"cluster_id": 1, "ages": [], "image_count": 1}]  # no comp keys
+    """Old callers that don't pass single/multi counts only get rules A and C
+    (B can't fire without comp keys). Issue 5 turned image_count==1 into Rule C,
+    so the prior expectation flipped — a comp-less image_count=1 is now a coach
+    by Rule C alone."""
+    # image_count=2 → no rule fires; was the actual back-compat shape.
+    data = [{"cluster_id": 1, "ages": [], "image_count": 2}]  # no comp keys
     flags = detect_coaches(data, session_median_count=10)
     assert flags[1] is False
+
+
+# ── Rule C — singleton heuristic (Issue 5) ───────────────────────────────────
+#
+# In our workflow, every player gets multiple shots by procedure (an individual,
+# a team, and a pano). The only person who ever gets a single shot is a coach.
+# So a singleton cluster (image_count == 1) is presumed coach. It's effectively
+# a rule, not a probabilistic heuristic — but the operator can still override
+# via manual_coach_override=-1 for the off-process kid-arrived-late case.
+
+
+def test_singleton_flagged_as_coach():
+    """image_count == 1 → coach by Rule C (regardless of ages/composition)."""
+    data = [{"cluster_id": 1, "ages": [], "image_count": 1,
+             "single_face_count": 1, "multi_face_count": 0}]
+    flags = detect_coaches(data, session_median_count=10)
+    assert flags[1] is True
+
+
+def test_singleton_flagged_even_with_kid_age():
+    """Even a 'kid'-aged singleton trips Rule C — the operator overrides if
+    it's actually a 1-shot kid (off-process recovery hatch)."""
+    data = [{"cluster_id": 1, "ages": [11.0, 12.0], "image_count": 1,
+             "single_face_count": 1, "multi_face_count": 0}]
+    flags = detect_coaches(data, session_median_count=10)
+    assert flags[1] is True
+
+
+def test_singleton_flagged_without_comp_keys():
+    """Rule C fires on image_count==1 alone — even old callers without comp
+    keys see it."""
+    data = [{"cluster_id": 1, "ages": [], "image_count": 1}]
+    flags = detect_coaches(data, session_median_count=10)
+    assert flags[1] is True
+
+
+def test_two_image_cluster_no_rule_c():
+    """Rule C is image_count == 1 strict; a 2-image cluster needs other rules
+    to fire (Rule A age or Rule B composition)."""
+    data = [{"cluster_id": 1, "ages": [], "image_count": 2,
+             "single_face_count": 2, "multi_face_count": 0}]
+    flags = detect_coaches(data, session_median_count=10)
+    assert flags[1] is False
+
+
+def test_singleton_alongside_normal_clusters():
+    """Mixed session: 1 singleton coach + 1 normal player cluster + 1 normal
+    coach cluster. Each judged independently."""
+    data = [
+        # singleton — Rule C
+        {"cluster_id": 1, "ages": [], "image_count": 1,
+         "single_face_count": 1, "multi_face_count": 0},
+        # normal player — no rule fires
+        {"cluster_id": 2, "ages": [12.0, 12.0], "image_count": 8,
+         "single_face_count": 6, "multi_face_count": 2},
+        # normal coach by composition (Rule B)
+        {"cluster_id": 3, "ages": [], "image_count": 7,
+         "single_face_count": 2, "multi_face_count": 5},
+    ]
+    flags = detect_coaches(data, session_median_count=8)
+    assert flags == {1: True, 2: False, 3: True}
+
+
+def test_rule_c_aligns_with_issue_2_single_face_requirement():
+    """A singleton trivially has single_face_count == 1, so Rule C does not
+    conflict with Issue 2's planned 'coach requires >=1 single-face image'
+    gate. When Issue 2 lands, this expectation stays."""
+    data = [{"cluster_id": 1, "ages": [], "image_count": 1,
+             "single_face_count": 1, "multi_face_count": 0}]
+    flags = detect_coaches(data, session_median_count=10)
+    assert flags[1] is True
+    # The trivial property:
+    assert data[0]["single_face_count"] >= 1

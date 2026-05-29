@@ -134,6 +134,12 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
 
 
         # ── Step 3–4: cluster all face embeddings ────────────────────────────
+        # Issue 5: faces DBSCAN labels -1 (noise singletons) are NOT left
+        # orphan anymore. Each noise face becomes its own singleton Cluster
+        # row so the cluster grid renders a review card for them. By workflow
+        # rule (players always get multiple shots; only coaches ever get one)
+        # the singleton defaults to is_likely_coach via Rule C in
+        # coach_detection.py, applied in Step 4b.
         _set_progress(db, session, "clustering", 0, 0)
         faces = (
             db.query(Face)
@@ -150,7 +156,16 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
             label_to_cluster: dict[int, Cluster] = {}
             for face, label in zip(faces, labels):
                 if label == -1:
-                    face.cluster_id = None
+                    # Issue 5: promote noise face to its own singleton Cluster
+                    # row. One row per noise face — no shared label key.
+                    singleton = Cluster(
+                        session_id=session_id,
+                        needs_review=0,
+                        image_count=0,
+                    )
+                    db.add(singleton)
+                    db.flush()  # assign id
+                    face.cluster_id = singleton.id
                     continue
                 cluster_row = label_to_cluster.get(label)
                 if cluster_row is None:
