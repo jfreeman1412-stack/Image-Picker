@@ -325,11 +325,16 @@ body {
     max(16px, env(safe-area-inset-bottom));
 }
 
-/* Shoot picker — a centered card. */
+/* Shoot picker — a centered card. align-items:flex-start + margin:auto on the
+ * card gives vertical centering when the card fits, and falls back to top-
+ * aligned + scroll when it doesn't (e.g. many cached shoots on a short phone).
+ * Plain align-items:center would clip the top of the card with no scroll. */
 .picker-screen {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .picker-card {
@@ -337,6 +342,7 @@ body {
   flex-direction: column;
   gap: 14px;
   width: min(420px, 100%);
+  margin: auto;             /* vertical-center when there's room; collapses to 0 on overflow */
   padding: 24px;
   background: var(--bg-elev-1);
   border: 1px solid var(--border);
@@ -462,7 +468,12 @@ body {
   font-weight: 600;
 }
 
-.roster-body { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+/* min-height:0 is required so flex:1 actually constrains the body's height for
+ * overflow:auto to clip + scroll. Without it, the flex item's default
+ * min-height:auto expands to the content's intrinsic height (the full roster
+ * list), pushing past the screen's 100dvh boundary; html/body overflow:hidden
+ * then clips the bottom with no scrollbar. */
+.roster-body { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .roster-pad { padding: 20px; }
 
 .roster-list { list-style: none; margin: 0; padding: 0; }
