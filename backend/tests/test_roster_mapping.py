@@ -510,3 +510,266 @@ def test_build_lookup_from_memberships_scoped_to_job(db):
     lookup2 = build_lookup_from_memberships(db, job2.id)
     assert lookup1 == {"alice": "teama"}
     assert lookup2 == {"bob": "teamb"}
+
+
+# ── Sibling vote-summing (2026-06-01) ─────────────────────────────────────────
+#
+# Same-folder-name sessions (the line-split pattern: 4 tablets each capturing a
+# portion of one team's roster end up as separate Session rows sharing the
+# raw `session.name`) individually have too few mapped clusters for the
+# suggestion threshold. Their COMBINED tallies often clearly identify the
+# team. Sibling vote-summing falls back to the group tally when a session's
+# individual signal is None.
+#
+# Aliased siblings DO contribute votes (their cluster matches are real
+# evidence about the folder family's team — the alias only affects the
+# "already covered" output gate, not the cluster vote data).
+# Archived siblings do NOT contribute (consistent with the endpoint
+# excluding archived sessions entirely).
+
+
+def _multi_session_job(db, name, count):
+    """Stand up `count` sessions with the same folder name in one job —
+    the line-split pattern. Returns (job, [session, ...])."""
+    job = Job(name="J", root_path="/tmp", has_lines=0)
+    db.add(job); db.commit(); db.refresh(job)
+    sessions = []
+    for _ in range(count):
+        s = DbSessionModel(job_id=job.id, name=name,
+                           source_path=f"/tmp/{name}",
+                           status="done", created_at=datetime.utcnow())
+        db.add(s); db.commit(); db.refresh(s)
+        sessions.append(s)
+    return job, sessions
+
+
+def _seed_jets_roster(db, job_id, extra=()):
+    """The 2-3rd Jets roster + any extra (name, team) rows."""
+    rows = [
+        (f"Jet{i}", "Rec-Flag-2-3-Jets") for i in range(1, 8)
+    ] + list(extra)
+    _seed_memberships(db, job_id, rows)
+
+
+# Individual unchanged: strong/weak signals from the per-session path
+# behave exactly as today. The wrapper's contract is preserved.
+
+
+def test_sibling_single_session_strong_signal_unchanged(db):
+    """One session, strong individual signal — same behavior as today; the
+    sibling path never engages (no siblings)."""
+    job, (s,) = _job(db, "10U Black")
+    for name in ("Eleanor-Pederson", "June-Wampach", "Quinn-Gentz",
+                 "Magdalena-Hetland", "Nora-Snyder"):
+        _cluster(db, s, label=name)
+    _seed_memberships(db, job.id, [
+        (n, "10U-Black-Softball") for n in (
+            "Eleanor-Pederson", "June-Wampach", "Quinn-Gentz",
+            "Magdalena-Hetland", "Nora-Snyder",
+        )
+    ])
+    sug = folder_suggestions(job.id, db)["items"][0]["suggestion"]
+    assert sug is not None
+    assert sug["mapped_clusters"] == 5
+    assert sug["suggestion_source"] == "self"
+
+
+def test_sibling_single_session_below_threshold_unchanged(db):
+    """One session, below 3-mapped threshold — no suggestion; no siblings
+    to fall back on; behavior unchanged."""
+    job, (s,) = _job(db, "10U Black")
+    for n in ("A1", "A2"):
+        _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"), ("A2", "10U-Black-Softball"),
+    ])
+    assert folder_suggestions(job.id, db)["items"][0]["suggestion"] is None
+
+
+def test_sibling_two_sessions_combined_clears_threshold(db):
+    """Two sessions same folder name, individually 2 + 2 mapped, combined
+    4/4 -> strong. Sibling fallback engages for both."""
+    job, sessions = _multi_session_job(db, "2-3rd Jets", 2)
+    for s in sessions:
+        for n in ("A", "B"):
+            _cluster(db, s, label=f"{n}{s.id}")
+    rows = []
+    for s in sessions:
+        for n in ("A", "B"):
+            rows.append((f"{n}{s.id}", "Rec-Flag-2-3-Jets"))
+    _seed_memberships(db, job.id, rows)
+
+    items = folder_suggestions(job.id, db)["items"]
+    assert len(items) == 2
+    for it in items:
+        sug = it["suggestion"]
+        assert sug is not None
+        assert sug["suggested_team_name"] == "Rec-Flag-2-3-Jets"
+        assert sug["mapped_clusters"] == 4   # combined group tally
+        assert sug["winning_clusters"] == 4
+        assert sug["suggestion_source"] == "siblings"
+
+
+def test_sibling_combined_disagree_no_suggestion(db):
+    """Two sessions same folder name, combined votes split 50/50 across two
+    teams -> share < 60% threshold -> no suggestion."""
+    job, sessions = _multi_session_job(db, "ConflictFolder", 2)
+    for n in ("A1", "A2", "A3"):
+        _cluster(db, sessions[0], label=n)
+    for n in ("B1", "B2", "B3"):
+        _cluster(db, sessions[1], label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "Team-A"), ("A2", "Team-A"), ("A3", "Team-A"),
+        ("B1", "Team-B"), ("B2", "Team-B"), ("B3", "Team-B"),
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    # Each session's individual signal IS strong (3/3 = 100%), so the
+    # individual path wins — sibling fallback never engages. Same-folder-name
+    # name collision across two truly different teams produces two distinct
+    # per-session suggestions. Sibling vote-summing isn't the right tool for
+    # this pathological case; the individual-first precedence handles it.
+    assert len(items) == 2
+    for it in items:
+        sug = it["suggestion"]
+        assert sug is not None
+        assert sug["suggestion_source"] == "self"
+
+
+def test_sibling_jets_x4_real_data_pattern(db):
+    """Job 45 2-3rd Jets x4 pattern: 4 sessions, individual mapped counts
+    1+2+1+1 = 5 combined, 4 votes Jets + 1 outlier = 80% share. Each
+    session's individual signal is None (< 3 mapped); the sibling fallback
+    surfaces the strong group signal for all 4."""
+    job, sessions = _multi_session_job(db, "2-3rd Jets", 4)
+    s0, s1, s2, s3 = sessions
+    _cluster(db, s0, label="Jet1")
+    _cluster(db, s1, label="Jet2"); _cluster(db, s1, label="Jet3")
+    _cluster(db, s2, label="Jet4")
+    _cluster(db, s3, label="Outsider1")
+    _seed_jets_roster(db, job.id, extra=[
+        ("Outsider1", "Some-Other-Team"),
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    assert len(items) == 4
+    for it in items:
+        sug = it["suggestion"]
+        assert sug is not None
+        assert sug["suggested_team_name"] == "Rec-Flag-2-3-Jets"
+        assert sug["mapped_clusters"] == 5
+        assert sug["winning_clusters"] == 4
+        assert sug["confidence"] == 0.8
+        assert sug["suggestion_source"] == "siblings"
+
+
+def test_sibling_aliased_sibling_contributes_votes(db):
+    """Aliased siblings' cluster votes ARE real face-match evidence about
+    the folder family. They should contribute to the group tally even though
+    the aliased session itself is omitted from items output."""
+    job, sessions = _multi_session_job(db, "2-3rd Jets", 2)
+    aliased, unmapped = sessions
+    aliased.roster_team_alias = "Rec-Flag-2-3-Jets"
+    db.commit()
+    # Aliased session has 4 strong votes; unmapped has 1 weak vote.
+    # Aliased is "already covered" so it drops from items. But its votes
+    # combine with unmapped's to produce a sibling suggestion for unmapped.
+    for n in ("J1", "J2", "J3", "J4"):
+        _cluster(db, aliased, label=n)
+    _cluster(db, unmapped, label="J5")
+    _seed_memberships(db, job.id, [
+        (n, "Rec-Flag-2-3-Jets") for n in ("J1", "J2", "J3", "J4", "J5")
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    # Only the unmapped session in items.
+    assert len(items) == 1
+    assert items[0]["session_id"] == unmapped.id
+    sug = items[0]["suggestion"]
+    assert sug is not None
+    assert sug["suggested_team_name"] == "Rec-Flag-2-3-Jets"
+    # Combined: 4 + 1 = 5 mapped, all voting Jets.
+    assert sug["mapped_clusters"] == 5
+    assert sug["suggestion_source"] == "siblings"
+
+
+def test_sibling_archived_sibling_does_not_contribute(db):
+    """Archived sessions are excluded from the endpoint entirely. Their
+    clusters' votes should NOT contribute to sibling vote-summing — keeps
+    archived = 'don't process for any purpose' consistent."""
+    job, sessions = _multi_session_job(db, "2-3rd Jets", 2)
+    archived, unmapped = sessions
+    archived.archived = 1
+    db.commit()
+    # Archived session has 5 strong votes; unmapped has 1 weak vote.
+    # If sibling vote-summing ignored 'archived', combined would be 6 mapped
+    # -> strong. If it correctly excludes archived, only unmapped's 1 vote
+    # counts -> below the 3-mapped threshold -> no suggestion.
+    for n in ("J1", "J2", "J3", "J4", "J5"):
+        _cluster(db, archived, label=n)
+    _cluster(db, unmapped, label="J6")
+    _seed_memberships(db, job.id, [
+        (n, "Rec-Flag-2-3-Jets")
+        for n in ("J1", "J2", "J3", "J4", "J5", "J6")
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    # Only unmapped survives the archived filter; below threshold -> None.
+    assert len(items) == 1
+    assert items[0]["session_id"] == unmapped.id
+    assert items[0]["suggestion"] is None
+
+
+def test_sibling_different_folder_names_dont_combine(db):
+    """Sessions with different raw folder names must NOT have their votes
+    combined just because both are individually unmapped. Group key is raw
+    session.name; cross-name aggregation is not a thing."""
+    job = Job(name="J", root_path="/tmp", has_lines=0)
+    db.add(job); db.commit(); db.refresh(job)
+    s_a = DbSessionModel(job_id=job.id, name="Folder-A",
+                         source_path="/tmp/A", status="done",
+                         created_at=datetime.utcnow())
+    s_b = DbSessionModel(job_id=job.id, name="Folder-B",
+                         source_path="/tmp/B", status="done",
+                         created_at=datetime.utcnow())
+    db.add_all([s_a, s_b]); db.commit(); db.refresh(s_a); db.refresh(s_b)
+    # 2 clusters each, both voting Rec-Flag-2-3-Jets — 4 votes combined
+    # would clear the threshold, but they're DIFFERENT folder names.
+    for s in (s_a, s_b):
+        for n in (f"X{s.id}", f"Y{s.id}"):
+            _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        (f"X{s.id}", "Rec-Flag-2-3-Jets") for s in (s_a, s_b)
+    ] + [
+        (f"Y{s.id}", "Rec-Flag-2-3-Jets") for s in (s_a, s_b)
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    assert len(items) == 2
+    for it in items:
+        # Per-session is 2 mapped -> below threshold; no siblings to combine
+        # with (different folder names) -> no suggestion.
+        assert it["suggestion"] is None
+
+
+def test_sibling_idempotency_aliased_session_excluded(db):
+    """Re-confirms that aliased sessions stay excluded from items output
+    even when sibling vote-summing is in play. Locks idempotency on top of
+    the existing α behavior."""
+    job, sessions = _multi_session_job(db, "2-3rd Jets", 3)
+    sessions[0].roster_team_alias = "Rec-Flag-2-3-Jets"  # already covered
+    db.commit()
+    for s in sessions:
+        for n in ("J", "K"):
+            _cluster(db, s, label=f"{n}{s.id}")
+    _seed_memberships(db, job.id, [
+        (f"J{s.id}", "Rec-Flag-2-3-Jets") for s in sessions
+    ] + [
+        (f"K{s.id}", "Rec-Flag-2-3-Jets") for s in sessions
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    returned_ids = {it["session_id"] for it in items}
+    assert sessions[0].id not in returned_ids  # aliased -> excluded
+    assert sessions[1].id in returned_ids
+    assert sessions[2].id in returned_ids
+    # Both unmapped siblings get the sibling-summed suggestion. Group tally
+    # includes the aliased session's votes (4) + each of the 2 unmapped (2
+    # each) -> 8 mapped, all voting Jets -> 100% suggestion.
+    for it in items:
+        assert it["suggestion"]["suggested_team_name"] == "Rec-Flag-2-3-Jets"
+        assert it["suggestion"]["suggestion_source"] == "siblings"

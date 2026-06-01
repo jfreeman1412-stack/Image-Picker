@@ -231,16 +231,18 @@ def list_mismatches(job_id: int, db: DbSession = Depends(get_db)):
 # ── Phase 6.1: folder ↔ CSV-team suggestions ────────────────────────────────
 
 
-def _suggest_alias_for_session(
-    session: Session, lookup: dict[str, str], raw_team_by_norm: dict[str, str],
-) -> dict | None:
-    """Vote-tally suggestion for a session whose folder doesn't match any
-    roster team. For each cluster, look up its auto_label in the roster
-    and tally the CSV team it maps to. If one team wins ≥60% of mapped
-    clusters AND there are ≥3 mapped clusters, return a suggestion dict.
+_MIN_MAPPED = 3
+_MIN_SHARE = 0.6
 
-    Returns None when the signal isn't strong enough (no mapped clusters,
-    tied vote, weak majority). The user maps manually in that case.
+
+def _tally_votes(
+    session: Session, lookup: dict[str, str],
+) -> tuple[dict[str, int], int, int]:
+    """Pure vote-tally over a session's clusters. Returns (votes, mapped, total).
+
+    Extracted from `_suggest_alias_for_session` so sibling vote-summing can
+    reuse the per-session tally without re-iterating clusters. Same multi-team
+    abstain (lookup.get(norm) == None → skip) as before.
     """
     votes: dict[str, int] = {}
     total = 0
@@ -255,12 +257,26 @@ def _suggest_alias_for_session(
         if expected is None:
             continue  # unknown name OR ambiguous (dup) — abstain
         votes[expected] = votes.get(expected, 0) + 1
-    mapped = sum(votes.values())
-    if mapped < 3:
+    return votes, sum(votes.values()), total
+
+
+def _format_suggestion(
+    votes: dict[str, int], mapped: int, total: int,
+    raw_team_by_norm: dict[str, str], *, source: str = "self",
+) -> dict | None:
+    """Apply the ≥3 mapped + ≥60% share thresholds and format the suggestion
+    dict. Returns None when the signal isn't strong enough.
+
+    `source` is informational: "self" for per-session signal, "siblings" for
+    a group-level signal aggregated from same-folder-name sessions in the
+    job. FE may ignore the field; existing UI consumes only suggested_team_name
+    + mapped_clusters + winning_clusters.
+    """
+    if mapped < _MIN_MAPPED:
         return None
     winner, win_count = max(votes.items(), key=lambda kv: kv[1])
     share = win_count / mapped
-    if share < 0.6:
+    if share < _MIN_SHARE:
         return None
     return {
         "suggested_team_name": raw_team_by_norm.get(winner, winner),
@@ -269,7 +285,18 @@ def _suggest_alias_for_session(
         "winning_clusters": win_count,
         "mapped_clusters": mapped,
         "total_clusters": total,
+        "suggestion_source": source,
     }
+
+
+def _suggest_alias_for_session(
+    session: Session, lookup: dict[str, str], raw_team_by_norm: dict[str, str],
+) -> dict | None:
+    """Vote-tally suggestion for a single session. Thin wrapper around the
+    pure helpers — preserves the public signature so existing callers and
+    tests are unaffected by the sibling-aggregation refactor."""
+    votes, mapped, total = _tally_votes(session, lookup)
+    return _format_suggestion(votes, mapped, total, raw_team_by_norm)
 
 
 @router.get("/{job_id}/roster-folder-suggestions")
@@ -306,14 +333,49 @@ def folder_suggestions(job_id: int, db: DbSession = Depends(get_db)):
     available = sorted(raw_team_by_norm.values())
     roster_norms = set(raw_team_by_norm.keys())
 
+    # Sibling vote-summing: line-split sessions share a raw folder name and
+    # individually have too few mapped clusters for the threshold. Their
+    # combined tallies often cleanly identify the team. Aliased siblings
+    # DO contribute votes (their cluster matches are real evidence about
+    # the folder family's team — the alias only affects the "already
+    # covered" output gate). Archived sessions don't contribute, consistent
+    # with the endpoint excluding them from work entirely.
+    sessions_active = [
+        s for s in db.query(Session).filter_by(job_id=job_id).all()
+        if not s.archived
+    ]
+    per_session_tally: dict[int, tuple[dict[str, int], int, int]] = {
+        s.id: _tally_votes(s, lookup) for s in sessions_active
+    }
+    group_votes: dict[str, dict[str, int]] = {}
+    group_mapped: dict[str, int] = {}
+    group_total: dict[str, int] = {}
+    sibling_count: dict[str, int] = {}
+    for s in sessions_active:
+        v, m, t = per_session_tally[s.id]
+        g = group_votes.setdefault(s.name, {})
+        for team, c in v.items():
+            g[team] = g.get(team, 0) + c
+        group_mapped[s.name] = group_mapped.get(s.name, 0) + m
+        group_total[s.name] = group_total.get(s.name, 0) + t
+        sibling_count[s.name] = sibling_count.get(s.name, 0) + 1
+
     items = []
-    for s in db.query(Session).filter_by(job_id=job_id).all():
-        if s.archived:
-            continue
+    for s in sessions_active:
         effective = session_norm_team(s)  # honors existing alias
         if effective in roster_norms:
             continue  # already covered (by folder name OR existing alias)
-        suggestion = _suggest_alias_for_session(s, lookup, raw_team_by_norm)
+        v, m, t = per_session_tally[s.id]
+        suggestion = _format_suggestion(v, m, t, raw_team_by_norm, source="self")
+        if suggestion is None and sibling_count[s.name] > 1:
+            # Sibling fallback — combine same-folder-name siblings' votes.
+            suggestion = _format_suggestion(
+                group_votes[s.name],
+                group_mapped[s.name],
+                group_total[s.name],
+                raw_team_by_norm,
+                source="siblings",
+            )
         items.append({
             "session_id": s.id,
             "session_name": s.name,
