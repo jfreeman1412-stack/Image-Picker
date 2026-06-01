@@ -19,7 +19,7 @@ from typing import Iterable
 
 from sqlalchemy.orm import Session as DbSession
 
-from app.models.db_models import RosterEntry
+from app.models.db_models import Player, PlayerMembership, RosterEntry
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,53 @@ def build_lookup(db: DbSession, job_id: int) -> dict[str, str]:
         for nn, teams in teams_by_name.items()
         if len(teams) == 1
     }
+
+
+def build_lookup_from_memberships(db: DbSession, job_id: int) -> dict[str, str]:
+    """PlayerMembership/Player equivalent of `build_lookup`, used as Option α's
+    fallback when RosterEntry is empty for a job.
+
+    Same {norm_name: norm_team} shape, same multi-team abstain rule. The join
+    is Player.norm_name + PlayerMembership.norm_team because Phase A.1 split
+    the player identity (global) from the per-shoot team binding.
+
+    PlayerMembership is the canonical roster source on modern jobs — the
+    capture-app upload, the Player Roster desktop button, and the mapped
+    upload all write only PlayerMembership. RosterEntry is a vestigial
+    Phase 6 table kept readable for back-compat; the Cross-check Roster
+    upload still writes to it. See `match-team-alias-issue` memory for the
+    planned Option γ retirement of RosterEntry.
+    """
+    teams_by_name: dict[str, set[str]] = {}
+    rows = (
+        db.query(Player.norm_name, PlayerMembership.norm_team)
+        .join(PlayerMembership, PlayerMembership.player_id == Player.id)
+        .filter(PlayerMembership.job_id == job_id)
+        .all()
+    )
+    for nn, nt in rows:
+        teams_by_name.setdefault(nn, set()).add(nt)
+    return {
+        nn: next(iter(teams))
+        for nn, teams in teams_by_name.items()
+        if len(teams) == 1
+    }
+
+
+def membership_raw_team_by_norm(db: DbSession, job_id: int) -> dict[str, str]:
+    """PlayerMembership equivalent of the `raw_team_by_norm` map
+    folder_suggestions builds from RosterEntry. Maps `norm_team` to the
+    first-seen raw `team_name` so the suggestion endpoint can echo a
+    customer-facing string. First-write-wins matches the RosterEntry-side
+    `setdefault` pattern."""
+    raw_team_by_norm: dict[str, str] = {}
+    for tn, nt in (
+        db.query(PlayerMembership.team_name, PlayerMembership.norm_team)
+        .filter_by(job_id=job_id)
+        .all()
+    ):
+        raw_team_by_norm.setdefault(nt, tn)
+    return raw_team_by_norm
 
 
 def get_duplicate_names(db: DbSession, job_id: int) -> list[str]:

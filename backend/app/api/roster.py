@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session as DbSession
 from app.db import get_db
 from app.models.db_models import Cluster, Face, Job, RosterEntry, Session
 from app.services.roster import (
-    CsvParseError, build_lookup, decode_bytes, get_duplicate_names,
-    normalize_name, parse_csv, replace_job_roster,
+    CsvParseError, build_lookup, build_lookup_from_memberships, decode_bytes,
+    get_duplicate_names, membership_raw_team_by_norm, normalize_name, parse_csv,
+    replace_job_roster,
 )
 from app.services.roster_check import cluster_is_mismatched, session_norm_team
 
@@ -283,15 +284,24 @@ def folder_suggestions(job_id: int, db: DbSession = Depends(get_db)):
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    lookup = build_lookup(db, job_id)
-    if not lookup:
-        return {"items": [], "available_teams": []}
 
-    raw_team_by_norm: dict[str, str] = {}
-    for r in db.query(RosterEntry.team_name, RosterEntry.norm_team).filter_by(
-        job_id=job_id,
-    ).all():
-        raw_team_by_norm.setdefault(r.norm_team, r.team_name)
+    # Option α: prefer RosterEntry when present (Phase 6 back-compat),
+    # otherwise fall back to PlayerMembership — the canonical roster source
+    # on modern jobs (capture-app + Player Roster desktop upload both write
+    # only PlayerMembership). When both tables are empty, return cleanly
+    # empty so the UI's "no roster" state is preserved.
+    lookup = build_lookup(db, job_id)
+    if lookup:
+        raw_team_by_norm: dict[str, str] = {}
+        for r in db.query(RosterEntry.team_name, RosterEntry.norm_team).filter_by(
+            job_id=job_id,
+        ).all():
+            raw_team_by_norm.setdefault(r.norm_team, r.team_name)
+    else:
+        lookup = build_lookup_from_memberships(db, job_id)
+        if not lookup:
+            return {"items": [], "available_teams": []}
+        raw_team_by_norm = membership_raw_team_by_norm(db, job_id)
 
     available = sorted(raw_team_by_norm.values())
     roster_norms = set(raw_team_by_norm.keys())

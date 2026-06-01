@@ -15,7 +15,17 @@ export default function JobDetail() {
   const [exporting, setExporting] = useState(false);
   const [showRoster, setShowRoster] = useState(false);
   const [showPlayerRoster, setShowPlayerRoster] = useState(false);
-  const [rosterSummary, setRosterSummary] = useState(null); // {entries_loaded, mismatch_count}
+  // {entries_loaded, mismatch_count, suggestions_count}
+  //   entries_loaded     — Phase 6 RosterEntry row count (vestigial — see
+  //                        memory: match-team-alias-issue)
+  //   mismatch_count     — Phase 6 cross-check (RosterEntry-driven)
+  //   suggestions_count  — Option α: sessions needing folder→team mapping,
+  //                        sourced from /roster-folder-suggestions which
+  //                        now reads PlayerMembership when RosterEntry is
+  //                        empty. The button label surfaces this count when
+  //                        RosterEntry is empty so PlayerMembership-only
+  //                        jobs (the modern default) get an actionable hint.
+  const [rosterSummary, setRosterSummary] = useState(null);
   const [running, setRunning] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [toast, setToast] = useState(null);
@@ -34,14 +44,21 @@ export default function JobDetail() {
   // break the page — degrade silently.
   const loadRosterSummary = async () => {
     try {
-      const r1 = await fetch(`/api/jobs/${id}/roster`);
-      const r2 = await fetch(`/api/jobs/${id}/roster-mismatches`);
+      const [r1, r2, r3] = await Promise.all([
+        fetch(`/api/jobs/${id}/roster`),
+        fetch(`/api/jobs/${id}/roster-mismatches`),
+        fetch(`/api/jobs/${id}/roster-folder-suggestions`),
+      ]);
       if (!r1.ok || !r2.ok) return;
       const rj = await r1.json();
       const mj = await r2.json();
+      // Option α: suggestions_count is best-effort. A failed fetch leaves
+      // the field 0 so the button just shows the existing labels.
+      const sj = r3.ok ? await r3.json() : { items: [] };
       setRosterSummary({
         entries_loaded: rj.entries_loaded || 0,
         mismatch_count: (mj.items || []).length,
+        suggestions_count: (sj.items || []).length,
       });
     } catch { /* leave summary null — button just shows generic label */ }
   };
@@ -166,11 +183,19 @@ export default function JobDetail() {
           </button>
           <button
             onClick={() => setShowRoster(true)}
-            title="Cross-check roster: flags wrong-team photos after the pipeline runs (separate from the Player roster)"
+            title="Cross-check roster: flags wrong-team photos and surfaces folder→team mapping suggestions"
           >
+            {/* Label precedence:
+                  (1) Phase 6 cross-check is loaded → show its mismatch count
+                  (2) Else if Option α suggestions exist (modern jobs with
+                      only PlayerMembership) → show the "N teams need mapping"
+                      hint so the operator opens the modal and resolves them
+                  (3) Else generic "Roster cross-check" label */}
             {rosterSummary?.entries_loaded > 0
               ? `Cross-check · ${rosterSummary.mismatch_count} mismatch${rosterSummary.mismatch_count === 1 ? '' : 'es'}`
-              : 'Roster cross-check'}
+              : rosterSummary?.suggestions_count > 0
+                ? `${rosterSummary.suggestions_count} team${rosterSummary.suggestions_count === 1 ? '' : 's'} need mapping`
+                : 'Roster cross-check'}
           </button>
           <button
             onClick={() => setShowPlayerRoster(true)}

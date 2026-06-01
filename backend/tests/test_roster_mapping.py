@@ -7,6 +7,11 @@ differently from the CSV team column (e.g. folder '10U Black' vs CSV
 content (how many copyright-derived auto_labels in the folder map to a
 given CSV team) and lets the user accept/override it. Aliases are
 per-session and survive roster re-uploads.
+
+Option α (2026-06-01): folder_suggestions falls back on PlayerMembership when
+RosterEntry is empty. On modern jobs the Player roster (capture-app or desktop
+upload) writes only PlayerMembership; RosterEntry is vestigial Phase 6.
+See memory: match-team-alias-issue.
 """
 from datetime import datetime
 
@@ -21,6 +26,7 @@ from app.db import Base
 from app.models.db_models import (
     Cluster, Job, Session as DbSessionModel,
 )
+from app.services.players import replace_shoot_memberships
 from app.services.roster import replace_job_roster
 from app.services.roster_check import session_norm_team
 
@@ -284,3 +290,223 @@ def test_suggestion_skips_archived_session(db):
     ])
     db.commit()
     assert folder_suggestions(job.id, db)["items"] == []
+
+
+# ── Option α: PlayerMembership fallback (the modern uploads' canonical table) ─
+#
+# Modern jobs upload via the capture app or the Player Roster desktop button —
+# both write to PlayerMembership only (never RosterEntry). The Phase 6
+# suggestion endpoint was reading only from RosterEntry and silently no-op'd
+# for these jobs. Option α reads PlayerMembership as a fallback so the
+# existing UI works without operators needing a separate Cross-check upload.
+
+
+def _seed_memberships(db, job_id, rows):
+    """Shortcut: stand up PlayerMembership rows via the production code path
+    so we exercise the same upsert + normalize logic the live API uses.
+    `rows` = [(raw_name, team_name), ...]."""
+    summary = replace_shoot_memberships(db, job_id, rows)
+    db.commit()
+    return summary
+
+
+def test_membership_fallback_strong_vote_returned(db):
+    """When RosterEntry is empty but PlayerMembership has data, the same
+    vote-tally algorithm produces a suggestion. Mirrors the
+    test_suggestion_strong_vote_returned shape, just via memberships."""
+    job, (s,) = _job(db, "10U Black")
+    for name in ("Eleanor-Pederson", "June-Wampach", "Quinn-Gentz",
+                 "Magdalena-Hetland", "Nora-Snyder"):
+        _cluster(db, s, label=name)
+    _seed_memberships(db, job.id, [
+        ("Eleanor-Pederson", "10U-Black-Softball"),
+        ("June-Wampach",     "10U-Black-Softball"),
+        ("Quinn-Gentz",      "10U-Black-Softball"),
+        ("Magdalena-Hetland","10U-Black-Softball"),
+        ("Nora-Snyder",      "10U-Black-Softball"),
+    ])
+
+    items = folder_suggestions(job.id, db)["items"]
+    assert len(items) == 1
+    sug = items[0]["suggestion"]
+    assert sug is not None
+    assert sug["suggested_team_name"] == "10U-Black-Softball"
+    assert sug["mapped_clusters"] == 5
+    assert sug["winning_clusters"] == 5
+    assert sug["confidence"] == 1.0
+
+
+def test_membership_fallback_available_teams_sorted(db):
+    """available_teams populated from PlayerMembership raw team names, sorted
+    case-insensitively to mirror the RosterEntry-side behavior."""
+    job, (s,) = _job(db, "10U Black")
+    _seed_memberships(db, job.id, [
+        ("P1", "Iron-Pigs"),
+        ("P2", "Sky-Carp"),
+        ("P3", "Hot-Rods"),
+    ])
+    teams = folder_suggestions(job.id, db)["available_teams"]
+    assert teams == ["Hot-Rods", "Iron-Pigs", "Sky-Carp"]
+
+
+def test_membership_fallback_multi_team_player_abstains(db):
+    """Same abstain rule as build_lookup: a player on >1 team in this job
+    contributes 0 votes (their name is omitted from the lookup). Mirrors
+    Phase 6's `duplicate_names` semantics."""
+    job, (s,) = _job(db, "10U Black")
+    for n in ("A1", "A2", "A3", "DupKid"):
+        _cluster(db, s, label=n)
+    # DupKid is on two teams → her name is excluded from the lookup → her
+    # cluster doesn't vote. The other 3 clusters all point to Black, which
+    # still hits the >=3 mapped + >=60% threshold.
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"),
+        ("A2", "10U-Black-Softball"),
+        ("A3", "10U-Black-Softball"),
+        ("DupKid", "10U-Black-Softball"),
+        ("DupKid", "12UAA-Baseball"),
+    ])
+    sug = folder_suggestions(job.id, db)["items"][0]["suggestion"]
+    assert sug is not None
+    assert sug["winning_clusters"] == 3
+    assert sug["mapped_clusters"] == 3   # DupKid did NOT contribute a vote
+
+
+def test_membership_fallback_skips_session_already_aliased(db):
+    """Same idempotency as the RosterEntry path: once aliased and resolving
+    to a roster team, the session drops out of items entirely."""
+    job, (s,) = _job(db, "10U Black")
+    s.roster_team_alias = "10U-Black-Softball"
+    for n in ("A1", "A2", "A3"):
+        _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"),
+        ("A2", "10U-Black-Softball"),
+        ("A3", "10U-Black-Softball"),
+    ])
+    assert folder_suggestions(job.id, db)["items"] == []
+
+
+def test_membership_fallback_skips_archived_session(db):
+    """Archived sessions are excluded from suggestions regardless of source."""
+    job, (s,) = _job(db, "10U Black")
+    s.archived = 1
+    for n in ("A1", "A2", "A3"):
+        _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"),
+        ("A2", "10U-Black-Softball"),
+        ("A3", "10U-Black-Softball"),
+    ])
+    assert folder_suggestions(job.id, db)["items"] == []
+
+
+def test_membership_fallback_session_folder_matches_a_membership_team(db):
+    """The 'already-covered' check honors PlayerMembership norm_teams too:
+    a folder whose normalized name matches any membership team is omitted."""
+    job, (s,) = _job(db, "10U-Black-Softball")
+    for n in ("A1", "A2", "A3"):
+        _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"),
+        ("A2", "10U-Black-Softball"),
+        ("A3", "10U-Black-Softball"),
+    ])
+    assert folder_suggestions(job.id, db)["items"] == []
+
+
+def test_roster_entry_wins_when_both_tables_populated(db):
+    """Back-compat: if a job somehow has both RosterEntry rows AND
+    PlayerMembership rows, RosterEntry is read (no fallback). Lets older
+    jobs that uploaded the Phase 6 cross-check CSV keep working unchanged
+    even after Option α ships."""
+    job, (s,) = _job(db, "10U Black")
+    for n in ("A1", "A2", "A3"):
+        _cluster(db, s, label=n)
+    # RosterEntry says Team-X for these names …
+    replace_job_roster(db, job.id, [
+        ("A1", "Team-X"),
+        ("A2", "Team-X"),
+        ("A3", "Team-X"),
+    ])
+    # … but PlayerMembership has a different mapping. RosterEntry should win.
+    _seed_memberships(db, job.id, [
+        ("A1", "Team-Y"),
+        ("A2", "Team-Y"),
+        ("A3", "Team-Y"),
+    ])
+    sug = folder_suggestions(job.id, db)["items"][0]["suggestion"]
+    assert sug is not None
+    assert sug["suggested_team_name"] == "Team-X"
+
+
+def test_membership_fallback_below_min_clusters_no_signal(db):
+    """The same min-mapped=3 / min-share=0.6 thresholds apply via fallback."""
+    job, (s,) = _job(db, "10U Black")
+    for n in ("A1", "A2"):
+        _cluster(db, s, label=n)
+    _seed_memberships(db, job.id, [
+        ("A1", "10U-Black-Softball"),
+        ("A2", "10U-Black-Softball"),
+    ])
+    items = folder_suggestions(job.id, db)["items"]
+    assert items[0]["suggestion"] is None  # listed (needs mapping) but no auto-suggestion
+
+
+def test_empty_remains_empty_when_neither_table_has_data(db):
+    """Existing baseline: jobs with neither RosterEntry nor PlayerMembership
+    return cleanly empty. Pre-Option-α behavior preserved."""
+    job, (s,) = _job(db, "10U Black")
+    _cluster(db, s, label="A1")
+    db.commit()
+    assert folder_suggestions(job.id, db) == {"items": [], "available_teams": []}
+
+
+# ── Option α: build_lookup_from_memberships unit tests ───────────────────────
+
+
+def test_build_lookup_from_memberships_empty_job(db):
+    from app.services.roster import build_lookup_from_memberships
+    job, _ = _job(db, "10U Black")
+    assert build_lookup_from_memberships(db, job.id) == {}
+
+
+def test_build_lookup_from_memberships_single_team_player(db):
+    from app.services.roster import build_lookup_from_memberships
+    job, _ = _job(db, "10U Black")
+    _seed_memberships(db, job.id, [
+        ("Eleanor-Pederson", "10U-Black-Softball"),
+    ])
+    lookup = build_lookup_from_memberships(db, job.id)
+    # normalize_name('Eleanor-Pederson') = 'eleanorpederson'
+    assert lookup == {"eleanorpederson": "10ublacksoftball"}
+
+
+def test_build_lookup_from_memberships_multi_team_player_omitted(db):
+    """Same abstain rule as services.roster.build_lookup. A player who
+    appears on >1 team is omitted entirely, so callers' .get() returns None
+    for both unknown AND ambiguous names."""
+    from app.services.roster import build_lookup_from_memberships
+    job, _ = _job(db, "10U Black")
+    _seed_memberships(db, job.id, [
+        ("Eleanor-Pederson", "10U-Black-Softball"),
+        ("DupKid", "10U-Black-Softball"),
+        ("DupKid", "12UAA-Baseball"),
+    ])
+    lookup = build_lookup_from_memberships(db, job.id)
+    assert "eleanorpederson" in lookup
+    assert "dupkid" not in lookup
+
+
+def test_build_lookup_from_memberships_scoped_to_job(db):
+    """Memberships from other jobs do not leak into this job's lookup."""
+    from app.services.roster import build_lookup_from_memberships
+    job1, _ = _job(db, "10U Black")
+    job2 = Job(name="J2", root_path="/tmp/j2", has_lines=0)
+    db.add(job2); db.commit(); db.refresh(job2)
+    _seed_memberships(db, job1.id, [("Alice", "Team-A")])
+    _seed_memberships(db, job2.id, [("Bob", "Team-B")])
+    lookup1 = build_lookup_from_memberships(db, job1.id)
+    lookup2 = build_lookup_from_memberships(db, job2.id)
+    assert lookup1 == {"alice": "teama"}
+    assert lookup2 == {"bob": "teamb"}
