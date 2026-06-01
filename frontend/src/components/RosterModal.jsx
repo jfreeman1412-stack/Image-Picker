@@ -297,7 +297,14 @@ export default function RosterModal({ job, onClose, onChanged }) {
         )}
 
         {/* ── Map team folders ───────────────────────────────────────── */}
-        {hasRoster && suggestions.items.length > 0 && (
+        {/* Option α.1: removed `hasRoster &&` guard. The section's data
+            (suggestions + available_teams) comes from /roster-folder-
+            suggestions which under Option α falls back to PlayerMembership
+            when RosterEntry is empty. The old guard was a false coupling
+            to the Phase 6 cross-check upload — hid the section on every
+            modern (PlayerMembership-only) job, including job 45. See
+            memory: match-team-alias-issue. */}
+        {suggestions.items.length > 0 && (
           <section style={{ marginBottom: 16 }}>
             <h3 style={{ marginBottom: 8 }}>
               Map team folders ({suggestions.items.length})
