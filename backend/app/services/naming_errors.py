@@ -16,12 +16,26 @@ clustering itself. Within-session duplicates are handled separately by the
 `duplicate_auto_label` flag (Phase 9); this is strictly cross-session.
 
 Read-time only — computes on request, persists nothing.
+
+Category 3 noise filter (2026-06-02): the same_face verdict was firing on
+every cross-team guest appearance (a kid posing in a friend's buddy photo
+on a different team). Under the refined rule, only flag when the case is
+actionable:
+  - Coach clusters (resolved via is_coach_for_sort() so operator overrides
+    are honored) are exempt entirely — coaches legitimately span teams.
+  - For non-coach groups, drop sessions whose cluster has no individual
+    photo of the player (face_count == 1 image), then re-check the
+    >= 2-session cross-team requirement. If <2 sessions still carry
+    portraits, suppress the flag.
+Category 1 (different_face) and the unknown verdict are unchanged — they're
+real labeling errors regardless of role or photo composition.
 """
 from __future__ import annotations
 
 import numpy as np
+from sqlalchemy import func
 
-from app.models.db_models import Cluster, Face, Session
+from app.models.db_models import Cluster, Face, Image, Session
 from app.services.cluster import DEFAULT_EPS
 from app.services.roster import build_lookup, normalize_name
 from app.services.roster_check import session_norm_team
@@ -53,6 +67,35 @@ def _cluster_centroid_from_db(db, cluster_id: int) -> np.ndarray | None:
     return cluster_centroid(embs)
 
 
+def _job_image_face_counts(db, job_id: int) -> dict[int, int]:
+    """For every image in this job's non-archived sessions, return the
+    total face count (independent of which cluster each face belongs to).
+    One grouped query — used by the Category 3 filter to identify which
+    clusters have at least one individual photo of the player."""
+    rows = (
+        db.query(Face.image_id, func.count(Face.id))
+        .join(Image, Image.id == Face.image_id)
+        .join(Session, Session.id == Image.session_id)
+        .filter(Session.job_id == job_id, Session.archived == 0)
+        .group_by(Face.image_id)
+        .all()
+    )
+    return dict(rows)
+
+
+def _cluster_has_individual_photo(
+    db, cluster_id: int, image_face_counts: dict[int, int],
+) -> bool:
+    """True iff this cluster has at least one image whose total face count
+    is exactly 1 (an individual photo of the player). Buddy-only clusters
+    return False — they're the guest-appearance case the Category 3 filter
+    suppresses."""
+    img_ids = {
+        r[0] for r in db.query(Face.image_id).filter_by(cluster_id=cluster_id).all()
+    }
+    return any(image_face_counts.get(iid, 0) == 1 for iid in img_ids)
+
+
 def find_cross_team_name_collisions(db, job_id: int) -> list[dict]:
     """Return one row per player name that appears as clusters in 2+ distinct
     non-archived sessions of this job, with a same_face/different_face
@@ -75,6 +118,11 @@ def find_cross_team_name_collisions(db, job_id: int) -> list[dict]:
         raw_team_by_norm.setdefault(nt, tn)
 
     sess_by_id = {s.id: s for s in sessions}
+
+    # Pre-compute image-level face counts once for the whole job — used by
+    # the Category 3 filter to identify clusters with at least one
+    # individual photo of the player. Single grouped query.
+    face_counts_by_image_cache = _job_image_face_counts(db, job_id)
 
     # Group clusters (with a real auto_label) by normalized name.
     groups: dict[str, list[Cluster]] = {}
@@ -120,6 +168,26 @@ def find_cross_team_name_collisions(db, job_id: int) -> list[dict]:
             # operator can eyeball it.
             max_d = min_d = None
             verdict = "unknown"
+
+        # Category 3 filter — applies only to same_face verdicts. Cat 1 and
+        # unknown emit unchanged.
+        if verdict == "same_face":
+            # Coach exemption: any coach in the group means the whole flag
+            # is dropped (coaches legitimately span teams). Resolved via
+            # is_coach_for_sort() so manual_coach_override is honored.
+            if any(c.is_coach_for_sort() for c in clusters):
+                continue
+            # Buddy-only suppression: filter the cluster list to clusters
+            # that have at least one individual photo of the player. If
+            # fewer than 2 distinct sessions remain, suppress entirely.
+            face_counts_by_image = face_counts_by_image_cache
+            kept = [
+                c for c in clusters
+                if _cluster_has_individual_photo(db, c.id, face_counts_by_image)
+            ]
+            if len({c.session_id for c in kept}) < 2:
+                continue
+            clusters = kept   # rewrite the working set for downstream rendering
 
         expected_norm_team = lookup.get(norm)
         expected_raw_team = raw_team_by_norm.get(expected_norm_team) if expected_norm_team else None

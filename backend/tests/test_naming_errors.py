@@ -196,3 +196,165 @@ def test_different_face_sorts_before_same_face(db):
     _cluster(db, b, "Zed-Diff", _basis_vec(3))
     items = find_cross_team_name_collisions(db, a.job_id)
     assert [it["verdict"] for it in items] == ["different_face", "same_face"]
+
+
+# ── Category 3 filter (2026-06-02) ────────────────────────────────────────────
+#
+# The same_face verdict was firing on every cross-team guest appearance —
+# kids posing in friends' buddy photos on a different team got their cluster
+# auto-labeled and surfaced as a "same face in two folders" flag, when really
+# they're expected behavior. New rule:
+#   - Coach clusters (is_coach_for_sort()) are exempted entirely from
+#     Category 3 — coaches legitimately span multiple teams.
+#   - For non-coach groups: drop sessions whose cluster has no individual
+#     photo of the player (face_count == 1 image). Re-check the ≥2-session
+#     cross-team requirement on what remains. If <2 sessions still have
+#     portraits, suppress the flag.
+# Category 1 (different_face) and the unknown verdict are unchanged — those
+# are always flagged regardless of role / photo composition.
+
+
+def _cluster_buddy_only(db, session, label, vec, n=2):
+    """Cluster that appears ONLY in multi-face images — the guest-appearance
+    pattern. Each image gets one face from this cluster plus a phantom face
+    (cluster_id=None) so the image-level face count is 2."""
+    c = Cluster(session_id=session.id, auto_label=label, image_count=n)
+    db.add(c); db.commit(); db.refresh(c)
+    for i in range(n):
+        img = Image(session_id=session.id, path=f"/tmp/{c.id}_{i}.png",
+                    filename=f"{c.id}_{i}.png")
+        db.add(img); db.commit(); db.refresh(img)
+        db.add(Face(image_id=img.id, cluster_id=c.id, bbox="[0,0,1,1]",
+                    det_score=0.9, embedding=_emb_bytes(vec)))
+        db.add(Face(image_id=img.id, cluster_id=None, bbox="[1,0,1,1]",
+                    det_score=0.9, embedding=_emb_bytes(_basis_vec(99))))
+    db.commit(); db.refresh(c)
+    return c
+
+
+def test_cat3_both_solo_still_flags(db):
+    """Baseline: both clusters have only individual photos → same_face flag
+    fires (this is the actual cross-team mis-foldered case the flag was
+    designed for)."""
+    _, (a, b) = _job(db, "T1", "T2")
+    _cluster(db, a, "Jack", _basis_vec(0))
+    _cluster(db, b, "Jack", _basis_vec(0))
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert len(items) == 1
+    assert items[0]["verdict"] == "same_face"
+
+
+def test_cat3_one_buddy_only_suppressed(db):
+    """One folder has solo photos, the other only buddy photos → suppressed.
+    The buddy-only folder is a guest appearance (kid posing with a friend on
+    the other team); flagging this as a duplicate is noise, not signal."""
+    _, (a, b) = _job(db, "T1", "T2")
+    _cluster(db, a, "Jack", _basis_vec(0))                    # 3 solo
+    _cluster_buddy_only(db, b, "Jack", _basis_vec(0), n=2)    # buddy only
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert items == []
+
+
+def test_cat3_both_buddy_only_suppressed(db):
+    """Both folders are guest-only — fully suppressed."""
+    _, (a, b) = _job(db, "T1", "T2")
+    _cluster_buddy_only(db, a, "Jack", _basis_vec(0), n=2)
+    _cluster_buddy_only(db, b, "Jack", _basis_vec(0), n=2)
+    assert find_cross_team_name_collisions(db, a.job_id) == []
+
+
+def test_cat3_coach_cluster_exempted(db):
+    """is_likely_coach=1 on any cluster in the group exempts the entire
+    same_face flag — coaches legitimately appear across teams."""
+    _, (a, b) = _job(db, "T1", "T2")
+    c_a = _cluster(db, a, "Coach-Smith", _basis_vec(0))
+    c_b = _cluster(db, b, "Coach-Smith", _basis_vec(0))
+    c_a.is_likely_coach = 1
+    db.commit()
+    assert find_cross_team_name_collisions(db, a.job_id) == []
+
+
+def test_cat3_coach_manually_demoted_falls_through_to_buddy_filter(db):
+    """Operator override scenario: is_likely_coach=1 but
+    manual_coach_override=-1 (force player). is_coach_for_sort() returns
+    False — the cluster is treated as a player, so the coach exemption does
+    NOT apply. Cat 3's buddy-only filter then evaluates normally."""
+    _, (a, b) = _job(db, "T1", "T2")
+    c_a = _cluster(db, a, "John-Doe", _basis_vec(0))
+    c_b = _cluster(db, b, "John-Doe", _basis_vec(0))
+    c_a.is_likely_coach = 1
+    c_a.manual_coach_override = -1   # force player
+    db.commit()
+    # Both have solo photos → flag fires (no coach exemption, no buddy
+    # suppression).
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert len(items) == 1
+    assert items[0]["verdict"] == "same_face"
+
+
+def test_cat3_player_manually_promoted_to_coach_exempted(db):
+    """Inverse: is_likely_coach=0 but manual_coach_override=1 (force coach).
+    is_coach_for_sort() returns True → coach exemption applies → suppressed."""
+    _, (a, b) = _job(db, "T1", "T2")
+    c_a = _cluster(db, a, "Force-Coach", _basis_vec(0))
+    c_b = _cluster(db, b, "Force-Coach", _basis_vec(0))
+    c_a.manual_coach_override = 1   # force coach
+    db.commit()
+    assert find_cross_team_name_collisions(db, a.job_id) == []
+
+
+def test_cat1_different_face_fires_for_coaches_too(db):
+    """Cat 1 (different_face) is always flagged — coaches included. A
+    different kid mis-labeled as a coach's name is still a real error
+    (probably the photographer didn't update the copyright field)."""
+    _, (a, b) = _job(db, "T1", "T2")
+    c_a = _cluster(db, a, "Coach-Smith", _basis_vec(0))
+    c_b = _cluster(db, b, "Coach-Smith", _basis_vec(1))   # different face
+    c_a.is_likely_coach = 1
+    c_b.is_likely_coach = 1
+    db.commit()
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert len(items) == 1
+    assert items[0]["verdict"] == "different_face"
+
+
+def test_cat1_buddy_only_groups_still_fire_for_different_face(db):
+    """Cat 1 fires regardless of photo composition — the noise filter only
+    applies to same_face. A different-face naming collision with buddy-only
+    appearances is still a real labeling error to surface."""
+    _, (a, b) = _job(db, "T1", "T2")
+    _cluster_buddy_only(db, a, "James", _basis_vec(0), n=2)
+    _cluster_buddy_only(db, b, "James", _basis_vec(1), n=2)   # different
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert len(items) == 1
+    assert items[0]["verdict"] == "different_face"
+
+
+def test_cat3_loose_three_solo_plus_one_buddy_filters_to_three(db):
+    """3+ session loose rule: 3 sessions have solo photos, 1 is buddy-only.
+    The buddy-only session is filtered out of the cluster list, but the
+    remaining 3 still satisfy the cross-team requirement → flag fires with
+    the filtered 3-cluster list."""
+    _, (a, b, c, d) = _job(db, "T1", "T2", "T3", "T4")
+    _cluster(db, a, "Mike", _basis_vec(0))
+    _cluster(db, b, "Mike", _basis_vec(0))
+    _cluster(db, c, "Mike", _basis_vec(0))
+    _cluster_buddy_only(db, d, "Mike", _basis_vec(0), n=2)
+    items = find_cross_team_name_collisions(db, a.job_id)
+    assert len(items) == 1
+    assert items[0]["verdict"] == "same_face"
+    # The buddy-only session dropped from the output cluster list.
+    session_names = {row["session_name"] for row in items[0]["clusters"]}
+    assert session_names == {"T1", "T2", "T3"}
+    assert "T4" not in session_names
+
+
+def test_cat3_loose_one_solo_plus_two_buddy_suppressed(db):
+    """3+ session loose rule: only 1 session has solo photos; the other 2
+    are buddy-only. After filtering, just 1 session remains — fails the
+    ≥2-session cross-team requirement → suppressed."""
+    _, (a, b, c) = _job(db, "T1", "T2", "T3")
+    _cluster(db, a, "Mike", _basis_vec(0))                  # solo
+    _cluster_buddy_only(db, b, "Mike", _basis_vec(0), n=2)  # buddy only
+    _cluster_buddy_only(db, c, "Mike", _basis_vec(0), n=2)  # buddy only
+    assert find_cross_team_name_collisions(db, a.job_id) == []
