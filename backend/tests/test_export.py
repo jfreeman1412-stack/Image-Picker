@@ -483,3 +483,516 @@ def test_export_includes_orphan_image_as_individual(ctx):
     # Normal team still works.
     assert (out / "To_be_Cropped" / "Team B" / "b1.jpg").exists()
     assert (out / "Team Images" / "Team B" / "b2.jpg").exists()
+
+
+# ── rename-on-export (2026-06-02) ────────────────────────────────────────────
+#
+# Per-export `rename_by_player` toggle on ExportJobRequest. When OFF (default),
+# camera filenames preserved exactly as today. When ON, each clustered image
+# gets a filename derived from its cluster's display_label() + role suffix:
+#
+#   - matched/manual label: <Label>-t.png (team), <Label>-p.png (pano),
+#     <Label>_001.png, _002.png, ... (individuals + buddy, capture_time order)
+#   - unmatched cluster:   Player_<cluster_id>-t.png / -p.png / _NNN.png
+#   - coach via is_coach_for_sort(): Coach_<cluster_id> prefix (honors
+#     manual_coach_override — same rule as the naming-errors filter)
+#
+# Buddy photos (image has >=2 ImageRole rows, one per cluster claiming it):
+# copied ONCE PER cluster, each named after that cluster's display_label.
+# Multiple clusters in the same session land both copies in that session's
+# To_be_Cropped folder.
+#
+# Truly-orphan images (in session.images but no ImageRole rows): keep
+# camera filename — there's no cluster to derive from. Today's legacy
+# behavior for this subset survives unchanged into rename mode.
+
+
+def _rename_job(SL, tmp_path, *, job_name="J", team_specs):
+    """Richer build helper for rename-mode tests. Each team spec is:
+        {
+          "name": str,
+          "clusters": [{
+              "label": str | None,                  # -> auto_label
+              "manual_label": str | None,           # takes precedence
+              "is_likely_coach": 0 | 1,
+              "manual_coach_override": -1 | 0 | 1,
+              "images": [{
+                  "filename": str,                  # if shared across clusters,
+                                                    # same filename = same Image row
+                  "role": "team" | "panoramic" | "individual" | "buddy" | "rejected",
+                  "capture_time": datetime | None,
+              }]
+          }],
+          "orphan_images": [{"filename": str}]      # no ImageRole — truly orphan
+        }
+    Same filename in two clusters of the same team = same Image row =
+    buddy expansion target. Across teams, same filename = different
+    physical files (different folders).
+    """
+    root = tmp_path / job_name
+    root.mkdir(parents=True, exist_ok=True)
+    db = SL()
+    job = Job(name=job_name, root_path=str(root.resolve()), has_lines=0,
+              created_at=datetime.utcnow())
+    db.add(job); db.commit(); db.refresh(job)
+    for spec in team_specs:
+        team_dir = root / spec["name"]
+        team_dir.mkdir(parents=True, exist_ok=True)
+        sess = DbSessionModel(
+            job_id=job.id, name=spec["name"], source_path=str(team_dir.resolve()),
+            status="done", created_at=datetime.utcnow(),
+        )
+        db.add(sess); db.commit(); db.refresh(sess)
+        # Map filename -> Image row for THIS session (shared buddy detection).
+        image_by_filename: dict[str, Image] = {}
+        for cluster_spec in spec.get("clusters", []):
+            cl = Cluster(
+                session_id=sess.id, image_count=0,
+                auto_label=cluster_spec.get("label"),
+                manual_label=cluster_spec.get("manual_label"),
+                is_likely_coach=cluster_spec.get("is_likely_coach", 0),
+                manual_coach_override=cluster_spec.get("manual_coach_override", 0),
+            )
+            db.add(cl); db.commit(); db.refresh(cl)
+            for img_spec in cluster_spec["images"]:
+                fn = img_spec["filename"]
+                if fn in image_by_filename:
+                    img = image_by_filename[fn]
+                else:
+                    fp = team_dir / fn
+                    if not fp.exists():
+                        fp.write_bytes(b"jpgbytes")
+                    img = Image(
+                        session_id=sess.id, path=str(fp.resolve()),
+                        filename=fn, capture_time=img_spec.get("capture_time"),
+                    )
+                    db.add(img); db.commit(); db.refresh(img)
+                    image_by_filename[fn] = img
+                db.add(ImageRole(image_id=img.id, cluster_id=cl.id,
+                                 role=img_spec["role"]))
+        for orphan in spec.get("orphan_images", []):
+            fn = orphan["filename"]
+            fp = team_dir / fn
+            if not fp.exists():
+                fp.write_bytes(b"orphanbytes")
+            db.add(Image(session_id=sess.id, path=str(fp.resolve()),
+                         filename=fn))
+        db.commit()
+    jid = job.id
+    db.close()
+    return jid, root
+
+
+def _rename_export(client, jid, **kw):
+    """POST /export with rename_by_player=True (other kwargs forwarded)."""
+    body = {"mode": "copy", "overwrite": True, "rename_by_player": True}
+    body.update(kw)
+    return client.post(f"/api/jobs/{jid}/export", json=body)
+
+
+# ── Toggle OFF: byte-identical to today's behavior ───────────────────────────
+
+
+def test_rename_toggle_off_byte_identical_to_legacy(ctx):
+    """The toggle defaults to False; sending rename_by_player=False (or
+    omitting it) must produce exactly today's filenames. The whole
+    existing test suite (562 baseline) doubles as the regression net;
+    this test pins the explicit-False contract."""
+    client, SL, tmp_path = ctx
+    jid, root = _build_job(SL, tmp_path, team_specs=[{"name": "T", "images": [
+        {"filename": "shot.jpg", "role": "team"},
+        {"filename": "x.jpg", "role": "individual"},
+    ]}])
+    body = {"mode": "copy", "overwrite": True, "rename_by_player": False}
+    r = client.post(f"/api/jobs/{jid}/export", json=body)
+    assert r.status_code == 200
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    # Camera filenames preserved exactly.
+    assert (out / "To_be_Cropped" / "T" / "shot.jpg").exists()
+    assert (out / "To_be_Cropped" / "T" / "x.jpg").exists()
+    assert (out / "Team Images" / "T" / "shot.jpg").exists()
+
+
+# ── Matched player: name + role + sequence ───────────────────────────────────
+
+
+def test_rename_matched_player_full_sequence(ctx):
+    """5 individuals + 1 team + 1 pano for a matched player → 7 renamed
+    files with role suffixes and zero-padded 3-digit sequence ordered by
+    capture_time."""
+    client, SL, tmp_path = ctx
+    t0 = datetime(2026, 1, 1, 10, 0, 0)
+    images = [
+        # Out-of-order capture_times to verify the sort key.
+        {"filename": "a.jpg", "role": "individual",
+         "capture_time": datetime(2026, 1, 1, 10, 2, 0)},
+        {"filename": "b.jpg", "role": "individual",
+         "capture_time": datetime(2026, 1, 1, 10, 0, 0)},
+        {"filename": "c.jpg", "role": "individual",
+         "capture_time": datetime(2026, 1, 1, 10, 4, 0)},
+        {"filename": "d.jpg", "role": "individual",
+         "capture_time": datetime(2026, 1, 1, 10, 1, 0)},
+        {"filename": "e.jpg", "role": "individual",
+         "capture_time": datetime(2026, 1, 1, 10, 3, 0)},
+        {"filename": "tm.jpg", "role": "team",
+         "capture_time": datetime(2026, 1, 1, 10, 5, 0)},
+        {"filename": "pn.jpg", "role": "panoramic",
+         "capture_time": datetime(2026, 1, 1, 10, 6, 0)},
+    ]
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Aviel-Afonya", "images": images}
+        ]
+    }])
+    r = _rename_export(client, jid)
+    assert r.status_code == 200
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    cropped = out / "To_be_Cropped" / "T"
+    files = sorted(p.name for p in cropped.iterdir())
+    # Sequence: b (10:00), d (10:01), a (10:02), e (10:03), c (10:04)
+    assert files == [
+        "Aviel-Afonya-p.jpg",
+        "Aviel-Afonya-t.jpg",
+        "Aviel-Afonya_001.jpg",   # b at 10:00
+        "Aviel-Afonya_002.jpg",   # d at 10:01
+        "Aviel-Afonya_003.jpg",   # a at 10:02
+        "Aviel-Afonya_004.jpg",   # e at 10:03
+        "Aviel-Afonya_005.jpg",   # c at 10:04
+    ]
+    # Team + pano also in their dedicated folders.
+    assert (out / "Team Images" / "T" / "Aviel-Afonya-t.jpg").exists()
+    assert (out / "Pano Images" / "T" / "Aviel-Afonya-p.jpg").exists()
+
+
+# ── Unmatched: Player_<cluster_id> ───────────────────────────────────────────
+
+
+def test_rename_unmatched_uses_cluster_id(ctx):
+    """No auto_label, no manual_label, not a coach → Player_<cluster_id>."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": None, "images": [
+                {"filename": "x1.jpg", "role": "individual"},
+                {"filename": "x2.jpg", "role": "team"},
+            ]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    # Cluster id is unknown to the test, but the format must match Player_<id>_001.jpg.
+    assert any(f.startswith("Player_") and f.endswith("_001.jpg") for f in files)
+    assert any(f.startswith("Player_") and f.endswith("-t.jpg") for f in files)
+
+
+# ── Coach: is_coach_for_sort() resolves manual overrides ─────────────────────
+
+
+def test_rename_singleton_coach_uses_coach_prefix(ctx):
+    """is_likely_coach=1, no label → Coach_<cluster_id>."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": None, "is_likely_coach": 1, "images": [
+                {"filename": "c.jpg", "role": "team"},
+            ]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = list((out / "To_be_Cropped" / "T").iterdir())
+    assert len(files) == 1
+    assert files[0].name.startswith("Coach_") and files[0].name.endswith("-t.jpg")
+
+
+def test_rename_coach_demoted_to_player_uses_player_prefix(ctx):
+    """is_likely_coach=1 BUT manual_coach_override=-1 → is_coach_for_sort()
+    returns False → Player_<cluster_id> prefix."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": None, "is_likely_coach": 1, "manual_coach_override": -1,
+             "images": [{"filename": "x.jpg", "role": "individual"}]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = list((out / "To_be_Cropped" / "T").iterdir())
+    assert any(f.name.startswith("Player_") for f in files)
+    assert not any(f.name.startswith("Coach_") for f in files)
+
+
+def test_rename_player_promoted_to_coach_uses_coach_prefix(ctx):
+    """is_likely_coach=0 BUT manual_coach_override=1 → is_coach_for_sort()
+    returns True → Coach_<cluster_id> prefix."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": None, "is_likely_coach": 0, "manual_coach_override": 1,
+             "images": [{"filename": "x.jpg", "role": "individual"}]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = list((out / "To_be_Cropped" / "T").iterdir())
+    assert any(f.name.startswith("Coach_") for f in files)
+
+
+# ── Manual label takes precedence ────────────────────────────────────────────
+
+
+def test_rename_manual_label_wins_over_auto(ctx):
+    """display_label() precedence: manual > auto > Player_<id>. Manual
+    label becomes the customer-visible filename (after _safe_dirname)."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Auto-Name", "manual_label": "Manual-Name",
+             "images": [{"filename": "x.jpg", "role": "individual"}]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = [p.name for p in (out / "To_be_Cropped" / "T").iterdir()]
+    assert any("Manual-Name" in f for f in files)
+    assert not any("Auto-Name" in f for f in files)
+
+
+def test_rename_manual_label_with_invalid_chars_stripped(ctx):
+    """Manual label characters that are filesystem-invalid get stripped
+    by _safe_dirname. Operator discipline plus the safety net."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"manual_label": "Aviel/Afonya?",
+             "images": [{"filename": "x.jpg", "role": "individual"}]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = [p.name for p in (out / "To_be_Cropped" / "T").iterdir()]
+    assert files == ["AvielAfonya_001.jpg"]
+
+
+# ── Buddy expansion: 1 source → N copies ─────────────────────────────────────
+
+
+def test_rename_buddy_cross_team_two_copies(ctx):
+    """2-kid buddy photo, kids on DIFFERENT teams → one copy per team's
+    folder, each named after the kid in that team."""
+    client, SL, tmp_path = ctx
+    # Same image lives physically in Team A's source folder. Both kids'
+    # clusters claim it via ImageRole. Cluster A is in Team A's session;
+    # cluster B is in Team B's session — wait, that's the cross-team case
+    # we can't model with a shared filename across teams in this helper.
+    # Instead, simulate by directly adding ImageRole rows that reference
+    # the same image_id from clusters in different sessions.
+    jid, root = _rename_job(SL, tmp_path, team_specs=[
+        {"name": "Team A", "clusters": [
+            {"label": "Alice", "images": [
+                {"filename": "buddy.jpg", "role": "buddy"},
+            ]}
+        ]},
+        {"name": "Team B", "clusters": [
+            {"label": "Bob", "images": []}  # set up cluster; ImageRole added below
+        ]},
+    ])
+    # Wire the buddy.jpg image (physically in Team A) into Bob's cluster too.
+    db = SL()
+    img = db.query(Image).filter_by(filename="buddy.jpg").first()
+    bob_cluster = db.query(Cluster).filter_by(auto_label="Bob").first()
+    db.add(ImageRole(image_id=img.id, cluster_id=bob_cluster.id, role="buddy"))
+    db.commit(); db.close()
+
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    # One copy in each team's To_be_Cropped folder, named for that team's kid.
+    assert (out / "To_be_Cropped" / "Team A" / "Alice_001.jpg").exists()
+    assert (out / "To_be_Cropped" / "Team B" / "Bob_001.jpg").exists()
+    # Buddy does NOT go to Team Images or Pano Images.
+    assert not (out / "Team Images" / "Team A").exists() or \
+           not any((out / "Team Images" / "Team A").iterdir())
+    assert not (out / "Team Images" / "Team B").exists() or \
+           not any((out / "Team Images" / "Team B").iterdir())
+
+
+def test_rename_buddy_same_team_both_copies_in_one_folder(ctx):
+    """Two kids on the same team in a buddy → both copies land in that
+    team's To_be_Cropped folder under their respective names."""
+    client, SL, tmp_path = ctx
+    # Two clusters in the same session, both claim 'buddy.jpg'.
+    jid, root = _rename_job(SL, tmp_path, team_specs=[
+        {"name": "T", "clusters": [
+            {"label": "Carol", "images": [
+                {"filename": "buddy.jpg", "role": "buddy"},
+            ]},
+            {"label": "Dan", "images": [
+                {"filename": "buddy.jpg", "role": "buddy"},  # SAME filename = SAME Image row
+            ]},
+        ]},
+    ])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    assert files == ["Carol_001.jpg", "Dan_001.jpg"]
+
+
+def test_rename_buddy_three_kids_three_copies(ctx):
+    """3-kid buddy across 3 different teams → 3 copies in 3 folders."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[
+        {"name": "T1", "clusters": [{"label": "Eve", "images": [
+            {"filename": "buddy3.jpg", "role": "buddy"},
+        ]}]},
+        {"name": "T2", "clusters": [{"label": "Frank", "images": []}]},
+        {"name": "T3", "clusters": [{"label": "Grace", "images": []}]},
+    ])
+    db = SL()
+    img = db.query(Image).filter_by(filename="buddy3.jpg").first()
+    for label in ("Frank", "Grace"):
+        cl = db.query(Cluster).filter_by(auto_label=label).first()
+        db.add(ImageRole(image_id=img.id, cluster_id=cl.id, role="buddy"))
+    db.commit(); db.close()
+
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    assert (out / "To_be_Cropped" / "T1" / "Eve_001.jpg").exists()
+    assert (out / "To_be_Cropped" / "T2" / "Frank_001.jpg").exists()
+    assert (out / "To_be_Cropped" / "T3" / "Grace_001.jpg").exists()
+
+
+def test_rename_buddy_matched_plus_unmatched_mix(ctx):
+    """Buddy with one matched + one unmatched cluster: matched gets named,
+    unmatched gets Player_<cluster_id>."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[
+        {"name": "T1", "clusters": [{"label": "Henry", "images": [
+            {"filename": "bm.jpg", "role": "buddy"},
+        ]}]},
+        {"name": "T2", "clusters": [{"label": None, "images": []}]},  # unmatched
+    ])
+    db = SL()
+    img = db.query(Image).filter_by(filename="bm.jpg").first()
+    unmatched = db.query(Cluster).filter(Cluster.auto_label.is_(None)).first()
+    db.add(ImageRole(image_id=img.id, cluster_id=unmatched.id, role="buddy"))
+    db.commit(); db.close()
+
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    assert (out / "To_be_Cropped" / "T1" / "Henry_001.jpg").exists()
+    t2_files = [p.name for p in (out / "To_be_Cropped" / "T2").iterdir()]
+    assert any(f.startswith("Player_") for f in t2_files)
+
+
+# ── Multiple-team / multiple-pano error condition ────────────────────────────
+
+
+def test_rename_multiple_team_photos_log_and_skip_extras(ctx):
+    """A cluster with 2 team-role images should NOT silently overwrite —
+    write the first, skip the second, log the duplicate."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Iris", "images": [
+                {"filename": "t1.jpg", "role": "team",
+                 "capture_time": datetime(2026, 1, 1, 10, 0, 0)},
+                {"filename": "t2.jpg", "role": "team",
+                 "capture_time": datetime(2026, 1, 1, 10, 1, 0)},
+            ]}
+        ]
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    cropped = out / "To_be_Cropped" / "T"
+    team_dir = out / "Team Images" / "T"
+    # Exactly one team file lands in each dir under Iris-t.jpg.
+    assert (cropped / "Iris-t.jpg").exists()
+    assert (team_dir / "Iris-t.jpg").exists()
+    # The second team image is skipped from the rename plan (not written
+    # under a colliding name or _2 suffix — explicitly omitted).
+    assert not (cropped / "Iris-t_2.jpg").exists()
+
+
+# ── Cross-session uniqueness ─────────────────────────────────────────────────
+
+
+def test_rename_same_player_two_team_folders_no_collision(ctx):
+    """Same player legitimately in two team folders (e.g., a multi-team
+    coach or a Q6 guest) → both files share the same name in their
+    respective folders. Different paths, no collision."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[
+        {"name": "T1", "clusters": [{"label": "Coach-Joe", "images": [
+            {"filename": "j1.jpg", "role": "team"},
+        ]}]},
+        {"name": "T2", "clusters": [{"label": "Coach-Joe", "images": [
+            {"filename": "j2.jpg", "role": "team"},
+        ]}]},
+    ])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    assert (out / "To_be_Cropped" / "T1" / "Coach-Joe-t.jpg").exists()
+    assert (out / "To_be_Cropped" / "T2" / "Coach-Joe-t.jpg").exists()
+
+
+# ── Orphan handling (user's added cases) ─────────────────────────────────────
+
+
+def test_rename_truly_orphan_image_keeps_camera_filename(ctx):
+    """Image with no ImageRole rows (no cluster claim) → camera filename
+    preserved in rename mode. Today's legacy behavior for this subset
+    survives unchanged."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Jack", "images": [
+                {"filename": "j.jpg", "role": "individual"},
+            ]}
+        ],
+        "orphan_images": [{"filename": "105A5333.png"}],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    assert files == ["105A5333.png", "Jack_001.jpg"]
+
+
+def test_rename_mixed_clustered_and_orphan_coexist(ctx):
+    """Mix of clustered + orphan images in the same session → renamed
+    files and camera names coexist correctly in To_be_Cropped."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Kate", "images": [
+                {"filename": "k1.jpg", "role": "individual"},
+                {"filename": "k2.jpg", "role": "team"},
+            ]}
+        ],
+        "orphan_images": [
+            {"filename": "test1.png"}, {"filename": "test2.png"},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    assert files == ["Kate-t.jpg", "Kate_001.jpg", "test1.png", "test2.png"]
+
+
+def test_rename_all_orphan_session_keeps_camera_names(ctx):
+    """A Color_Swatch-style session with no clusters (all images are
+    truly orphan) → every file keeps its camera filename. No renamed
+    files appear."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "Color_Swatch",
+        "clusters": [],
+        "orphan_images": [
+            {"filename": "cs1.png"}, {"filename": "cs2.png"},
+            {"filename": "cs3.png"},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "Color_Swatch").iterdir())
+    assert files == ["cs1.png", "cs2.png", "cs3.png"]

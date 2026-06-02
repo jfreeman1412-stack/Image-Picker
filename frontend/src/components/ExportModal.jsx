@@ -12,6 +12,10 @@ function fmtDuration(secs) {
 export default function ExportModal({ job, onClose }) {
   const [mode, setMode] = useState('copy');
   const [overwrite, setOverwrite] = useState(true);
+  // 2026-06-02: per-export rename toggle. Default OFF — feature soaks
+  // before becoming the default. When ON, filenames derive from each
+  // cluster's display_label() + role suffix or sequence number.
+  const [renameByPlayer, setRenameByPlayer] = useState(false);
   const [phase, setPhase] = useState('form'); // form | running | done | error
   const [status, setStatus] = useState(null); // /export-status payload
   const [error, setError] = useState(null);
@@ -44,6 +48,7 @@ export default function ExportModal({ job, onClose }) {
     // Only send destination_path when the user actually customized it.
     // Sending legacyDefault verbatim is harmless but unnecessary.
     const body = { mode, overwrite };
+    if (renameByPlayer) body.rename_by_player = true;
     const trimmed = (destination || '').trim();
     if (trimmed && trimmed !== legacyDefault) body.destination_path = trimmed;
     const res = await fetch(`/api/jobs/${job.id}/export`, {
@@ -108,6 +113,14 @@ export default function ExportModal({ job, onClose }) {
                 <input type="checkbox" checked={overwrite}
                        onChange={e => setOverwrite(e.target.checked)} />
                 Overwrite if the destination already exists
+              </label>
+            </div>
+            <div className="form-row">
+              <label>
+                <input type="checkbox" checked={renameByPlayer}
+                       onChange={e => setRenameByPlayer(e.target.checked)} />
+                Rename files by player (clustered photos use the player's name; buddy
+                photos get a copy per kid; orphan/calibration images keep camera names)
               </label>
             </div>
             {error && <p className="error">{error}</p>}

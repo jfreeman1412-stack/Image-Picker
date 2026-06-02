@@ -663,6 +663,15 @@ class ExportJobRequest(BaseModel):
     # When None, falls back to the legacy `<root>_sorted` sibling layout
     # so existing callers / wizard runs continue to work unchanged.
     destination_path: str | None = None
+    # 2026-06-02: rename each exported file after its cluster's player.
+    # Default False = today's behavior (camera filenames preserved); the
+    # toggle-OFF path is byte-identical to the pre-build code path.
+    # When True, filenames derive from Cluster.display_label() + role
+    # suffix (-t / -p) or zero-padded sequence (_001, _002, ...). Buddy
+    # photos copy once per cluster that claims them, into each cluster's
+    # session folder. Images with no ImageRole (truly orphan — no cluster
+    # claim) keep their camera filename. See PHASE_C3 design + memory.
+    rename_by_player: bool = False
 
 
 _ROLE_PRIORITY = {
@@ -735,14 +744,25 @@ def _count_export_files(db: DbSession, sessions) -> int:
 _EXPORT_WORKERS = 8
 
 
-def _allocate_dests(srcs: list[Path], target_dir: Path) -> list[Path]:
+def _allocate_dests(
+    srcs: list[Path], target_dir: Path,
+    *, basenames: list[str | None] | None = None,
+) -> list[Path]:
     """Reserve non-colliding destination paths under target_dir for each
-    src.name. Resolved in the main thread so parallel copy workers can
-    write to distinct paths without racing each other on _unique_path."""
+    src. The basename defaults to src.name (legacy behavior). When
+    `basenames` is provided, an entry of None falls back to src.name and
+    a non-None entry overrides — this is how rename-on-export injects
+    derived names (Aviel-Afonya_001.jpg, Coach_5-t.jpg, etc.) while
+    keeping the same suffix-on-collision (_2, _3, ...) mechanism. Resolved
+    on the main thread so parallel copy workers can write to distinct
+    paths without racing each other on _unique_path."""
     reserved: set[Path] = set()
     out: list[Path] = []
-    for src in srcs:
-        candidate = target_dir / src.name
+    for idx, src in enumerate(srcs):
+        chosen = src.name
+        if basenames is not None and basenames[idx] is not None:
+            chosen = basenames[idx]
+        candidate = target_dir / chosen
         if candidate in reserved or candidate.exists():
             stem, suffix = candidate.stem, candidate.suffix
             n = 2
@@ -854,9 +874,158 @@ def _resolve_out_root(root: Path, destination_path: str | None) -> Path:
     return root.parent / f"{root.name}_sorted"
 
 
+# ── Rename-on-export helpers (2026-06-02) ────────────────────────────────────
+#
+# When ExportJobRequest.rename_by_player is True, each clustered image gets a
+# filename derived from its cluster's display_label() + role suffix or
+# sequence number. Buddy photos copy once per cluster that claims them
+# (ImageRole row per cluster), each into the cluster's session folder.
+# Images with no ImageRole stay as camera filenames — see memory:
+# clustering-singleton-edge for Issue 5 context.
+
+
+def _label_for_filename(cluster: Cluster) -> str:
+    """Resolve the cluster's customer-facing label for rename-mode filenames.
+
+    Precedence mirrors Cluster.display_label() with one extension: when the
+    fallback fires (no manual, no auto), the prefix becomes Coach_<id> when
+    is_coach_for_sort() returns True (honors manual_coach_override per the
+    naming-errors filter rule). _safe_dirname strips filesystem-invalid
+    characters from operator-typed manual labels — discipline + safety net.
+    """
+    manual = (cluster.manual_label or "").strip()
+    if manual:
+        return _safe_dirname(manual)
+    auto = (cluster.auto_label or "").strip()
+    if auto:
+        return _safe_dirname(auto)
+    prefix = "Coach" if cluster.is_coach_for_sort() else "Player"
+    return f"{prefix}_{cluster.id}"
+
+
+def _derive_export_basename(
+    cluster: Cluster, role: str, seq_num: int, src_filename: str,
+) -> str:
+    """Build the rename-mode basename. `seq_num` is the per-cluster
+    sequence index for individual/buddy roles (1-based, zero-padded to 3
+    digits). Team and pano use role suffixes instead of sequence numbers.
+    The source extension is preserved (e.g. .jpg / .png)."""
+    label = _label_for_filename(cluster)
+    ext = Path(src_filename).suffix
+    if role == "team":
+        return f"{label}-t{ext}"
+    if role == "panoramic":
+        return f"{label}-p{ext}"
+    # individual or buddy → zero-padded 3-digit sequence
+    return f"{label}_{seq_num:03d}{ext}"
+
+
+def _build_rename_plan_for_session(
+    db: DbSession, session: Session, role_map: dict[int, str],
+) -> list[tuple[Path, str, str | None]]:
+    """Produce (src_path, basename, secondary_subdir) entries for ONE session
+    under rename mode. secondary_subdir is 'Team Images' or 'Pano Images'
+    when role is team/panoramic, else None.
+
+    Per-cluster iteration: each cluster in this session contributes its
+    ImageRole rows (excluding rejected). Buddy images naturally produce
+    multiple entries (one per cluster that claims them). Multiple team or
+    pano roles in the same cluster are an error condition — log + keep
+    the first, drop the rest. Images in session.images with no ImageRole
+    fall through to the camera-filename orphan path.
+    """
+    image_by_id = {img.id: img for img in session.images}
+    seen_in_rename: set[int] = set()    # image ids that got at least one
+                                        # ImageRole-driven rename plan entry
+    out: list[tuple[Path, str, str | None]] = []
+
+    for cluster in session.clusters:
+        # Collect this cluster's ImageRole rows (one query per cluster keeps
+        # the working set small; export endpoint already iterates clusters).
+        rows = (
+            db.query(ImageRole.image_id, ImageRole.role)
+            .filter(ImageRole.cluster_id == cluster.id)
+            .all()
+        )
+        # Partition by role; surface multiple-team / multiple-pano errors.
+        team_image_id: int | None = None
+        pano_image_id: int | None = None
+        seq_candidates: list[tuple[float, int, int, str]] = []
+            # (capture_time_ts, image_id, role_priority, role)
+        for image_id, role in rows:
+            if role == "rejected":
+                continue
+            img = image_by_id.get(image_id)
+            if img is None:
+                # Buddy from a different session — Image lives in another
+                # session.images. Re-fetch.
+                img = db.query(Image).get(image_id)
+                if img is None:
+                    continue
+            if role == "team":
+                if team_image_id is not None:
+                    logger.warning(
+                        "[export-rename] cluster %s has multiple team-role "
+                        "images; keeping first (image_id=%s), skipping %s",
+                        cluster.id, team_image_id, image_id,
+                    )
+                    continue
+                team_image_id = image_id
+            elif role == "panoramic":
+                if pano_image_id is not None:
+                    logger.warning(
+                        "[export-rename] cluster %s has multiple pano-role "
+                        "images; keeping first (image_id=%s), skipping %s",
+                        cluster.id, pano_image_id, image_id,
+                    )
+                    continue
+                pano_image_id = image_id
+            ts = img.capture_time.timestamp() if img.capture_time else 0.0
+            seq_candidates.append((ts, image_id, _ROLE_PRIORITY.get(role, 99), role))
+
+        # Emit team + pano first (their order in the folder doesn't matter
+        # since they have distinct suffixes), then individuals/buddy in
+        # capture-time order with assigned sequence numbers.
+        if team_image_id is not None:
+            img = image_by_id.get(team_image_id) or db.query(Image).get(team_image_id)
+            basename = _derive_export_basename(cluster, "team", 0, img.filename)
+            out.append((Path(img.path), basename, "Team Images"))
+            seen_in_rename.add(team_image_id)
+        if pano_image_id is not None:
+            img = image_by_id.get(pano_image_id) or db.query(Image).get(pano_image_id)
+            basename = _derive_export_basename(cluster, "panoramic", 0, img.filename)
+            out.append((Path(img.path), basename, "Pano Images"))
+            seen_in_rename.add(pano_image_id)
+
+        # Individuals + buddy share a sequence; sort by capture_time.
+        seq_only = [
+            (ts, image_id, role)
+            for (ts, image_id, _, role) in seq_candidates
+            if role in ("individual", "buddy")
+        ]
+        seq_only.sort(key=lambda r: (r[0], r[1]))   # tie-break by image_id
+        for seq, (_, image_id, role) in enumerate(seq_only, start=1):
+            img = image_by_id.get(image_id) or db.query(Image).get(image_id)
+            basename = _derive_export_basename(cluster, role, seq, img.filename)
+            out.append((Path(img.path), basename, None))
+            seen_in_rename.add(image_id)
+
+    # Orphan images: in session.images but never picked up by any cluster's
+    # ImageRole iteration above. Keep camera filename.
+    for img in session.images:
+        if img.id in seen_in_rename:
+            continue
+        if role_map.get(img.id) == "rejected":
+            continue
+        out.append((Path(img.path), img.filename, None))
+
+    return out
+
+
 def _run_export(
     job_id: int, mode: str, overwrite: bool,
     destination_path: str | None = None,
+    rename_by_player: bool = False,
 ) -> None:
     """Background task: the actual copy/move, updating Job.export_* as it
     goes so the modal can show a live bar + ETA."""
@@ -904,38 +1073,112 @@ def _run_export(
 
                 # Build copy plans on the main thread so destination paths are
                 # reserved sequentially (no race between workers on _unique_path).
+                #
+                # Toggle-OFF (legacy, default): iterate session.images, derive
+                # role from role_map. One entry per image; secondary dest for
+                # team/pano. Camera filenames preserved.
+                #
+                # Toggle-ON (rename-by-player, 2026-06-02): iterate this
+                # session's clusters' ImageRoles. A buddy image surfaces under
+                # each cluster that claims it — naturally producing one copy
+                # per kid into the kid's session folder. Filenames derive from
+                # cluster.display_label(). Truly-orphan images (no ImageRole)
+                # fall back to camera filename.
                 srcs: list[Path] = []
                 roles: list[str] = []
-                for image in session.images:
-                    role = role_map.get(image.id)
-                    if role == "rejected":
-                        files_skipped_rejected += 1
-                        continue
-                    if role is None:
-                        # Issue 5: orphan image (no cluster → no ImageRole)
-                        # — still ship the photo as an individual so single-
-                        # image team folders (often a lone coach shot) don't
-                        # get silently dropped from the deliverable. See
-                        # memory: clustering-singleton-edge.
-                        role = "individual"
-                    src = Path(image.path)
-                    if not src.exists():
-                        logger.warning("Source missing for export: %s", src)
-                        continue
-                    srcs.append(src)
-                    roles.append(role)
+                # For rename mode we override the per-source basename used by
+                # _allocate_dests. legacy mode leaves this empty and
+                # _allocate_dests uses src.name as today.
+                rename_basenames: list[str | None] = []
+                # Maps src str -> (secondary_subdir, role) so the threadpool
+                # loop can look up the secondary destination after dests are
+                # allocated. Legacy mode still uses team_dsts / pano_dsts.
+                rename_secondary: dict[str, str] = {}
 
-                website_dsts = _allocate_dests(srcs, website_team)
-                team_srcs = [s for s, r in zip(srcs, roles) if r == "team"]
-                pano_srcs = [s for s, r in zip(srcs, roles) if r == "panoramic"]
-                team_dsts = dict(zip(
-                    [str(s) for s in team_srcs],
-                    _allocate_dests(team_srcs, team_team),
-                ))
-                pano_dsts = dict(zip(
-                    [str(s) for s in pano_srcs],
-                    _allocate_dests(pano_srcs, pano_team),
-                ))
+                if rename_by_player:
+                    plan = _build_rename_plan_for_session(db, session, role_map)
+                    for src, basename, secondary_subdir in plan:
+                        if not src.exists():
+                            logger.warning("Source missing for export: %s", src)
+                            continue
+                        srcs.append(src)
+                        # The role tag here is only used for progress / failure
+                        # bookkeeping; the actual destination subdir is encoded
+                        # in rename_secondary so legacy code paths that branch
+                        # on `role == "team"` stay unconfused.
+                        roles.append(
+                            "team" if secondary_subdir == "Team Images"
+                            else "panoramic" if secondary_subdir == "Pano Images"
+                            else "individual"
+                        )
+                        rename_basenames.append(basename)
+                        if secondary_subdir:
+                            rename_secondary[str(src)] = secondary_subdir
+                else:
+                    for image in session.images:
+                        role = role_map.get(image.id)
+                        if role == "rejected":
+                            files_skipped_rejected += 1
+                            continue
+                        if role is None:
+                            # Issue 5: orphan image (no cluster → no ImageRole)
+                            # — still ship the photo as an individual so single-
+                            # image team folders (often a lone coach shot) don't
+                            # get silently dropped from the deliverable. See
+                            # memory: clustering-singleton-edge.
+                            role = "individual"
+                        src = Path(image.path)
+                        if not src.exists():
+                            logger.warning("Source missing for export: %s", src)
+                            continue
+                        srcs.append(src)
+                        roles.append(role)
+                        rename_basenames.append(None)
+
+                website_dsts = _allocate_dests(
+                    srcs, website_team, basenames=rename_basenames,
+                )
+                # Build secondary plans. Rename mode resolves via
+                # rename_secondary (per-source subdir choice); legacy mode
+                # picks via role tag like today.
+                if rename_by_player:
+                    team_secondary_srcs = [
+                        s for s in srcs
+                        if rename_secondary.get(str(s)) == "Team Images"
+                    ]
+                    pano_secondary_srcs = [
+                        s for s in srcs
+                        if rename_secondary.get(str(s)) == "Pano Images"
+                    ]
+                    team_secondary_basenames = [
+                        b for s, b in zip(srcs, rename_basenames)
+                        if rename_secondary.get(str(s)) == "Team Images"
+                    ]
+                    pano_secondary_basenames = [
+                        b for s, b in zip(srcs, rename_basenames)
+                        if rename_secondary.get(str(s)) == "Pano Images"
+                    ]
+                    team_dsts = dict(zip(
+                        [str(s) for s in team_secondary_srcs],
+                        _allocate_dests(team_secondary_srcs, team_team,
+                                        basenames=team_secondary_basenames),
+                    ))
+                    pano_dsts = dict(zip(
+                        [str(s) for s in pano_secondary_srcs],
+                        _allocate_dests(pano_secondary_srcs, pano_team,
+                                        basenames=pano_secondary_basenames),
+                    ))
+                else:
+                    team_srcs = [s for s, r in zip(srcs, roles) if r == "team"]
+                    pano_srcs = [s for s, r in zip(srcs, roles) if r == "panoramic"]
+                    team_dsts = dict(zip(
+                        [str(s) for s in team_srcs],
+                        _allocate_dests(team_srcs, team_team),
+                    ))
+                    pano_dsts = dict(zip(
+                        [str(s) for s in pano_srcs],
+                        _allocate_dests(pano_srcs, pano_team),
+                    ))
 
                 # Parallel copy fan-out, sequential progress accounting. Per-file
                 # failures are caught + logged + skipped (B.3-style lossless): the
@@ -945,10 +1188,17 @@ def _run_export(
                     futures_meta: dict = {}
                     for src, role, website_dst in zip(srcs, roles, website_dsts):
                         secondary = None
-                        if role == "team":
-                            secondary = team_dsts.get(str(src))
-                        elif role == "panoramic":
-                            secondary = pano_dsts.get(str(src))
+                        if rename_by_player:
+                            sub = rename_secondary.get(str(src))
+                            if sub == "Team Images":
+                                secondary = team_dsts.get(str(src))
+                            elif sub == "Pano Images":
+                                secondary = pano_dsts.get(str(src))
+                        else:
+                            if role == "team":
+                                secondary = team_dsts.get(str(src))
+                            elif role == "panoramic":
+                                secondary = pano_dsts.get(str(src))
                         fut = ex.submit(_copy_one, src, website_dst, secondary, mode)
                         futures_meta[fut] = (src, role, website_dst, secondary)
                     for fut in as_completed(futures_meta):
@@ -1056,7 +1306,7 @@ def export_job(
 
     background.add_task(
         _run_export, job.id, payload.mode, payload.overwrite,
-        payload.destination_path,
+        payload.destination_path, payload.rename_by_player,
     )
     return {"job_id": job.id, "export_total": total}
 
