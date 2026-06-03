@@ -116,6 +116,12 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
         team_mismatch = cluster_match_team_mismatch(
             c, sess_norm, membership_teams_by_player,
         )
+        # Move-card Phase 1 (2026-06-03): operator-dismissed cross-team
+        # cases suppress the flag at read time. The match data still
+        # surfaces in the `match` block below so the UI can render the
+        # "dismissed" state explicitly if needed.
+        if c.accepted_cross_team:
+            team_mismatch = False
         combined_reason = add_match_team_mismatch_flag(combined_reason, team_mismatch)
         visible_reasons = filter_visible_reasons(combined_reason, flag_vis)
         out.append({
@@ -131,6 +137,7 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
             "is_likely_coach": bool(c.is_likely_coach),
             "is_coach_for_sort": c.is_coach_for_sort(),
             "manual_coach_override": c.manual_coach_override or 0,
+            "accepted_cross_team": bool(c.accepted_cross_team),
             "guest_of": guest_map.get(c.id),   # None unless a confirmed cross-team guest
             # Phase A.4: reference-match data (additive — existing UI ignores it;
             # A.5 will render it). roster_team is the matched player's team(s)

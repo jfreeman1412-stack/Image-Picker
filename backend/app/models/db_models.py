@@ -130,6 +130,12 @@ class Cluster(Base):
     match_tier = Column(String, nullable=True)         # high | low | none
     match_scope = Column(String, nullable=True)        # roster | global_fallback
     auto_label_source = Column(String, nullable=True)  # copyright | match
+    # Move-card Phase 1 (2026-06-03): operator-acknowledged cross-team
+    # appearance (guest player, sibling in a buddy shot, multi-team kid).
+    # When True, the read-time match_team_mismatch flag is suppressed for
+    # this cluster — it stays in its current session, no move needed.
+    # Cleared automatically when the cluster is moved via move-with-guards.
+    accepted_cross_team = Column(Integer, default=0)
 
     session = relationship("Session", back_populates="clusters")
     faces = relationship("Face", back_populates="cluster")

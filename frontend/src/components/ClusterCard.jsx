@@ -31,11 +31,25 @@ export default function ClusterCard({
   dragFrom,        // cluster_id an image is currently being dragged from (or null)
   onDragStart,     // (from_cluster_id) → parent tracks the active drag
   onDragEnd,       // () → parent clears the active drag
+  // Move-card Phase 1 (2026-06-03): inline controls when this cluster has
+  // match_team_mismatch firing. Parent (SessionDetail) supplies the team
+  // options + handlers; ClusterCard renders the suggestion + dropdown +
+  // dismiss controls and handles the force-confirm inline if the backend
+  // returns 409 with safety-guard impact.
+  currentSessionName,  // name of the session this cluster currently lives in
+  teamOptions,         // [{session_id, name}] — sessions in this job (sans current)
+  onMoveWithGuards,    // async (cluster_id, target_session_id, force) → {ok, impact?}
+  onDismissCrossTeam,  // async (cluster_id) → void
+  onUndismissCrossTeam, // async (cluster_id) → void
 }) {
   const [editing, setEditing] = useState(false);
   const [label, setLabel] = useState(cluster.label);
   const [openPopover, setOpenPopover] = useState(null); // image_id
   const [dropHover, setDropHover] = useState(false);
+  // Move-card inline state.
+  const [pickedSessionId, setPickedSessionId] = useState('');
+  const [blockedImpact, setBlockedImpact] = useState(null); // {impact, target_session_id}
+  const [moveBusy, setMoveBusy] = useState(false);
 
   // This card is a valid drop target only while an image from a *different*
   // cluster is being dragged.
@@ -123,6 +137,44 @@ export default function ClusterCard({
   // noise for a non-member) and show a "belongs to <team>" banner instead.
   const guest = cluster.guest_of || null;
 
+  // Move-card Phase 1: derive the visibility + smart-suggestion target.
+  // Show the inline controls when match_team_mismatch is in the visible
+  // reasons OR the operator already dismissed (so they can undo). Guest
+  // clusters never show these — they have their own banner.
+  const teamMismatchVisible = visibleReasons.includes('match_team_mismatch');
+  const showMoveCardActions =
+    !guest && onMoveWithGuards && (teamMismatchVisible || cluster.accepted_cross_team);
+  // Smart suggestion target: a session whose name case-insensitively
+  // matches the matched player's roster team. Phase 1 only handles Case 1
+  // (existing session); Phase 2 will add Case 2 (auto-create when team
+  // exists in roster but no session yet) and Case 3 (add new team).
+  const rosterTeam = (cluster.match?.roster_team || '').toLowerCase();
+  const smartTarget = teamOptions?.find(
+    (o) => o.name.toLowerCase() === rosterTeam,
+  );
+
+  const handleMove = async (targetSessionId, force) => {
+    if (!targetSessionId || moveBusy) return;
+    setMoveBusy(true);
+    try {
+      const res = await onMoveWithGuards(
+        cluster.cluster_id, Number(targetSessionId), force,
+      );
+      if (!res || res.ok) {
+        setBlockedImpact(null);
+        setPickedSessionId('');
+        return;
+      }
+      // 409 with impact: surface the force-confirm prompt.
+      setBlockedImpact({
+        impact: res.impact,
+        target_session_id: Number(targetSessionId),
+      });
+    } finally {
+      setMoveBusy(false);
+    }
+  };
+
   return (
     <div
       className={`cluster-card ${guest ? 'guest' : ''} ${guest ? '' : completeClass} ${(!guest && showReview) ? 'review' : ''} ${isDropCandidate ? 'drop-candidate' : ''} ${dropHover ? 'drop-hover' : ''}`}
@@ -191,6 +243,112 @@ export default function ClusterCard({
           </span>
         ))}
       </div>
+
+      {/* Move-card Phase 1 (2026-06-03): inline smart-suggestion + dropdown
+          + dismiss. Visible only when match_team_mismatch is firing or
+          when the operator already dismissed (so they can undo). */}
+      {showMoveCardActions && (
+        <div className="move-card-actions">
+          {cluster.accepted_cross_team ? (
+            <div className="dismissed-banner">
+              <span>
+                ✓ Accepted as intentional cross-team appearance
+                {cluster.match?.player_name && (
+                  <> — <b>{cluster.match.player_name}</b> rostered with{' '}
+                  <b>{cluster.match.roster_team}</b></>
+                )}.
+              </span>
+              <button
+                className="ghost"
+                onClick={() => onUndismissCrossTeam(cluster.cluster_id)}
+              >
+                Undo dismiss
+              </button>
+            </div>
+          ) : blockedImpact ? (
+            <div className="move-blocked-banner">
+              <p style={{ margin: 0 }}>
+                <b>Move blocked.</b>{' '}
+                {blockedImpact.impact.manual_role_overrides > 0 && (
+                  <>{blockedImpact.impact.manual_role_overrides} manual
+                    role lock{blockedImpact.impact.manual_role_overrides === 1 ? '' : 's'}
+                    {' '}would be carried over.</>
+                )}
+                {blockedImpact.impact.source_session_reviewed && (
+                  <> Source session is marked reviewed.</>
+                )}
+                {' '}Force the move?
+              </p>
+              <div className="actions" style={{ gap: 8, marginTop: 6 }}>
+                <button
+                  className="danger"
+                  disabled={moveBusy}
+                  onClick={() => handleMove(blockedImpact.target_session_id, true)}
+                >
+                  Force move
+                </button>
+                <button
+                  className="ghost"
+                  onClick={() => setBlockedImpact(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <p className="move-suggestion-text" style={{ margin: 0 }}>
+                <b>Likely on wrong team:</b>{' '}
+                {cluster.match?.player_name && (
+                  <><b>{cluster.match.player_name}</b> is rostered with{' '}
+                  <b>{cluster.match.roster_team}</b> but this card is in{' '}
+                  <b>{currentSessionName}</b>.</>
+                )}
+              </p>
+              <div className="actions" style={{ gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+                {smartTarget && (
+                  <button
+                    className="primary"
+                    disabled={moveBusy}
+                    onClick={() => handleMove(smartTarget.session_id, false)}
+                  >
+                    Move card to {smartTarget.name}
+                  </button>
+                )}
+                <select
+                  value={pickedSessionId}
+                  onChange={(e) => setPickedSessionId(e.target.value)}
+                  disabled={moveBusy}
+                >
+                  <option value="">
+                    {smartTarget ? 'Pick different team…' : 'Pick team…'}
+                  </option>
+                  {(teamOptions || []).map((opt) => (
+                    <option key={opt.session_id} value={opt.session_id}>
+                      {opt.name}
+                    </option>
+                  ))}
+                </select>
+                {pickedSessionId && (
+                  <button
+                    disabled={moveBusy}
+                    onClick={() => handleMove(pickedSessionId, false)}
+                  >
+                    Move
+                  </button>
+                )}
+                <button
+                  className="ghost"
+                  disabled={moveBusy}
+                  onClick={() => onDismissCrossTeam(cluster.cluster_id)}
+                >
+                  Dismiss as cross-team
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {guest && (
         <p className="guest-note">

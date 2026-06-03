@@ -211,6 +211,183 @@ def _do_merge(
     return target.id, _unreview_target(target_session)
 
 
+# ── Move-card Phase 1 (2026-06-03) ───────────────────────────────────────────
+#
+# New endpoints layered on top of move_cluster's existing machinery:
+#   POST /clusters/{id}/move-with-guards    — wraps `move_cluster` (mode=create)
+#                                             with safety guards against
+#                                             accidentally moving manually-
+#                                             reviewed work. Clears
+#                                             accepted_cross_team after move.
+#   POST /clusters/{id}/dismiss-cross-team  — operator confirms intentional
+#                                             cross-team appearance.
+#                                             Sets accepted_cross_team=1.
+#                                             Read-time match_team_mismatch
+#                                             suppressed for this cluster.
+#   POST /clusters/{id}/undismiss-cross-team — reverses the dismiss.
+#
+# Existing /move endpoint is intentionally untouched — RosterModal's Phase 6
+# mismatch flow continues to work bit-for-bit.
+
+
+class DismissCrossTeamRequest(BaseModel):
+    """Empty body — endpoint just flips a flag. Kept as a class so the
+    FE pattern matches other POST endpoints with payloads."""
+    pass
+
+
+class MoveWithGuardsRequest(BaseModel):
+    target_session_id: int
+    # When False (default), refuses to move if any of the cluster's images
+    # has a manual_override=1 ImageRole OR the source session is reviewed=1.
+    # When True, bypasses both guards explicitly — for the operator who
+    # confirmed they really do want to move despite the work-loss risk.
+    force: bool = False
+
+
+def _check_move_safety(
+    db: DbSession, source: Cluster, force: bool,
+) -> dict | None:
+    """Return an impact dict if the move is blocked by a safety guard,
+    otherwise None. force=True returns None unconditionally.
+
+    Blockers:
+      - manual_role_overrides: count of ImageRole rows with
+        manual_override=1 on any of the cluster's images. These are
+        operator-locked role decisions that the move would carry forward
+        (in create mode) — surfaced so the operator knows the move will
+        bring locked picks into the target session.
+      - source_session_reviewed: True if source session.reviewed=1. Moves
+        from finalized sessions should not be casual.
+    """
+    if force:
+        return None
+    # Collect image_ids in the source cluster via Face rows.
+    image_ids = {
+        f.image_id
+        for f in db.query(Face).filter_by(cluster_id=source.id).all()
+    }
+    manual_role_overrides = 0
+    if image_ids:
+        manual_role_overrides = (
+            db.query(ImageRole)
+            .filter(ImageRole.image_id.in_(image_ids),
+                    ImageRole.manual_override == 1)
+            .count()
+        )
+    source_session = db.query(Session).get(source.session_id)
+    source_session_reviewed = bool(source_session and source_session.reviewed)
+
+    if manual_role_overrides == 0 and not source_session_reviewed:
+        return None
+    return {
+        "manual_role_overrides": manual_role_overrides,
+        "source_session_reviewed": source_session_reviewed,
+    }
+
+
+@router.post("/{cluster_id}/move-with-guards")
+def move_cluster_with_guards(
+    cluster_id: int,
+    payload: MoveWithGuardsRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Move-card workflow's move endpoint: existing /move machinery + the
+    two mandatory safety guards. force=True bypasses both.
+
+    Uses mode='create' under the hood (relocates the cluster intact;
+    manual_label / manual_coach_override / ImageRoles preserved). Merge-
+    mode is not exposed via this endpoint — the smart-suggestion flow
+    explicitly creates a new cluster in the target session rather than
+    merging into a name match (avoids surprise label collisions).
+
+    On successful move: clears accepted_cross_team on the cluster (it's
+    now in a session that should match its matched_player's team — the
+    cross-team case is resolved by the move, not just acknowledged).
+    """
+    source = db.query(Cluster).get(cluster_id)
+    if source is None:
+        raise HTTPException(404, "Source cluster not found")
+
+    impact = _check_move_safety(db, source, force=payload.force)
+    if impact is not None:
+        raise HTTPException(409, detail={
+            "error": "move_blocked",
+            "message": (
+                "This cluster has operator-locked work that would be "
+                "carried by the move (manual role picks) or comes from a "
+                "reviewed session. Pass force=true to proceed."
+            ),
+            "impact": impact,
+            "cluster_id": cluster_id,
+        })
+
+    # Delegate to the existing /move endpoint's body via direct call.
+    # mode='create' relocates the source cluster intact.
+    result = move_cluster(
+        cluster_id,
+        MoveRequest(target_session_id=payload.target_session_id,
+                    mode="create"),
+        db,
+    )
+
+    # After a successful move, clear accepted_cross_team. The cluster
+    # has been moved to (presumably) the right team — the cross-team
+    # case is resolved by the relocation, not just dismissed.
+    db.expire_all()
+    moved = db.query(Cluster).get(cluster_id)
+    if moved is not None and moved.accepted_cross_team:
+        moved.accepted_cross_team = 0
+        db.commit()
+
+    return result
+
+
+@router.post("/{cluster_id}/dismiss-cross-team")
+def dismiss_cross_team(
+    cluster_id: int,
+    payload: DismissCrossTeamRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Operator confirms this cluster's cross-team appearance is
+    intentional (a guest player, sibling in a buddy shot, or a kid who
+    actually plays on multiple teams). Sets accepted_cross_team=1; the
+    read-time match_team_mismatch flag is suppressed for this cluster
+    until the operator undismisses it OR the cluster is moved.
+
+    Idempotent: dismissing an already-dismissed cluster returns the
+    same response without error."""
+    c = db.query(Cluster).get(cluster_id)
+    if c is None:
+        raise HTTPException(404, "Cluster not found")
+    if not c.accepted_cross_team:
+        c.accepted_cross_team = 1
+        db.commit()
+    return {
+        "cluster_id": c.id,
+        "accepted_cross_team": True,
+    }
+
+
+@router.post("/{cluster_id}/undismiss-cross-team")
+def undismiss_cross_team(
+    cluster_id: int,
+    db: DbSession = Depends(get_db),
+):
+    """Operator reverses a prior dismiss. accepted_cross_team flips back
+    to 0; the match_team_mismatch flag re-surfaces on the next read."""
+    c = db.query(Cluster).get(cluster_id)
+    if c is None:
+        raise HTTPException(404, "Cluster not found")
+    if c.accepted_cross_team:
+        c.accepted_cross_team = 0
+        db.commit()
+    return {
+        "cluster_id": c.id,
+        "accepted_cross_team": False,
+    }
+
+
 @router.post("/{cluster_id}/global-match-suggest")
 def global_match_suggest(cluster_id: int, db: DbSession = Depends(get_db)):
     """Phase A.4: read-only top-N GLOBAL reference matches for a cluster,

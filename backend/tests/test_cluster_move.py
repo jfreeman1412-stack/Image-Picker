@@ -475,3 +475,283 @@ def test_aggregator_skips_archived_sessions(db):
     db.commit()
     # Archived source is excluded — no row.
     assert list_mismatches(job.id, db) == {"items": []}
+
+
+# ── Move-card Phase 1 (2026-06-03) ───────────────────────────────────────────
+#
+# New endpoints layered on top of cluster_move.py's existing machinery:
+#   POST /api/clusters/{cluster_id}/move-with-guards  — adds the
+#       manual_override=1 and Session.reviewed=1 safety guards; clears
+#       accepted_cross_team after the move; force=True bypasses both
+#       guards explicitly.
+#   POST /api/clusters/{cluster_id}/dismiss-cross-team — operator confirms
+#       this cluster is a legitimate cross-team appearance (guest /
+#       sibling / multi-team kid). Sets Cluster.accepted_cross_team=1; the
+#       read-time match_team_mismatch flag is then suppressed from
+#       visible_review_reasons. Inverse endpoint /undismiss-cross-team
+#       restores the flag.
+#
+# Existing /move endpoint is intentionally unchanged — RosterModal's
+# Phase 6 mismatch flow continues to work bit-for-bit.
+
+
+from app.api.cluster_move import (
+    DismissCrossTeamRequest,
+    MoveWithGuardsRequest,
+    _check_move_safety,
+    dismiss_cross_team,
+    move_cluster_with_guards,
+    undismiss_cross_team,
+)
+
+
+def _add_image_role(db, cluster: Cluster, manual_override: int = 0) -> ImageRole:
+    """Attach a role row to the cluster's first image (or any image if it
+    has multiple). Used to seed manual_override=1 for guard tests."""
+    face = db.query(Face).filter_by(cluster_id=cluster.id).first()
+    role = ImageRole(image_id=face.image_id, cluster_id=cluster.id,
+                     role="individual", manual_override=manual_override)
+    db.add(role); db.commit()
+    return role
+
+
+# ── accepted_cross_team field defaults ──────────────────────────────────────
+
+
+def test_accepted_cross_team_defaults_to_zero(db):
+    """New schema field: accepted_cross_team defaults to 0 on cluster create."""
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=1)
+    db.refresh(c)
+    assert c.accepted_cross_team == 0
+
+
+# ── Dismiss / undismiss endpoints ───────────────────────────────────────────
+
+
+def test_dismiss_sets_accepted_cross_team(db):
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=1)
+    res = dismiss_cross_team(c.id, DismissCrossTeamRequest(), db)
+    db.refresh(c)
+    assert c.accepted_cross_team == 1
+    assert res["accepted_cross_team"] is True
+    assert res["cluster_id"] == c.id
+
+
+def test_dismiss_idempotent(db):
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=1)
+    dismiss_cross_team(c.id, DismissCrossTeamRequest(), db)
+    res = dismiss_cross_team(c.id, DismissCrossTeamRequest(), db)
+    db.refresh(c)
+    assert c.accepted_cross_team == 1
+    assert res["accepted_cross_team"] is True
+
+
+def test_undismiss_clears_accepted_cross_team(db):
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=1)
+    c.accepted_cross_team = 1; db.commit()
+    res = undismiss_cross_team(c.id, db)
+    db.refresh(c)
+    assert c.accepted_cross_team == 0
+    assert res["accepted_cross_team"] is False
+
+
+def test_dismiss_404_on_missing_cluster(db):
+    with pytest.raises(HTTPException) as exc:
+        dismiss_cross_team(99999, DismissCrossTeamRequest(), db)
+    assert exc.value.status_code == 404
+
+
+# ── Read-time match_team_mismatch suppression when accepted ─────────────────
+
+
+def test_accepted_cross_team_suppresses_match_team_mismatch(db):
+    """Backend-side: the read-time filter in clusters.py:list_clusters
+    drops match_team_mismatch from visible_review_reasons when
+    accepted_cross_team=1. End-to-end: dismiss → flag clears in UI without
+    moving the cluster."""
+    from app.api.clusters import list_clusters
+    from app.models.db_models import Player, PlayerMembership
+
+    job, src, _ = _job_with_two_sessions(db, source_name="WrongTeam")
+    # Player is rostered on RealTeam; cluster is in WrongTeam session.
+    p = Player(norm_name="alice", display_name="Alice")
+    db.add(p); db.commit(); db.refresh(p)
+    db.add(PlayerMembership(player_id=p.id, job_id=job.id,
+                            team_name="RealTeam", norm_team="realteam"))
+    db.commit()
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    c.match_tier = "high"
+    c.matched_player_id = p.id
+    db.commit()
+    # Without dismiss: match_team_mismatch fires.
+    before = list_clusters(src.id, db)
+    assert any("match_team_mismatch" in cl["visible_review_reasons"]
+               for cl in before)
+    # After dismiss: flag suppressed.
+    c.accepted_cross_team = 1
+    db.commit()
+    after = list_clusters(src.id, db)
+    for cl in after:
+        assert "match_team_mismatch" not in cl["visible_review_reasons"]
+
+
+# ── Safety guards: _check_move_safety helper + endpoint behavior ────────────
+
+
+def test_check_move_safety_clean_returns_none(db):
+    """No blockers (no manual_override=1 roles, source not reviewed)."""
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    assert _check_move_safety(db, c, force=False) is None
+
+
+def test_check_move_safety_manual_override_blocks(db):
+    """An ImageRole.manual_override=1 on any of the cluster's images
+    blocks the move without force=True."""
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    impact = _check_move_safety(db, c, force=False)
+    assert impact is not None
+    assert impact["manual_role_overrides"] >= 1
+
+
+def test_check_move_safety_reviewed_session_blocks(db):
+    """Source session reviewed=1 blocks the move without force=True."""
+    _, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    impact = _check_move_safety(db, c, force=False)
+    assert impact is not None
+    assert impact["source_session_reviewed"] is True
+
+
+def test_check_move_safety_force_bypasses_all_guards(db):
+    """force=True returns None even when blockers are present."""
+    _, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    assert _check_move_safety(db, c, force=True) is None
+
+
+# ── move-with-guards endpoint: integration over the helper ──────────────────
+
+
+def test_move_with_guards_happy_path_moves_cluster(db):
+    """No blockers → move proceeds via existing /move machinery. Target
+    cluster sits in the target session; accepted_cross_team cleared on
+    moved cluster (now in the right team — no longer a cross-team case)."""
+    _, src, tgt = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    c.accepted_cross_team = 1; db.commit()  # was dismissed previously
+    res = move_cluster_with_guards(
+        c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == tgt.id
+    assert moved.accepted_cross_team == 0   # cleared by the move
+    assert res["status"] == "moved"
+    assert res["target_session_id"] == tgt.id
+
+
+def test_move_with_guards_manual_override_blocks_without_force(db):
+    """ImageRole.manual_override=1 → 409 with impact dict; cluster
+    unchanged."""
+    _, src, tgt = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    orig_session = c.session_id
+    with pytest.raises(HTTPException) as exc:
+        move_cluster_with_guards(
+            c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+        )
+    assert exc.value.status_code == 409
+    assert "manual_role_overrides" in exc.value.detail["impact"]
+    db.refresh(c)
+    assert c.session_id == orig_session   # unchanged
+
+
+def test_move_with_guards_reviewed_session_blocks_without_force(db):
+    """Source session reviewed=1 → 409; cluster unchanged."""
+    _, src, tgt = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    orig_session = c.session_id
+    with pytest.raises(HTTPException) as exc:
+        move_cluster_with_guards(
+            c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["impact"]["source_session_reviewed"] is True
+    db.refresh(c)
+    assert c.session_id == orig_session
+
+
+def test_move_with_guards_force_true_overrides_both(db):
+    """force=True bypasses BOTH guards. Move proceeds."""
+    _, src, tgt = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    res = move_cluster_with_guards(
+        c.id, MoveWithGuardsRequest(target_session_id=tgt.id, force=True), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == tgt.id
+    assert res["status"] == "moved"
+
+
+def test_move_with_guards_combined_blockers_both_surfaced(db):
+    """If multiple blockers are present, the impact dict surfaces both
+    counts so the UI can show the operator everything they're being
+    asked to override."""
+    _, src, tgt = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    with pytest.raises(HTTPException) as exc:
+        move_cluster_with_guards(
+            c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+        )
+    impact = exc.value.detail["impact"]
+    assert impact["manual_role_overrides"] >= 1
+    assert impact["source_session_reviewed"] is True
+
+
+def test_move_with_guards_validates_target_same_job(db):
+    """Cross-job moves still rejected — defers to the underlying
+    cluster_move validation."""
+    job, src, tgt = _job_with_two_sessions(db)
+    # Stand up a session in a different job.
+    other_job = Job(name="OtherJob", root_path="/tmp/other", has_lines=0)
+    db.add(other_job); db.commit(); db.refresh(other_job)
+    other_session = Session(
+        job_id=other_job.id, name="Other", source_path="/tmp/other/Other",
+        status="done", created_at=datetime.utcnow(),
+    )
+    db.add(other_session); db.commit(); db.refresh(other_session)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    with pytest.raises(HTTPException) as exc:
+        move_cluster_with_guards(
+            c.id, MoveWithGuardsRequest(target_session_id=other_session.id), db,
+        )
+    assert exc.value.status_code == 400
+
+
+def test_move_with_guards_target_archived_rejected(db):
+    """Archived target rejected — defers to underlying validation."""
+    _, src, tgt = _job_with_two_sessions(db)
+    tgt.archived = 1; db.commit()
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    with pytest.raises(HTTPException) as exc:
+        move_cluster_with_guards(
+            c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+        )
+    assert exc.value.status_code == 400

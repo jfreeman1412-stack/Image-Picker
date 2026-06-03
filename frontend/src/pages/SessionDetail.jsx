@@ -311,6 +311,54 @@ export default function SessionDetail() {
     (a, b) => (a.guest_of ? 1 : 0) - (b.guest_of ? 1 : 0),
   );
 
+  // Move-card Phase 1 (2026-06-03): build dropdown options + handlers.
+  // teamOptions excludes the current session and any archived sessions —
+  // Phase 1 only handles Case 1 (move to existing session). Phase 2 will
+  // surface roster teams without sessions yet (Case 2) + add-new-team UI.
+  const moveCardTeamOptions = (job?.sessions || [])
+    .filter((s) => s.id !== session.id && !s.archived)
+    .map((s) => ({ session_id: s.id, name: s.name }));
+
+  const onMoveWithGuards = async (clusterId, targetSessionId, force) => {
+    const res = await fetch(`/api/clusters/${clusterId}/move-with-guards`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_session_id: Number(targetSessionId),
+        force: !!force,
+      }),
+    });
+    if (res.ok) {
+      await load();   // refresh cluster list — moved cluster vanishes
+      return { ok: true };
+    }
+    if (res.status === 409) {
+      try {
+        const body = await res.json();
+        return { ok: false, impact: body?.detail?.impact || {} };
+      } catch {
+        return { ok: false, impact: {} };
+      }
+    }
+    return { ok: false, impact: {} };
+  };
+
+  const onDismissCrossTeam = async (clusterId) => {
+    const res = await fetch(`/api/clusters/${clusterId}/dismiss-cross-team`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (res.ok) await load();
+  };
+
+  const onUndismissCrossTeam = async (clusterId) => {
+    const res = await fetch(`/api/clusters/${clusterId}/undismiss-cross-team`, {
+      method: 'POST',
+    });
+    if (res.ok) await load();
+  };
+
   // Progress indicator: team N of M · X reviewed
   let progress = null;
   if (job?.sessions?.length) {
@@ -398,6 +446,11 @@ export default function SessionDetail() {
             dragFrom={dragFrom}
             onDragStart={onThumbDragStart}
             onDragEnd={onThumbDragEnd}
+            currentSessionName={session.name}
+            teamOptions={moveCardTeamOptions}
+            onMoveWithGuards={onMoveWithGuards}
+            onDismissCrossTeam={onDismissCrossTeam}
+            onUndismissCrossTeam={onUndismissCrossTeam}
           />
         ))}
       </div>

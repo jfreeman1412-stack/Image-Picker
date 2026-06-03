@@ -58,6 +58,8 @@ _PHASE2_COLUMNS = {
         ("match_tier", "VARCHAR"),
         ("match_scope", "VARCHAR"),
         ("auto_label_source", "VARCHAR"),
+        # Move-card Phase 1 (2026-06-03): dismiss-cross-team flag.
+        ("accepted_cross_team", "INTEGER DEFAULT 0"),
     ],
     "image_roles": [
         ("manual_override", "INTEGER DEFAULT 0"),
