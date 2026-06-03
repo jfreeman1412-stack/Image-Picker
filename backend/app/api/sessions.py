@@ -115,6 +115,10 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
     # Phase A.4: match_team_mismatch blocks readiness when visible (mirrors
     # duplicate_auto_label). Recomputed read-time from stored matches + the
     # current roster, so it tracks roster edits without a pipeline re-run.
+    # Move-card Phase 1.5 (2026-06-03): also suppressed when the operator
+    # dismissed the cross-team appearance (accepted_cross_team=1). Mirrors
+    # the same suppression in clusters.py:list_clusters so both UI surfaces
+    # (▲ needs chip + ⚠ badge) clear atomically on dismiss.
     if flag_vis.get(MATCH_TEAM_MISMATCH, True):
         from app.models.db_models import PlayerMembership
         membership_teams_by_player: dict[int, set[str]] = {}
@@ -123,6 +127,8 @@ def _compute_review_readiness(db: DbSession, session: Session) -> dict:
                 membership_teams_by_player.setdefault(m.player_id, set()).add(m.norm_team)
         sess_norm = session_norm_team(session)
         for c in session.clusters:
+            if c.accepted_cross_team:
+                continue   # operator dismissed — don't block readiness
             if not cluster_match_team_mismatch(c, sess_norm, membership_teams_by_player):
                 continue
             if c.id in by_cluster:

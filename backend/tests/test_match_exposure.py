@@ -257,6 +257,37 @@ def test_readiness_blocks_on_visible_match_team_mismatch(db):
     assert len(rows) == 1
 
 
+def test_readiness_passes_when_match_team_mismatch_dismissed(db):
+    """Move-card Phase 1.5 (2026-06-03): when Cluster.accepted_cross_team=1,
+    the readiness path should also suppress match_team_mismatch from the
+    `missing` array. This mirrors the read-time suppression in
+    clusters.py:list_clusters that Phase 1 already shipped.
+
+    Phase 1 bug this regression-tests: dismiss was clearing the
+    `⚠ match_team_mismatch` review-badge in visible_review_reasons, but
+    NOT clearing the `▲ needs match_team_mismatch` readiness chip. The
+    operator saw the badge disappear but the chip persisted — and
+    'Mark reviewed & next' stayed blocked. With this fix, dismiss
+    atomically clears both surfaces."""
+    _, sess, p = _job_session_player(db)
+    c = _role_complete_matched_cluster(db, sess, matched_player_id=p.id)
+    # Sanity check on pre-dismiss state: the flag fires in readiness.
+    r = _compute_review_readiness(db, sess)
+    assert r["ready"] is False
+    assert any(MATCH_TEAM_MISMATCH in x["missing"]
+               for x in r["incomplete_clusters"])
+    # Operator dismisses the cross-team flag.
+    c.accepted_cross_team = 1
+    db.commit()
+    # Now the readiness path should treat this cluster as ready.
+    r = _compute_review_readiness(db, sess)
+    assert r["ready"] is True
+    assert not any(
+        MATCH_TEAM_MISMATCH in x.get("missing", [])
+        for x in r.get("incomplete_clusters", [])
+    )
+
+
 def test_readiness_passes_when_match_flag_hidden(db):
     _, sess, p = _job_session_player(db)
     _role_complete_matched_cluster(db, sess, matched_player_id=p.id)
