@@ -403,26 +403,80 @@ export default function JobWizard() {
         </section>
       )}
 
-      {/* Step 6: Image subfolder */}
-      {step === 'subfolder' && firstTeamPeek && (
+      {/* Step 6: Image subfolder
+          2026-06-08: surface the renditions-in-subfolder case. Job 55
+          missed because the operator clicked "team-folder root" without
+          noticing the root had 0 supported-format files (only Canon CR3
+          RAWs, which ingest_folder skips). Three fixes:
+            1. Symmetric image counts on every button (root included).
+            2. Recommended marker on the subfolder with the most images,
+               when it beats the root count.
+            3. Warning banner + root button disabled when root has 0
+               supported images AND a subfolder has > 0 — so the only
+               clickable option leads to a non-empty ingest. */}
+      {step === 'subfolder' && firstTeamPeek && (() => {
+        const rootImages = firstTeamPeek.image_count || 0;
+        const rootRaws = firstTeamPeek.raw_count || 0;
+        // Best subfolder = highest image_count, ties broken by name asc.
+        const subs = [...(firstTeamPeek.subfolders || [])]
+          .sort((a, b) => (b.image_count - a.image_count) || a.name.localeCompare(b.name));
+        const bestSub = subs.find((s) => s.image_count > 0) || null;
+        // Recommended marker fires when the best subfolder has more
+        // images than the root — that's the clearest signal that the
+        // root pick won't ingest anything.
+        const recommendedName = (bestSub && bestSub.image_count > rootImages)
+          ? bestSub.name : null;
+        // Root pick is disabled when it would ingest 0 files AND a
+        // subfolder offers a deliverable count. Keeps the "RAWs only at
+        // root + no rendition subfolder anywhere" case clickable so the
+        // wizard doesn't trap the user — they can still create the job
+        // and see the empty result if that's what they want.
+        const rootDisabled = rootImages === 0 && bestSub !== null;
+        const showRawWarning = rootImages === 0 && rootRaws > 0;
+
+        return (
         <section className="card">
           <h2>Where are the images?</h2>
           <p>
             Looking inside <code>{firstTeamPeek.name}</code>: found{' '}
-            <b>{firstTeamPeek.image_count}</b> images and <b>{firstTeamPeek.raw_count}</b> raws
+            <b>{rootImages}</b> images and <b>{rootRaws}</b> raws
             in the team-folder root, plus <b>{firstTeamPeek.subfolders.length}</b> subfolders.
           </p>
+          {showRawWarning && (
+            <p className="warn" style={{ background: '#fff3cd', padding: 8, borderRadius: 4 }}>
+              ⚠ The team-folder root has <b>0 supported-format images</b>
+              {' '}({rootRaws} RAW files, which can't be ingested directly).
+              {bestSub
+                ? <> Pick <b>"{bestSub.name}"</b> below — it has the renditions.</>
+                : <> No subfolder with deliverable images found either —
+                  this folder structure may need conversion before ingest.</>}
+            </p>
+          )}
           <p className="warn">
             The pattern you pick here applies to <b>every</b> team folder in the job.
           </p>
           <div className="wizard-choices">
-            <button onClick={() => chooseImageLocation(null)}>
+            <button
+              onClick={() => chooseImageLocation(null)}
+              disabled={rootDisabled}
+              title={rootDisabled
+                ? 'Disabled: the team-folder root has 0 supported-format images. Pick a subfolder.'
+                : undefined}
+              style={rootDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : undefined}
+            >
               Images are in the team-folder root
+              <span className="muted"> ({rootImages} images)</span>
+              {recommendedName === null && rootImages > 0 && (
+                <span style={{ marginLeft: 6, color: '#0a7d2a' }}> ★ Recommended</span>
+              )}
             </button>
-            {firstTeamPeek.subfolders.map((sub) => (
+            {subs.map((sub) => (
               <button key={sub.name} onClick={() => chooseImageLocation(sub.name)}>
                 Images are in subfolder "{sub.name}"
                 <span className="muted"> ({sub.image_count} images)</span>
+                {recommendedName === sub.name && (
+                  <span style={{ marginLeft: 6, color: '#0a7d2a' }}> ★ Recommended</span>
+                )}
               </button>
             ))}
           </div>
@@ -435,7 +489,8 @@ export default function JobWizard() {
             </button>
           </div>
         </section>
-      )}
+        );
+      })()}
 
       {/* Step 7: Create + progress */}
       {step === 'create' && (
