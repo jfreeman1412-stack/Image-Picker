@@ -37,19 +37,34 @@ export default function ClusterCard({
   // dismiss controls and handles the force-confirm inline if the backend
   // returns 409 with safety-guard impact.
   currentSessionName,  // name of the session this cluster currently lives in
-  teamOptions,         // [{session_id, name}] — sessions in this job (sans current)
-  onMoveWithGuards,    // async (cluster_id, target_session_id, force) → {ok, impact?}
-  onDismissCrossTeam,  // async (cluster_id) → void
+  // Move-card Phase 2 (2026-06-08): teamOptions shape expanded to include
+  // roster teams without sessions yet (Case 2) — each entry is
+  // {name, norm_name, session_id|null, archived}. A null session_id signals
+  // the smart-button and dropdown to invoke onMoveToNewSession instead of
+  // onMoveWithGuards. The "+ Add new team…" sentinel at the bottom of the
+  // dropdown opens the modal that drives Case 3 (onMoveToAddTeam).
+  teamOptions,
+  onMoveWithGuards,     // async (cluster_id, target_session_id, force) → {ok, impact?}
+  onMoveToNewSession,   // async (cluster_id, team_name, force) → {ok, impact?}      (Case 2)
+  onMoveToAddTeam,      // async (cluster_id, team_name, force) → {ok, impact?}      (Case 3)
+  onDismissCrossTeam,   // async (cluster_id) → void
   onUndismissCrossTeam, // async (cluster_id) → void
 }) {
   const [editing, setEditing] = useState(false);
   const [label, setLabel] = useState(cluster.label);
   const [openPopover, setOpenPopover] = useState(null); // image_id
   const [dropHover, setDropHover] = useState(false);
-  // Move-card inline state.
-  const [pickedSessionId, setPickedSessionId] = useState('');
-  const [blockedImpact, setBlockedImpact] = useState(null); // {impact, target_session_id}
+  // Move-card inline state. Phase 2 (2026-06-08) replaced the bare
+  // session-id selection with a richer pickedTarget that distinguishes
+  // (a) existing-session moves, (b) roster-team-without-session moves
+  // (Case 2 — auto-creates the session), and (c) the "+ Add new team…"
+  // modal entry point (Case 3). blockedImpact's `retry` carries the
+  // original handler so the force-confirm panel re-invokes the right
+  // case after the operator confirms.
+  const [pickedTarget, setPickedTarget] = useState('');     // dropdown selected value
+  const [blockedImpact, setBlockedImpact] = useState(null); // {impact, retry: () => Promise}
   const [moveBusy, setMoveBusy] = useState(false);
+  const [addTeamModal, setAddTeamModal] = useState(null);   // {typedName, error} or null
 
   // This card is a valid drop target only while an image from a *different*
   // cluster is being dragged.
@@ -144,35 +159,97 @@ export default function ClusterCard({
   const teamMismatchVisible = visibleReasons.includes('match_team_mismatch');
   const showMoveCardActions =
     !guest && onMoveWithGuards && (teamMismatchVisible || cluster.accepted_cross_team);
-  // Smart suggestion target: a session whose name case-insensitively
-  // matches the matched player's roster team. Phase 1 only handles Case 1
-  // (existing session); Phase 2 will add Case 2 (auto-create when team
-  // exists in roster but no session yet) and Case 3 (add new team).
+  // Move-card Phase 2 (2026-06-08): smart suggestion now finds a target
+  // whose name matches the matched player's roster team in EITHER form —
+  // an existing session (Case 1) or a roster-only team (Case 2). The
+  // button text + the handler branch on whether session_id is null.
   const rosterTeam = (cluster.match?.roster_team || '').toLowerCase();
   const smartTarget = teamOptions?.find(
-    (o) => o.name.toLowerCase() === rosterTeam,
+    (o) => !o.archived && o.name.toLowerCase() === rosterTeam,
+  );
+  const smartIsCase2 = smartTarget && smartTarget.session_id == null;
+
+  // The dropdown only ever shows non-archived targets, and excludes the
+  // smart-suggestion target (it already has its own button). The
+  // ADD_NEW_TEAM_SENTINEL is the last option — picking it opens the modal.
+  const ADD_NEW_TEAM = '__add_new_team__';
+  const dropdownOptions = (teamOptions || []).filter(
+    (o) => !o.archived && (!smartTarget || o.norm_name !== smartTarget.norm_name),
   );
 
-  const handleMove = async (targetSessionId, force) => {
-    if (!targetSessionId || moveBusy) return;
+  // Centralised force-confirm + busy bookkeeping. `runner` is an async
+  // closure that performs the move (already bound to the chosen
+  // case-2/3/1 endpoint + force flag). On 409 we capture `runner` so the
+  // "Force move" button re-invokes the SAME case path with force=true.
+  const runMove = async (runner, retryWithForce) => {
+    if (moveBusy) return;
     setMoveBusy(true);
     try {
-      const res = await onMoveWithGuards(
-        cluster.cluster_id, Number(targetSessionId), force,
-      );
+      const res = await runner();
       if (!res || res.ok) {
         setBlockedImpact(null);
-        setPickedSessionId('');
+        setPickedTarget('');
+        setAddTeamModal(null);
         return;
       }
       // 409 with impact: surface the force-confirm prompt.
-      setBlockedImpact({
-        impact: res.impact,
-        target_session_id: Number(targetSessionId),
-      });
+      setBlockedImpact({ impact: res.impact, retry: retryWithForce });
     } finally {
       setMoveBusy(false);
     }
+  };
+
+  // Three case dispatchers. Each closes over the team key + cluster id.
+  const moveToExistingSession = (sessionId, force) =>
+    runMove(
+      () => onMoveWithGuards(cluster.cluster_id, Number(sessionId), force),
+      () => moveToExistingSession(sessionId, true),
+    );
+
+  const moveToRosterTeam = (teamName, force) =>
+    runMove(
+      () => onMoveToNewSession(cluster.cluster_id, teamName, force),
+      () => moveToRosterTeam(teamName, true),
+    );
+
+  const moveToTypedTeam = (teamName, force) =>
+    runMove(
+      () => onMoveToAddTeam(cluster.cluster_id, teamName, force),
+      () => moveToTypedTeam(teamName, true),
+    );
+
+  // Pick from the dropdown. Routes Case 1 vs Case 2 based on session_id.
+  const handleDropdownPick = (force) => {
+    if (!pickedTarget || pickedTarget === ADD_NEW_TEAM) return;
+    const opt = dropdownOptions.find((o) => o.norm_name === pickedTarget);
+    if (!opt) return;
+    if (opt.session_id != null) {
+      moveToExistingSession(opt.session_id, force);
+    } else {
+      moveToRosterTeam(opt.name, force);
+    }
+  };
+
+  // The smart-suggestion button. Routes Case 1 vs Case 2 based on the
+  // target's session_id.
+  const handleSmartMove = (force) => {
+    if (!smartTarget) return;
+    if (smartTarget.session_id != null) {
+      moveToExistingSession(smartTarget.session_id, force);
+    } else {
+      moveToRosterTeam(smartTarget.name, force);
+    }
+  };
+
+  // Case 3 modal commit. Validates the typed name isn't blank locally
+  // (server-side validation is the source of truth for the rest).
+  const handleAddTeamCommit = () => {
+    const typed = (addTeamModal?.typedName || '').trim();
+    if (!typed) {
+      setAddTeamModal({ ...(addTeamModal || {}), error: 'Team name required.' });
+      return;
+    }
+    moveToTypedTeam(typed, false);
   };
 
   return (
@@ -283,7 +360,7 @@ export default function ClusterCard({
                 <button
                   className="danger"
                   disabled={moveBusy}
-                  onClick={() => handleMove(blockedImpact.target_session_id, true)}
+                  onClick={() => blockedImpact.retry && blockedImpact.retry()}
                 >
                   Force move
                 </button>
@@ -310,29 +387,44 @@ export default function ClusterCard({
                   <button
                     className="primary"
                     disabled={moveBusy}
-                    onClick={() => handleMove(smartTarget.session_id, false)}
+                    onClick={() => handleSmartMove(false)}
+                    title={smartIsCase2
+                      ? `Create a new session named "${smartTarget.name}" and move the card there`
+                      : `Move into the existing "${smartTarget.name}" session`}
                   >
                     Move card to {smartTarget.name}
+                    {smartIsCase2 && ' (new session)'}
                   </button>
                 )}
                 <select
-                  value={pickedSessionId}
-                  onChange={(e) => setPickedSessionId(e.target.value)}
+                  value={pickedTarget}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === ADD_NEW_TEAM) {
+                      setPickedTarget('');
+                      setAddTeamModal({ typedName: '', error: null });
+                      return;
+                    }
+                    setPickedTarget(v);
+                  }}
                   disabled={moveBusy}
                 >
                   <option value="">
                     {smartTarget ? 'Pick different team…' : 'Pick team…'}
                   </option>
-                  {(teamOptions || []).map((opt) => (
-                    <option key={opt.session_id} value={opt.session_id}>
+                  {dropdownOptions.map((opt) => (
+                    <option key={opt.norm_name} value={opt.norm_name}>
                       {opt.name}
+                      {opt.session_id == null ? ' (no session yet)' : ''}
                     </option>
                   ))}
+                  <option disabled>──────────</option>
+                  <option value={ADD_NEW_TEAM}>+ Add new team…</option>
                 </select>
-                {pickedSessionId && (
+                {pickedTarget && pickedTarget !== ADD_NEW_TEAM && (
                   <button
                     disabled={moveBusy}
-                    onClick={() => handleMove(pickedSessionId, false)}
+                    onClick={() => handleDropdownPick(false)}
                   >
                     Move
                   </button>
@@ -345,6 +437,68 @@ export default function ClusterCard({
                   Dismiss as cross-team
                 </button>
               </div>
+
+              {/* Move-card Phase 2: "+ Add new team…" modal (Case 3 entry).
+                  Inline panel — kept lightweight; the backend handles the
+                  three sub-cases (typed name matches existing session →
+                  Case 1, matches roster team → Case 2, brand new → Case 3
+                  with optional add_walkup_player). */}
+              {addTeamModal && (
+                <div
+                  className="add-team-modal"
+                  style={{
+                    marginTop: 8, padding: 8,
+                    border: '1px solid #aaa', borderRadius: 4,
+                    background: '#fafafa',
+                  }}
+                >
+                  <p style={{ margin: '0 0 6px 0' }}>
+                    <b>Add new team for this card:</b>
+                  </p>
+                  <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
+                    <input
+                      type="text"
+                      autoFocus
+                      placeholder="Team name (e.g. 11U Wildcats)"
+                      value={addTeamModal.typedName}
+                      onChange={(e) => setAddTeamModal({
+                        ...addTeamModal,
+                        typedName: e.target.value,
+                        error: null,
+                      })}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleAddTeamCommit();
+                        if (e.key === 'Escape') setAddTeamModal(null);
+                      }}
+                      disabled={moveBusy}
+                      style={{ flex: 1, minWidth: 180 }}
+                    />
+                    <button
+                      className="primary"
+                      disabled={moveBusy}
+                      onClick={handleAddTeamCommit}
+                    >
+                      Create & move
+                    </button>
+                    <button
+                      className="ghost"
+                      disabled={moveBusy}
+                      onClick={() => setAddTeamModal(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {addTeamModal.error && (
+                    <p style={{ margin: '6px 0 0 0', color: '#c00' }}>
+                      {addTeamModal.error}
+                    </p>
+                  )}
+                  <p style={{ margin: '6px 0 0 0', fontSize: '0.85em', color: '#666' }}>
+                    If this name matches a team you've already added (any case), we'll move
+                    the card into that team instead of creating a duplicate.
+                  </p>
+                </div>
+              )}
             </>
           )}
         </div>

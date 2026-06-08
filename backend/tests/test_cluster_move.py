@@ -755,3 +755,414 @@ def test_move_with_guards_target_archived_rejected(db):
             c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
         )
     assert exc.value.status_code == 400
+
+
+# ── Move-card Phase 2 (2026-06-08) ───────────────────────────────────────────
+#
+# Two new endpoints on top of cluster_move.py's Phase 1 machinery:
+#   POST /api/clusters/{cluster_id}/move-to-new-session
+#       Case 2 — the matched player's roster team has no session yet. Creates
+#       an empty session (status="done", source_path=NULL, name=team_name)
+#       then delegates to /move-with-guards. team_name must already exist in
+#       PlayerMembership for the job.
+#
+#   POST /api/clusters/{cluster_id}/move-to-add-team
+#       Case 3 — operator typed a brand-new team name in the "+ Add new team…"
+#       modal. Three internal sub-cases:
+#         (a) typed name normalizes to an existing session → falls through to
+#             the Case 1 path (just /move-with-guards into that session).
+#         (b) typed name normalizes to a roster team without a session →
+#             Case 2 fall-through (create empty session + move).
+#         (c) truly new team → add_walkup_player (only if cluster has a
+#             matched_player_id; silently skip the membership otherwise),
+#             create empty session, move.
+#
+# One new GET endpoint for the dropdown:
+#   GET /api/jobs/{job_id}/move-targets — returns roster teams (with/without
+#       sessions) so the FE can render the expanded dropdown + the smart-
+#       suggestion button when the target is roster-only (Case 2).
+#
+# Phase 1's /move-with-guards, /dismiss-cross-team, /undismiss-cross-team are
+# untouched — verified by the byte-identical regression tests at the bottom.
+
+from app.api.cluster_move import (
+    MoveToAddTeamRequest,
+    MoveToNewSessionRequest,
+    move_to_add_team,
+    move_to_new_session,
+)
+from app.api.jobs import get_move_targets
+from app.models.db_models import Player, PlayerMembership
+
+
+def _seed_membership(db, job, *, name: str, team: str, is_coach: int = 0):
+    """Find-or-create a global Player by raw name, attach a PlayerMembership
+    to this job. Returns the Player. Test-only convenience (the real loader
+    is replace_shoot_memberships / add_walkup_player)."""
+    from app.services.players import upsert_player
+    p, _ = upsert_player(db, name)
+    db.add(PlayerMembership(
+        player_id=p.id, job_id=job.id,
+        team_name=team, norm_team=team.lower().replace(" ", "").replace("-", ""),
+        is_coach=is_coach,
+    ))
+    db.commit(); db.refresh(p)
+    return p
+
+
+# ── GET /api/jobs/{id}/move-targets ─────────────────────────────────────────
+
+
+def test_move_targets_lists_session_teams_with_session_id(db):
+    """Existing sessions appear as targets with session_id populated."""
+    job, src, tgt = _job_with_two_sessions(
+        db, source_name="Aces", target_name="Bears",
+    )
+    res = get_move_targets(job.id, db)
+    by_name = {t["name"]: t for t in res["teams"]}
+    assert "Aces" in by_name and by_name["Aces"]["session_id"] == src.id
+    assert "Bears" in by_name and by_name["Bears"]["session_id"] == tgt.id
+    assert by_name["Aces"]["archived"] is False
+
+
+def test_move_targets_lists_roster_only_teams_with_null_session_id(db):
+    """Teams in PlayerMembership but with no session in this job get
+    session_id=None — these are the Case 2 dropdown rows."""
+    job, src, _ = _job_with_two_sessions(db, source_name="Aces", target_name="Bears")
+    # Wildcats is in the roster but has no session.
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    res = get_move_targets(job.id, db)
+    by_name = {t["name"]: t for t in res["teams"]}
+    assert "Wildcats" in by_name
+    assert by_name["Wildcats"]["session_id"] is None
+    assert by_name["Wildcats"]["archived"] is False
+
+
+def test_move_targets_marks_archived_sessions(db):
+    """Archived sessions still appear (operator might want context) but with
+    archived=True so the FE can filter them out of the dropdown."""
+    job, src, tgt = _job_with_two_sessions(db)
+    tgt.archived = 1
+    db.commit()
+    res = get_move_targets(job.id, db)
+    archived = [t for t in res["teams"] if t["archived"]]
+    assert any(t["session_id"] == tgt.id for t in archived)
+
+
+def test_move_targets_dedupes_when_session_and_roster_team_share_name(db):
+    """A session named 'Bears' AND a PlayerMembership team 'Bears' → ONE row
+    with session_id populated (not two rows)."""
+    job, src, tgt = _job_with_two_sessions(
+        db, source_name="Aces", target_name="Bears",
+    )
+    _seed_membership(db, job, name="Alice", team="Bears")  # same as session
+    res = get_move_targets(job.id, db)
+    bears_rows = [t for t in res["teams"] if t["name"].lower() == "bears"]
+    assert len(bears_rows) == 1
+    assert bears_rows[0]["session_id"] == tgt.id
+
+
+def test_move_targets_404_on_missing_job(db):
+    with pytest.raises(HTTPException) as exc:
+        get_move_targets(99999, db)
+    assert exc.value.status_code == 404
+
+
+# ── POST /api/clusters/{id}/move-to-new-session  (Case 2) ───────────────────
+
+
+def test_case2_creates_empty_session_status_done(db):
+    """The auto-created session has status='done' (so export sees it) and
+    source_path=NULL (no folder to ingest)."""
+    job, src, _ = _job_with_two_sessions(db)
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    res = move_to_new_session(
+        c.id, MoveToNewSessionRequest(team_name="Wildcats"), db,
+    )
+    new_sess = db.query(Session).get(res["target_session_id"])
+    assert new_sess.name == "Wildcats"
+    assert new_sess.status == "done"
+    assert new_sess.source_path is None
+    assert new_sess.job_id == job.id
+
+
+def test_case2_moves_cluster_into_new_session(db):
+    """Source cluster ends up in the new session, owned images relocated."""
+    job, src, _ = _job_with_two_sessions(db)
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    owned_ids = {f.image_id for f in db.query(Face).filter_by(cluster_id=c.id).all()}
+    res = move_to_new_session(
+        c.id, MoveToNewSessionRequest(team_name="Wildcats"), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == res["target_session_id"]
+    assert owned_ids == _image_ids_in_session(db, res["target_session_id"])
+
+
+def test_case2_rejects_team_not_in_roster(db):
+    """team_name must exist in PlayerMembership for this job — Case 2 is
+    'roster team without session'. Operators take Case 3 for brand-new
+    teams."""
+    job, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="x", image_count=1)
+    with pytest.raises(HTTPException) as exc:
+        move_to_new_session(
+            c.id, MoveToNewSessionRequest(team_name="NotARosterTeam"), db,
+        )
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"] == "team_not_in_roster"
+
+
+def test_case2_rejects_when_session_already_exists_for_team(db):
+    """If a non-archived session named team_name already exists, refuse —
+    the operator should use Case 1 (pick that session from the dropdown)."""
+    job, src, tgt = _job_with_two_sessions(
+        db, source_name="Aces", target_name="Bears",
+    )
+    _seed_membership(db, job, name="Alice", team="Bears")
+    c = _cluster_with_images(db, src, label="Alice", image_count=1)
+    with pytest.raises(HTTPException) as exc:
+        move_to_new_session(
+            c.id, MoveToNewSessionRequest(team_name="Bears"), db,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "session_already_exists"
+
+
+def test_case2_manual_override_blocks_without_force(db):
+    """Same Phase 1 guard applies: manual_override=1 → 409 with impact dict."""
+    job, src, _ = _job_with_two_sessions(db)
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    with pytest.raises(HTTPException) as exc:
+        move_to_new_session(
+            c.id, MoveToNewSessionRequest(team_name="Wildcats"), db,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["impact"]["manual_role_overrides"] >= 1
+
+
+def test_case2_reviewed_source_blocks_without_force(db):
+    """Same Phase 1 guard: source session reviewed=1 → 409."""
+    job, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    with pytest.raises(HTTPException) as exc:
+        move_to_new_session(
+            c.id, MoveToNewSessionRequest(team_name="Wildcats"), db,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["impact"]["source_session_reviewed"] is True
+
+
+def test_case2_force_bypasses_guards(db):
+    """force=True → move proceeds despite manual_override + reviewed source."""
+    job, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    res = move_to_new_session(
+        c.id, MoveToNewSessionRequest(team_name="Wildcats", force=True), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == res["target_session_id"]
+
+
+def test_case2_guard_block_does_not_create_session(db):
+    """The new session must NOT be created if the guard blocks the move —
+    otherwise repeated guard-blocked attempts would leak empty sessions."""
+    job, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    sessions_before = db.query(Session).filter_by(job_id=job.id).count()
+    with pytest.raises(HTTPException):
+        move_to_new_session(
+            c.id, MoveToNewSessionRequest(team_name="Wildcats"), db,
+        )
+    sessions_after = db.query(Session).filter_by(job_id=job.id).count()
+    assert sessions_after == sessions_before
+
+
+# ── POST /api/clusters/{id}/move-to-add-team  (Case 3) ──────────────────────
+
+
+def test_case3_fresh_team_creates_session_membership_and_moves(db):
+    """Typed name not in roster → add_walkup_player inserts the membership
+    (cluster has a matched player), empty session is created, cluster
+    moves."""
+    job, src, _ = _job_with_two_sessions(db)
+    alice = _seed_membership(db, job, name="Alice", team="Aces")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    c.matched_player_id = alice.id
+    c.match_tier = "high"
+    db.commit()
+    res = move_to_add_team(
+        c.id, MoveToAddTeamRequest(team_name="Wildcats"), db,
+    )
+    db.expire_all()
+    # New session with the typed name + Alice now has a Wildcats membership.
+    new_sess = db.query(Session).get(res["target_session_id"])
+    assert new_sess.name == "Wildcats"
+    assert new_sess.status == "done"
+    memberships = db.query(PlayerMembership).filter_by(
+        job_id=job.id, player_id=alice.id,
+    ).all()
+    team_names = {m.team_name for m in memberships}
+    assert "Wildcats" in team_names
+    # Cluster moved.
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == new_sess.id
+
+
+def test_case3_existing_team_match_falls_through_to_case2(db):
+    """Typed name normalizes to a roster team WITHOUT a session → Case 2 path:
+    create empty session, move. No duplicate membership row."""
+    job, src, _ = _job_with_two_sessions(db)
+    alice = _seed_membership(db, job, name="Alice", team="Wildcats")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    c.matched_player_id = alice.id; db.commit()
+    memberships_before = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    # User typed "wildcats" (different case) — should match existing.
+    res = move_to_add_team(
+        c.id, MoveToAddTeamRequest(team_name="wildcats"), db,
+    )
+    # No new membership created (already existed).
+    memberships_after = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    assert memberships_after == memberships_before
+    new_sess = db.query(Session).get(res["target_session_id"])
+    assert new_sess.name.lower() == "wildcats"
+
+
+def test_case3_existing_team_match_with_session_falls_through_to_case1(db):
+    """Typed name normalizes to an existing SESSION's name → Case 1 path:
+    just move into that session, no new session created."""
+    job, src, tgt = _job_with_two_sessions(
+        db, source_name="Aces", target_name="Bears",
+    )
+    c = _cluster_with_images(db, src, label="x", image_count=2)
+    sessions_before = db.query(Session).filter_by(job_id=job.id).count()
+    res = move_to_add_team(
+        c.id, MoveToAddTeamRequest(team_name="BEARS"), db,
+    )
+    sessions_after = db.query(Session).filter_by(job_id=job.id).count()
+    assert sessions_after == sessions_before  # no new session
+    assert res["target_session_id"] == tgt.id
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == tgt.id
+
+
+def test_case3_unmatched_cluster_skips_membership_but_creates_session_and_moves(db):
+    """Per spec: cluster with no matched_player_id → silently skip the
+    add_walkup_player call (no membership inserted), but still create the
+    session and move the cluster."""
+    job, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="auto-Alice", image_count=2)
+    # No matched_player_id set — cluster.match_tier=None.
+    assert c.matched_player_id is None
+    memberships_before = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    res = move_to_add_team(
+        c.id, MoveToAddTeamRequest(team_name="Wildcats"), db,
+    )
+    # No new membership.
+    memberships_after = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    assert memberships_after == memberships_before
+    # Session created + move happened.
+    new_sess = db.query(Session).get(res["target_session_id"])
+    assert new_sess.name == "Wildcats"
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == new_sess.id
+
+
+def test_case3_manual_override_blocks_without_force(db):
+    """Same Phase 1 guard applies to Case 3."""
+    job, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="x", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    with pytest.raises(HTTPException) as exc:
+        move_to_add_team(
+            c.id, MoveToAddTeamRequest(team_name="Wildcats"), db,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["impact"]["manual_role_overrides"] >= 1
+
+
+def test_case3_force_bypasses_guards(db):
+    """force=True bypasses Case 3 guards too."""
+    job, src, _ = _job_with_two_sessions(db)
+    src.reviewed = 1; db.commit()
+    c = _cluster_with_images(db, src, label="x", image_count=2)
+    _add_image_role(db, c, manual_override=1)
+    res = move_to_add_team(
+        c.id, MoveToAddTeamRequest(team_name="Wildcats", force=True), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == res["target_session_id"]
+
+
+def test_case3_guard_block_does_not_create_session_or_membership(db):
+    """Guard block in Case 3 must NOT leak an empty session OR a membership."""
+    job, src, _ = _job_with_two_sessions(db)
+    alice = _seed_membership(db, job, name="Alice", team="Aces")
+    c = _cluster_with_images(db, src, label="Alice", image_count=2)
+    c.matched_player_id = alice.id; db.commit()
+    _add_image_role(db, c, manual_override=1)
+    sessions_before = db.query(Session).filter_by(job_id=job.id).count()
+    memberships_before = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    with pytest.raises(HTTPException):
+        move_to_add_team(
+            c.id, MoveToAddTeamRequest(team_name="Wildcats"), db,
+        )
+    sessions_after = db.query(Session).filter_by(job_id=job.id).count()
+    memberships_after = db.query(PlayerMembership).filter_by(job_id=job.id).count()
+    assert sessions_after == sessions_before
+    assert memberships_after == memberships_before
+
+
+def test_case3_blank_team_name_rejected(db):
+    """Sanity: empty / whitespace-only typed name → 400."""
+    job, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="x", image_count=1)
+    with pytest.raises(HTTPException) as exc:
+        move_to_add_team(c.id, MoveToAddTeamRequest(team_name="   "), db)
+    assert exc.value.status_code == 400
+
+
+# ── Phase 1 endpoints byte-identical regression ─────────────────────────────
+
+
+def test_phase1_move_with_guards_still_byte_identical(db):
+    """Phase 2 layered Case 2/3 endpoints next to /move-with-guards but did
+    NOT modify it. This test re-runs Phase 1's happy path to lock it."""
+    _, src, tgt = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=2)
+    c.accepted_cross_team = 1; db.commit()
+    res = move_cluster_with_guards(
+        c.id, MoveWithGuardsRequest(target_session_id=tgt.id), db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(c.id)
+    assert moved.session_id == tgt.id
+    assert moved.accepted_cross_team == 0
+    assert res["status"] == "moved"
+
+
+def test_phase1_dismiss_still_byte_identical(db):
+    """Phase 1.5's atomic chip+badge clear behavior — locked again here so
+    Phase 2 builds can't break it without test failure."""
+    _, src, _ = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, label="L", image_count=1)
+    res = dismiss_cross_team(c.id, DismissCrossTeamRequest(), db)
+    db.refresh(c)
+    assert c.accepted_cross_team == 1
+    assert res["accepted_cross_team"] is True

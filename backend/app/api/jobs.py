@@ -511,6 +511,57 @@ def _purge_session_rows(db: DbSession, session) -> None:
     _delete_thumbs(image_ids)
 
 
+# ── Move-card Phase 2 (2026-06-08): move-targets dropdown source ────────────
+
+
+@router.get("/{job_id}/move-targets")
+def get_move_targets(job_id: int, db: DbSession = Depends(get_db)):
+    """Return every team that's a candidate destination for a move-card move:
+    union of (a) sessions in this job and (b) distinct PlayerMembership
+    teams in this job. A team that has both a session AND roster rows
+    collapses into ONE row with session_id populated.
+
+    Shape: {"teams": [{"name", "norm_name", "session_id"|null, "archived"}]}
+    Sorted by name (case-insensitive) for stable dropdown order.
+
+    The frontend's smart-suggestion button now uses this list directly — a
+    target with session_id=null fires Case 2 (auto-create session + move),
+    a target with session_id set fires Case 1 (Phase 1's /move-with-guards).
+    The "+ Add new team…" modal at the bottom of the dropdown drives Case 3.
+    """
+    from app.services.roster import normalize_name
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+
+    # Sessions first — they carry the authoritative archived/session_id state.
+    by_norm: dict[str, dict] = {}
+    for s in job.sessions:
+        norm = normalize_name(s.name) or s.name.lower()
+        by_norm[norm] = {
+            "name": s.name,
+            "norm_name": norm,
+            "session_id": s.id,
+            "archived": bool(s.archived),
+        }
+
+    # Layer roster-only teams: skip any team whose norm collides with a
+    # session row (the session is the source of truth for the display name +
+    # archived state).
+    for m in db.query(PlayerMembership).filter_by(job_id=job_id).all():
+        if m.norm_team in by_norm:
+            continue
+        by_norm[m.norm_team] = {
+            "name": m.team_name,
+            "norm_name": m.norm_team,
+            "session_id": None,
+            "archived": False,
+        }
+
+    teams = sorted(by_norm.values(), key=lambda t: t["name"].lower())
+    return {"teams": teams}
+
+
 @router.delete("/{job_id}")
 def delete_job(job_id: int, db: DbSession = Depends(get_db)):
     """Permanently delete a job: cascades to sessions, images, faces,

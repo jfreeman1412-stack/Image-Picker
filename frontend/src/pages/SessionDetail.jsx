@@ -64,7 +64,21 @@ export default function SessionDetail() {
 
     if (s.job_id) {
       const jRes = await fetch(`/api/jobs/${s.job_id}`);
-      setJob(jRes.ok ? await jRes.json() : null);
+      const jBody = jRes.ok ? await jRes.json() : null;
+      // Move-card Phase 2: hydrate the move-targets list onto the same job
+      // object so ClusterCard's dropdown sees roster-only teams as well as
+      // existing sessions. Failure leaves job.move_targets undefined and
+      // ClusterCard falls back to an empty dropdown (degrades gracefully).
+      if (jBody) {
+        try {
+          const mtRes = await fetch(`/api/jobs/${s.job_id}/move-targets`);
+          if (mtRes.ok) {
+            const mt = await mtRes.json();
+            jBody.move_targets = Array.isArray(mt?.teams) ? mt.teams : [];
+          }
+        } catch { /* leave move_targets undefined on network blip */ }
+      }
+      setJob(jBody);
     } else {
       setJob(null);
     }
@@ -311,13 +325,38 @@ export default function SessionDetail() {
     (a, b) => (a.guest_of ? 1 : 0) - (b.guest_of ? 1 : 0),
   );
 
-  // Move-card Phase 1 (2026-06-03): build dropdown options + handlers.
-  // teamOptions excludes the current session and any archived sessions —
-  // Phase 1 only handles Case 1 (move to existing session). Phase 2 will
-  // surface roster teams without sessions yet (Case 2) + add-new-team UI.
-  const moveCardTeamOptions = (job?.sessions || [])
-    .filter((s) => s.id !== session.id && !s.archived)
-    .map((s) => ({ session_id: s.id, name: s.name }));
+  // Move-card Phase 2 (2026-06-08): dropdown source is now the
+  // /move-targets endpoint, which unions sessions + roster-only teams.
+  // teamOptions excludes the current session; ClusterCard handles the
+  // archived filter (it surfaces archived flags for context).
+  const moveTargets = job?.move_targets || [];
+  const moveCardTeamOptions = moveTargets
+    .filter((t) => t.session_id !== session.id);
+
+  // 409 → impact dict for the inline force-confirm prompt; 4xx that's NOT
+  // a guard block (team_not_in_roster, session_already_exists, missing_team_name)
+  // surface a friendlier inline message via window.alert for now — they
+  // shouldn't happen through the UI's happy paths but the operator deserves
+  // a clear message if one does.
+  const parseMoveResponse = async (res) => {
+    if (res.ok) {
+      await load();
+      return { ok: true };
+    }
+    let body;
+    try { body = await res.json(); } catch { body = null; }
+    const detail = body?.detail || {};
+    if (res.status === 409 && detail.impact) {
+      return { ok: false, impact: detail.impact };
+    }
+    // Non-guard rejection (validation or duplicate session). Surface the
+    // message inline and treat as a non-impact non-ok so the caller can
+    // close the inline busy state without showing the force-confirm panel.
+    if (detail.message) {
+      window.alert(detail.message);
+    }
+    return { ok: false, impact: {} };
+  };
 
   const onMoveWithGuards = async (clusterId, targetSessionId, force) => {
     const res = await fetch(`/api/clusters/${clusterId}/move-with-guards`, {
@@ -328,19 +367,25 @@ export default function SessionDetail() {
         force: !!force,
       }),
     });
-    if (res.ok) {
-      await load();   // refresh cluster list — moved cluster vanishes
-      return { ok: true };
-    }
-    if (res.status === 409) {
-      try {
-        const body = await res.json();
-        return { ok: false, impact: body?.detail?.impact || {} };
-      } catch {
-        return { ok: false, impact: {} };
-      }
-    }
-    return { ok: false, impact: {} };
+    return parseMoveResponse(res);
+  };
+
+  const onMoveToNewSession = async (clusterId, teamName, force) => {
+    const res = await fetch(`/api/clusters/${clusterId}/move-to-new-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ team_name: teamName, force: !!force }),
+    });
+    return parseMoveResponse(res);
+  };
+
+  const onMoveToAddTeam = async (clusterId, teamName, force) => {
+    const res = await fetch(`/api/clusters/${clusterId}/move-to-add-team`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ team_name: teamName, force: !!force }),
+    });
+    return parseMoveResponse(res);
   };
 
   const onDismissCrossTeam = async (clusterId) => {
@@ -449,6 +494,8 @@ export default function SessionDetail() {
             currentSessionName={session.name}
             teamOptions={moveCardTeamOptions}
             onMoveWithGuards={onMoveWithGuards}
+            onMoveToNewSession={onMoveToNewSession}
+            onMoveToAddTeam={onMoveToAddTeam}
             onDismissCrossTeam={onDismissCrossTeam}
             onUndismissCrossTeam={onUndismissCrossTeam}
           />

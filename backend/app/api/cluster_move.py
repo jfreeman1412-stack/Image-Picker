@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.api.clusters import _resort_session_outliers
 from app.db import get_db
-from app.models.db_models import Cluster, Face, Image, ImageRole, Session
+from app.models.db_models import Cluster, Face, Image, ImageRole, Player, Session
 from app.services import matching
 from app.services.face_pipeline import _sort_cluster
 from app.services.roster import normalize_name
@@ -386,6 +386,258 @@ def undismiss_cross_team(
         "cluster_id": c.id,
         "accepted_cross_team": False,
     }
+
+
+# ── Move-card Phase 2 (2026-06-08) ───────────────────────────────────────────
+#
+# Two new endpoints that extend Phase 1's safety-guarded move to two cases the
+# operator runs into when the matched player's roster team has no session yet:
+#
+#   POST /{cluster_id}/move-to-new-session  (Case 2)
+#       team_name is a known roster team (in PlayerMembership for this job)
+#       that has no session yet. We auto-create an empty session and move.
+#
+#   POST /{cluster_id}/move-to-add-team  (Case 3)
+#       team_name comes from the "+ Add new team…" modal. It might (a) match
+#       an existing session, (b) match an existing roster team without a
+#       session, or (c) be brand new. The endpoint figures out which sub-case
+#       it actually is and delegates internally; for (c) it also inserts a
+#       PlayerMembership row for the cluster's matched player (silently
+#       skipped when the cluster has no matched player — per spec the new
+#       team exists as a session only and player ID happens later).
+#
+# Both endpoints reuse Phase 1's _check_move_safety and the existing
+# move_cluster(mode="create") machinery. The auto-created session has
+# status="done" + source_path=NULL so the export pipeline (which keys off
+# status=="done") sees it as soon as a cluster lands in it.
+
+
+class MoveToNewSessionRequest(BaseModel):
+    team_name: str
+    # Same semantics as MoveWithGuardsRequest.force: bypass _check_move_safety
+    # for an operator who confirmed the work-loss risk.
+    force: bool = False
+
+
+class MoveToAddTeamRequest(BaseModel):
+    team_name: str
+    force: bool = False
+
+
+def _norm_team(s: str) -> str:
+    """Match Phase A.1's norm_team rule for case-insensitive team-name
+    comparisons (replace_shoot_memberships writes the same key)."""
+    from app.services.roster import normalize_name
+    return normalize_name(s)
+
+
+def _find_session_in_job_by_name(
+    db: DbSession, job_id: int, team_name: str,
+) -> Session | None:
+    """Case-insensitive lookup for a non-archived session in this job whose
+    name matches team_name. None if not found."""
+    target_norm = _norm_team(team_name)
+    if not target_norm:
+        return None
+    for s in db.query(Session).filter_by(job_id=job_id, archived=0).all():
+        if _norm_team(s.name) == target_norm:
+            return s
+    return None
+
+
+def _roster_team_exists(db: DbSession, job_id: int, team_name: str) -> bool:
+    """True iff any PlayerMembership row in this job has norm_team matching
+    the normalized team_name. Drives Case 3's existing-team-match branch."""
+    from app.models.db_models import PlayerMembership
+    target_norm = _norm_team(team_name)
+    if not target_norm:
+        return False
+    return db.query(PlayerMembership).filter_by(
+        job_id=job_id, norm_team=target_norm,
+    ).first() is not None
+
+
+def _create_empty_session(
+    db: DbSession, job_id: int, team_name: str,
+) -> Session:
+    """Create an empty session for Phase 2 auto-routing. status='done' so the
+    export pipeline includes it once a cluster moves in; source_path=NULL
+    since there is no folder to ingest. Caller commits."""
+    from datetime import datetime
+    s = Session(
+        job_id=job_id,
+        name=team_name,
+        source_path=None,
+        status="done",
+        created_at=datetime.utcnow(),
+    )
+    db.add(s)
+    db.flush()
+    return s
+
+
+@router.post("/{cluster_id}/move-to-new-session")
+def move_to_new_session(
+    cluster_id: int,
+    payload: MoveToNewSessionRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Case 2: matched player's roster team has no session yet. Validate
+    that team_name IS in PlayerMembership for the job (Case 2's precondition
+    — Case 3 handles brand-new teams), reject if a non-archived session of
+    the same name already exists, check Phase 1's safety guards, create
+    the empty session, then delegate to move_cluster(mode='create').
+
+    On guard block we 409 BEFORE creating the session so guard-blocked
+    attempts don't leak orphan empty sessions."""
+    source = db.query(Cluster).get(cluster_id)
+    if source is None:
+        raise HTTPException(404, "Source cluster not found")
+    source_session = db.query(Session).get(source.session_id)
+    if source_session is None or source_session.job_id is None:
+        raise HTTPException(400, "Source session has no job")
+    job_id = source_session.job_id
+
+    team_name = (payload.team_name or "").strip()
+    if not team_name:
+        raise HTTPException(400, detail={
+            "error": "missing_team_name",
+            "message": "team_name is required.",
+        })
+    if not _roster_team_exists(db, job_id, team_name):
+        raise HTTPException(400, detail={
+            "error": "team_not_in_roster",
+            "message": f"'{team_name}' is not in this job's roster. Use "
+                       "the 'Add new team' flow for brand-new teams.",
+        })
+    if _find_session_in_job_by_name(db, job_id, team_name) is not None:
+        raise HTTPException(409, detail={
+            "error": "session_already_exists",
+            "message": f"A session named '{team_name}' already exists in "
+                       "this job. Pick it from the team dropdown instead.",
+        })
+
+    # Phase 1 guards BEFORE session creation — guard-blocked attempts must
+    # not leak orphan empty sessions.
+    impact = _check_move_safety(db, source, force=payload.force)
+    if impact is not None:
+        raise HTTPException(409, detail={
+            "error": "move_blocked",
+            "message": (
+                "This cluster has operator-locked work that would be "
+                "carried by the move (manual role picks) or comes from a "
+                "reviewed session. Pass force=true to proceed."
+            ),
+            "impact": impact,
+            "cluster_id": cluster_id,
+        })
+
+    new_sess = _create_empty_session(db, job_id, team_name)
+    db.commit()
+
+    result = move_cluster(
+        cluster_id,
+        MoveRequest(target_session_id=new_sess.id, mode="create"),
+        db,
+    )
+    # Same post-move bookkeeping as /move-with-guards.
+    db.expire_all()
+    moved = db.query(Cluster).get(cluster_id)
+    if moved is not None and moved.accepted_cross_team:
+        moved.accepted_cross_team = 0
+        db.commit()
+    return result
+
+
+@router.post("/{cluster_id}/move-to-add-team")
+def move_to_add_team(
+    cluster_id: int,
+    payload: MoveToAddTeamRequest,
+    db: DbSession = Depends(get_db),
+):
+    """Case 3: operator typed a team name in the "+ Add new team…" modal.
+    Three internal branches:
+
+      (a) Name normalizes to an existing non-archived session → Case 1: just
+          /move-with-guards into that session. No new session, no new
+          membership.
+      (b) Name normalizes to a roster team without a session → Case 2 path:
+          create empty session, move. No new membership (already in roster).
+      (c) Truly new team → add_walkup_player IFF the cluster has a
+          matched_player_id (silently skip the membership otherwise per
+          spec); create empty session; move.
+
+    Phase 1 guards apply uniformly — checked BEFORE any session/membership
+    creation so a guard-blocked Case 3 leaks neither artifact."""
+    from app.models.db_models import PlayerMembership
+    from app.services.players import add_walkup_player
+
+    source = db.query(Cluster).get(cluster_id)
+    if source is None:
+        raise HTTPException(404, "Source cluster not found")
+    source_session = db.query(Session).get(source.session_id)
+    if source_session is None or source_session.job_id is None:
+        raise HTTPException(400, "Source session has no job")
+    job_id = source_session.job_id
+
+    team_name = (payload.team_name or "").strip()
+    if not team_name:
+        raise HTTPException(400, detail={
+            "error": "missing_team_name",
+            "message": "team_name is required.",
+        })
+
+    # Guard check FIRST so a block leaks neither a session nor a membership.
+    impact = _check_move_safety(db, source, force=payload.force)
+    if impact is not None:
+        raise HTTPException(409, detail={
+            "error": "move_blocked",
+            "message": (
+                "This cluster has operator-locked work that would be "
+                "carried by the move (manual role picks) or comes from a "
+                "reviewed session. Pass force=true to proceed."
+            ),
+            "impact": impact,
+            "cluster_id": cluster_id,
+        })
+
+    # (a) Name matches an existing session → Case 1 fall-through.
+    existing = _find_session_in_job_by_name(db, job_id, team_name)
+    if existing is not None:
+        return move_cluster(
+            cluster_id,
+            MoveRequest(target_session_id=existing.id, mode="create"),
+            db,
+        )
+
+    # (b) Name matches a roster team without a session → Case 2 fall-through.
+    # No add_walkup_player needed — the player(s) are already in the roster
+    # for this team.
+    is_roster_team = _roster_team_exists(db, job_id, team_name)
+    new_sess = _create_empty_session(db, job_id, team_name)
+    db.commit()
+
+    if not is_roster_team:
+        # (c) Truly new team. Add the cluster's matched player to it via the
+        # Phase B.5 walkup path — but only when the cluster IS matched. An
+        # unmatched cluster yields a session with no members (operator will
+        # rename + add roster row later).
+        if source.matched_player_id is not None:
+            player = db.query(Player).get(source.matched_player_id)
+            if player is not None:
+                add_walkup_player(db, job_id, player.display_name, team_name)
+
+    result = move_cluster(
+        cluster_id,
+        MoveRequest(target_session_id=new_sess.id, mode="create"),
+        db,
+    )
+    db.expire_all()
+    moved = db.query(Cluster).get(cluster_id)
+    if moved is not None and moved.accepted_cross_team:
+        moved.accepted_cross_team = 0
+        db.commit()
+    return result
 
 
 @router.post("/{cluster_id}/global-match-suggest")
