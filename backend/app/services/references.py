@@ -49,12 +49,36 @@ class ReferenceQualityError(ValueError):
 
 # ── the quality gate (pure — the heart of the phase) ─────────────────────
 
-def evaluate_reference_quality(detections: list[dict]) -> dict:
+
+def _iou(box_a: list[int], box_b: list[int]) -> float:
+    """Intersection-over-Union for two [x, y, w, h] boxes. Phase B.6 helper
+    for selected_bbox face picking. Returns 0.0 for disjoint boxes."""
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax + aw, bx + bw)
+    iy2 = min(ay + ah, by + bh)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def evaluate_reference_quality(
+    detections: list[dict],
+    *,
+    selected_bbox: list[int] | None = None,
+    allow_low_confidence: bool = False,
+) -> dict:
     """Pick the single reference face from a detection list, or raise
     ReferenceQualityError with a clear code+message. Pure — no I/O, no model —
     so it's unit-tested directly with hand-built dicts.
 
-    Order matters; first failure wins:
+    Default order (no kwargs — A.2 behavior, byte-for-byte unchanged):
       no_face        — zero faces (also covers an unreadable image, which
                        detect_faces returns as [])
       multiple_faces — 2+ faces at the DET_SCORE_THRESHOLD (0.5) floor (ANY
@@ -62,6 +86,18 @@ def evaluate_reference_quality(detections: list[dict]) -> dict:
                        over-caught rather than risk a poisoned reference)
       low_confidence — the single face is below REF_MIN_DET_SCORE
       face_too_small — the single face's area ratio is below REF_MIN_AREA_RATIO
+
+    Phase B.6 salvage kwargs:
+      selected_bbox=[x, y, w, h] — operator tapped this face in a
+        multiple_faces situation. Skips the multiplicity check and picks
+        the face with highest IoU against the box. Raises
+        selected_face_not_found if no face overlaps (defensive — identical
+        bytes detect identically, so this is rare).
+      allow_low_confidence=True — operator's deliberate "use anyway" on a
+        low_confidence single face. Bypasses the low_confidence raise.
+        face_too_small is ALWAYS enforced (would store an unusable
+        embedding) regardless of this flag.
+
     Returns the chosen detection dict on success.
     """
     # detect_faces() already drops anything below DET_SCORE_THRESHOLD, but be
@@ -73,13 +109,30 @@ def evaluate_reference_quality(detections: list[dict]) -> dict:
             "no_face",
             "No face was detected in the photo (or the file isn't a readable "
             "image). Retake with the player's face clearly in frame.")
-    if len(faces) > 1:
-        raise ReferenceQualityError(
-            "multiple_faces",
-            f"{len(faces)} faces detected. A reference photo must show exactly "
-            "one person — make sure no one else is in frame.")
-    face = faces[0]
-    if face["det_score"] < REF_MIN_DET_SCORE:
+
+    if selected_bbox is not None:
+        # Pick the face with highest IoU; an all-zero IoU run means the
+        # operator tapped somewhere no face was detected.
+        scored = sorted(
+            ((_iou(selected_bbox, f["bbox"]), f) for f in faces),
+            key=lambda t: t[0], reverse=True,
+        )
+        best_iou, best_face = scored[0]
+        if best_iou <= 0.0:
+            raise ReferenceQualityError(
+                "selected_face_not_found",
+                "The face you selected doesn't match any detected face in "
+                "the photo. Tap a face box and try again.")
+        face = best_face
+    else:
+        if len(faces) > 1:
+            raise ReferenceQualityError(
+                "multiple_faces",
+                f"{len(faces)} faces detected. A reference photo must show "
+                "exactly one person — make sure no one else is in frame.")
+        face = faces[0]
+
+    if face["det_score"] < REF_MIN_DET_SCORE and not allow_low_confidence:
         raise ReferenceQualityError(
             "low_confidence",
             "Face detection confidence is too low. Retake in better lighting, "
@@ -124,9 +177,13 @@ def _write_temp(data: bytes, ext: str) -> Path:
 def _store_reference(
     db: DbSession, player_id: int, captured_job_id: int | None,
     face: dict, tmp: Path, ext: str, original_filename: str | None,
+    *, accepted_via: str | None = None,
 ) -> dict:
     """Persist a validated face: create the row (flush for id), move the temp
-    file to references/{player_id}/{id}{ext}, commit, return the summary."""
+    file to references/{player_id}/{id}{ext}, commit, return the summary.
+
+    Phase B.6: accepted_via stamps how the row was accepted (NULL keeps
+    today's A.2/B.2 behavior — pre-B.6 rows and the unchanged B.2 PUT)."""
     ref = ReferenceFace(
         player_id=player_id,
         captured_job_id=captured_job_id,
@@ -136,6 +193,7 @@ def _store_reference(
         det_score=float(face["det_score"]),
         bbox=json.dumps(face["bbox"]),
         face_area_ratio=face.get("face_area_ratio"),
+        accepted_via=accepted_via,
     )
     db.add(ref)
     db.flush()  # assign ref.id
@@ -153,6 +211,7 @@ def _store_reference(
         "det_score": ref.det_score,
         "face_area_ratio": ref.face_area_ratio,
         "image_path": ref.image_path,
+        "accepted_via": ref.accepted_via,
     }
 
 
@@ -322,3 +381,99 @@ def delete_shoot_references(db: DbSession, player_id: int, job_id: int) -> dict:
     n = _wipe_player_references_for_job(db, player_id, job_id)
     db.commit()
     return {"deleted": n}
+
+
+# ── Phase B.6 — salvage paths ────────────────────────────────────────────
+
+
+def _read_image_dims(path: Path) -> tuple[int, int]:
+    """Return (width, height) of an image without loading the full data.
+    Pillow's open is lazy, so this is cheap. Wrapped in its own function
+    so tests can monkeypatch it without needing real image bytes."""
+    from PIL import Image as PILImage
+    with PILImage.open(path) as img:
+        return img.size  # (width, height)
+
+
+def detect_reference_faces(
+    db: DbSession, player_id: int, job_id: int, data: bytes, *,
+    original_filename: str | None = None,
+) -> dict:
+    """Phase B.6 — read-only face detection over the uploaded bytes for
+    the salvage UI. Returns image dimensions + every detected face's
+    bbox/det_score/face_area_ratio plus a stable index. Writes nothing.
+
+    Defensively re-filters by DET_SCORE_THRESHOLD so the UI's tap-targets
+    can never include a sub-floor face the gate would later reject as
+    not-found. 404 if the player or the job is missing."""
+    _require_player(db, player_id)
+    _require_job_if_given(db, job_id)
+    ext = _safe_ext(original_filename)
+    tmp = _write_temp(data, ext)
+    try:
+        width, height = _read_image_dims(tmp)
+        raw = face_detector.detect_faces(tmp)
+        faces = []
+        for i, f in enumerate([d for d in raw if d["det_score"] >= DET_SCORE_THRESHOLD]):
+            faces.append({
+                "index": i,
+                "bbox": list(f["bbox"]),
+                "det_score": float(f["det_score"]),
+                "face_area_ratio": f.get("face_area_ratio"),
+            })
+        return {"width": width, "height": height, "faces": faces}
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def resolve_shoot_reference(
+    db: DbSession, player_id: int, job_id: int, data: bytes, *,
+    selected_bbox: list[int] | None = None,
+    allow_low_confidence: bool = False,
+    original_filename: str | None = None,
+) -> dict:
+    """Phase B.6 — operator-driven salvage of a previously rejected
+    capture. Same scoped-replace semantics as `replace_shoot_reference`
+    (validate → wipe this shoot's refs for this player → store the new
+    one tagged with `captured_job_id == job_id`), but the gate accepts
+    salvage kwargs:
+
+      selected_bbox=[x,y,w,h] → multiple_faces salvage (pick the operator-
+        tapped face). On no overlap, raises selected_face_not_found.
+      allow_low_confidence=True → low-confidence override. face_too_small
+        is ALWAYS enforced regardless.
+
+    accepted_via on the stored row records which path was taken:
+      both unset → 'normal'   (resolve called without salvage kwargs)
+      selected_bbox set → 'face_select'
+      allow_low_confidence only → 'low_conf_override'
+      both → 'face_select' (the face-pick is the dominant operator action;
+        the low-conf override is the consequential one)
+
+    Default-arg call is byte-for-byte equivalent to replace_shoot_reference
+    except for `accepted_via='normal'` on the stored row. 404 if player or
+    job missing; 400 (via ReferenceQualityError) on a gate rejection."""
+    _require_player(db, player_id)
+    _require_job_if_given(db, job_id)
+    ext = _safe_ext(original_filename)
+    tmp = _write_temp(data, ext)
+    try:
+        face = evaluate_reference_quality(
+            face_detector.detect_faces(tmp),
+            selected_bbox=selected_bbox,
+            allow_low_confidence=allow_low_confidence,
+        )
+        accepted_via = (
+            "face_select" if selected_bbox is not None
+            else "low_conf_override" if allow_low_confidence
+            else "normal"
+        )
+        _wipe_player_references_for_job(db, player_id, job_id)
+        return _store_reference(
+            db, player_id, job_id, face, tmp, ext, original_filename,
+            accepted_via=accepted_via,
+        )
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)

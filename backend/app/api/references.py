@@ -16,7 +16,9 @@ PHASE_A2_REFERENCE_UPLOAD.md.
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+import json
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session as DbSession
 
@@ -24,8 +26,8 @@ from app.db import get_db
 from app.models.db_models import ReferenceFace
 from app.services.references import (
     ReferenceQualityError, add_reference, delete_reference,
-    delete_shoot_references, list_references, replace_player_references,
-    replace_shoot_reference,
+    delete_shoot_references, detect_reference_faces, list_references,
+    replace_player_references, replace_shoot_reference, resolve_shoot_reference,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,3 +132,67 @@ def delete_shoot_reference_endpoint(
     """Remove this player's reference(s) FOR THIS shoot only. Idempotent;
     other shoots untouched."""
     return delete_shoot_references(db, player_id, job_id)
+
+
+# ── Phase B.6 — salvage routes (additive; B.2 PUT above stays frozen) ────
+
+
+@router.post("/{player_id}/references/shoot/{job_id}/detect")
+async def detect_route(
+    player_id: int,
+    job_id: int,
+    file: UploadFile = File(...),
+    db: DbSession = Depends(get_db),
+):
+    """Phase B.6 — read-only face detection over the uploaded bytes.
+    Returns {width, height, faces:[{index, bbox, det_score,
+    face_area_ratio}]}. Writes nothing. Powers the operator's tap-target
+    overlay in the capture app's Needs-attention salvage flow.
+
+    Same 404s as the family (player or job missing). Same multipart shape
+    as the B.2 PUT so the capture app reuses the upload helper."""
+    data = await file.read()
+    return detect_reference_faces(
+        db, player_id, job_id, data, original_filename=file.filename)
+
+
+@router.post("/{player_id}/references/shoot/{job_id}/resolve")
+async def resolve_route(
+    player_id: int,
+    job_id: int,
+    file: UploadFile = File(...),
+    selected_bbox: str | None = Form(None),     # JSON-encoded [x, y, w, h]
+    allow_low_confidence: bool = Form(False),
+    db: DbSession = Depends(get_db),
+):
+    """Phase B.6 — operator-driven salvage. Validates with the extended
+    gate (selected_bbox + allow_low_confidence), then scoped-replaces
+    this player's references for this shoot (same wipe-then-store
+    semantics as the B.2 PUT — which stays byte-for-byte unchanged).
+
+    Form `selected_bbox` is a JSON string `[x,y,w,h]` or omitted.
+    Form `allow_low_confidence` is bool (default False).
+    Both omitted → equivalent to the B.2 PUT path but with
+    `accepted_via='normal'` stamped on the row."""
+    parsed_bbox: list[int] | None = None
+    if selected_bbox is not None:
+        try:
+            parsed_bbox = json.loads(selected_bbox)
+            if (not isinstance(parsed_bbox, list) or len(parsed_bbox) != 4
+                    or not all(isinstance(v, (int, float)) for v in parsed_bbox)):
+                raise ValueError("selected_bbox must be [x, y, w, h]")
+            parsed_bbox = [int(v) for v in parsed_bbox]
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, detail={
+                "error": "bad_selected_bbox", "message": str(exc),
+            })
+    data = await file.read()
+    try:
+        return resolve_shoot_reference(
+            db, player_id, job_id, data,
+            selected_bbox=parsed_bbox,
+            allow_low_confidence=allow_low_confidence,
+            original_filename=file.filename,
+        )
+    except ReferenceQualityError as exc:
+        raise _quality_400(exc)

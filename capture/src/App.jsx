@@ -269,6 +269,20 @@ export default function App() {
     refreshLocalPlayers();
   };
 
+  // Phase B.6 (2026-06-08) — Select-face salvage completed successfully.
+  // The /resolve call already returned 200 (the panel handles that),
+  // so all we do here is the post-success bookkeeping that mirrors a
+  // drainer SYNC: drop the queue item, flip the offline cache to synced,
+  // and refresh the ✓ badge on the roster.
+  const resolvedFailed = async (item) => {
+    await removeQueueItem(item.id);
+    markRosterSynced(item.jobId, item.playerId);
+    if (item.jobId === selectedJob?.id) {
+      setReferencedPlayerIds((prev) => new Set(prev).add(item.playerId));
+    }
+    refreshQueue();
+  };
+
   if (view === 'shoots') {
     return (
       <ShootPicker
@@ -287,6 +301,7 @@ export default function App() {
         items={failedItems}
         onReshoot={reshootFailed}
         onDiscard={discardFailed}
+        onResolved={resolvedFailed}
         onBack={() => setView('roster')}
       />
     );

@@ -169,9 +169,15 @@ async function uploadItem(item) {
     }
     if (res.status === 400) {
       const body = await res.json().catch(() => ({}));
+      // Phase B.6 Section 4 (2026-06-08): store the rejection CODE alongside
+      // the message, so NeedsAttention can branch its salvage actions on it
+      // (`multiple_faces` → Select-face, `low_confidence` → Use-anyway).
+      // Existing items captured pre-B.6 carry no failReason → NeedsAttention
+      // self-classifies them via the /detect probe (graceful fallback).
       await updateQueueItem(item.id, {
         status: QUEUE_STATUS.FAILED_QUALITY,
         lastError: body?.detail?.message || body?.detail?.error || 'Quality check failed.',
+        failReason: body?.detail?.error || null,
       });
       return SYNC_RESULT.FAILED_QUALITY;
     }

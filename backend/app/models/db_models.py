@@ -258,6 +258,10 @@ class ReferenceFace(Base):
     det_score = Column(Float, nullable=False)
     bbox = Column(String, nullable=True)             # JSON [x, y, w, h], like Face.bbox
     face_area_ratio = Column(Float, nullable=True)
+    # Phase B.6 (2026-06-08): provenance for the salvage paths. NULL = pre-B.6
+    # row or the unchanged B.2 PUT; 'normal' / 'face_select' /
+    # 'low_conf_override' from /resolve. Auto-migrated via _PHASE2_COLUMNS.
+    accepted_via = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     player = relationship("Player", back_populates="references")

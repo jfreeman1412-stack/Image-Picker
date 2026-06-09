@@ -81,6 +81,14 @@ _PHASE2_COLUMNS = {
         # Phase 6.1: per-session CSV-team override (folder->roster mapping).
         ("roster_team_alias", "VARCHAR"),
     ],
+    # Phase B.6 (2026-06-08): provenance for how a reference was accepted.
+    # NULL → captured normally (pre-B.6 or the unchanged B.2 PUT path).
+    # 'normal' → B.6 resolve called with no salvage kwargs (defaults).
+    # 'face_select' → resolve with selected_bbox (multiple_faces salvage).
+    # 'low_conf_override' → resolve with allow_low_confidence=True.
+    "reference_faces": [
+        ("accepted_via", "VARCHAR"),
+    ],
     # Soft-archive flag for jobs that should drop off the default home view.
     # Phase 4.5: async ingest status/progress fields.
     "jobs": [
