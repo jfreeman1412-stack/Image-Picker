@@ -143,6 +143,54 @@ def _iter_team_folders(root: Path, has_lines: bool):
                 yield team_dir
 
 
+def _find_or_create_session_for_team(
+    db: DbSession, job_id: int, team_name: str, source_path: str,
+) -> tuple[Session, bool]:
+    """Phase 1 merge-for-clustering (2026-06-09): if the job already has a
+    non-archived session whose normalize_name(name) matches this team's,
+    return that session and don't create a new one. Otherwise create a
+    fresh pending session and return it.
+
+    Returns (session, was_merged) where was_merged=True iff we returned
+    an existing session.
+
+    Job-wide scope: any same-named folder anywhere in this job is a merge
+    target (cross-line same-name collision risk accepted — team names are
+    unique across lines in the operator's roster-driven outdoor shoots).
+    Normalized matching via normalize_name() catches case / whitespace /
+    dash variants between paired folders.
+
+    Archived sessions are NOT eligible merge targets — the operator hid
+    them deliberately, so a fresh ingest of the same name creates a fresh
+    session rather than resurrecting the archived one.
+
+    Source path option (a): the FIRST-encountered path wins. We never
+    overwrite an existing session's source_path on merge. Confirmed
+    dead-data safe — source_path is only serialized into GET
+    /api/sessions/{id} JSON and the frontend doesn't read it; the
+    re-ingest path (/import-images) refuses on a job with existing
+    sessions, so the dropped second path was never going to be re-read.
+    """
+    from app.services.roster import normalize_name
+    target_norm = normalize_name(team_name)
+    if target_norm:
+        # Linear scan; jobs have O(30) sessions in practice — microseconds.
+        existing = (
+            db.query(Session)
+            .filter_by(job_id=job_id, archived=0)
+            .all()
+        )
+        for s in existing:
+            if normalize_name(s.name) == target_norm:
+                return s, True
+    new_sess = Session(
+        job_id=job_id, name=team_name, source_path=source_path,
+        status="pending",
+    )
+    db.add(new_sess); db.commit(); db.refresh(new_sess)
+    return new_sess, False
+
+
 def _ingest_job(
     job_id: int, root: Path, has_lines: bool, subfolder: Optional[str],
     auto_run: bool = True,
@@ -159,6 +207,10 @@ def _ingest_job(
         job.ingest_status = "ingesting"
         db.commit()
         skipped: list[dict] = []
+        # Phase 1 merge-for-clustering (2026-06-09): each entry is
+        # {folder_name, source_path, into_session_name} so the operator can see
+        # which folders merged into which existing teams.
+        merged: list[dict] = []
         done = 0
         try:
             team_dirs = list(_iter_team_folders(root, has_lines))
@@ -180,32 +232,47 @@ def _ingest_job(
                 job.ingest_current_team = team_dir.name
                 db.commit()
 
-                session = Session(
-                    job_id=job_id,
-                    name=team_dir.name,
-                    source_path=str(team_dir.resolve()),
-                    status="pending",
+                session, was_merged = _find_or_create_session_for_team(
+                    db, job_id, team_dir.name, str(team_dir.resolve()),
                 )
-                db.add(session)
-                db.commit()
-                db.refresh(session)
+                if was_merged:
+                    merged.append({
+                        "folder_name": team_dir.name,
+                        "source_path": str(team_dir.resolve()),
+                        "into_session_name": session.name,
+                    })
+                    logger.info(
+                        "[ingest] Job %s: merged folder '%s' into existing "
+                        "session '%s' (id=%s)",
+                        job_id, team_dir.name, session.name, session.id,
+                    )
 
                 count = ingest_folder(db, session.id, image_source)
                 done += 1
+                # Progress counts FOLDERS visited (not unique sessions). The
+                # session-count divergence after merge is cosmetic; the progress
+                # bar staying accurate to what's being processed is the honest
+                # signal. The merge events show up in ingest_error notes below.
                 job.ingest_progress = done
                 db.commit()
                 logger.info(
-                    "[ingest] Job %s team %d/%d: %s — %d images found",
+                    "[ingest] Job %s team %d/%d: %s — %d images found%s",
                     job_id, done, len(team_dirs), team_dir.name, count,
+                    " (merged)" if was_merged else "",
                 )
 
             job.ingest_status = "done"
             job.ingest_current_team = None
-            # ingest_error doubles as a structured note for non-fatal skips
-            # when there was no hard error (kept simple — no extra column).
-            job.ingest_error = (
-                json.dumps({"skipped_teams": skipped}) if skipped else None
-            )
+            # ingest_error doubles as a structured-notes channel for non-fatal
+            # events: pre-Phase-1 it held skipped_teams from missing subfolders;
+            # Phase 1 adds merged_folders alongside. Both keys are optional; the
+            # field stays NULL when neither happened (no-merge regression case).
+            notes: dict = {}
+            if skipped:
+                notes["skipped_teams"] = skipped
+            if merged:
+                notes["merged_folders"] = merged
+            job.ingest_error = json.dumps(notes) if notes else None
             session_ids = [s.id for s in job.sessions if not s.archived]
             db.commit()
         except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
