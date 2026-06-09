@@ -6,6 +6,7 @@ POST   /api/sessions/{id}/merge-clusters   merge two clusters
 POST   /api/sessions/{id}/new-cluster      create an empty cluster
 POST   /api/sessions/{id}/clusters/{cid}/rename
 """
+from datetime import datetime
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -91,7 +92,17 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
         role_by_image = {r.image_id: (r.role, bool(r.manual_override)) for r in role_rows}
 
         images = []
-        for img in sorted(image_rows, key=lambda i: i.capture_time or i.filename):
+        # Tuple sort-key: untimed images (capture_time=None) sort to the front
+        # via the datetime.min sentinel; among each group, filename is the
+        # tiebreaker. The earlier `i.capture_time or i.filename` form returned
+        # a mix of datetime and str across a cluster's images and tripped a
+        # str-vs-datetime TypeError whenever a cluster contained both
+        # populations — which surfaces in any merged session whose source
+        # folders disagree on whether EXIF DateTimeOriginal is present
+        # (e.g., outdoor-shoot PNGs converted from RAW keep capture_time;
+        # camera JPGs from the naturals line drop it).
+        for img in sorted(image_rows,
+                          key=lambda i: (i.capture_time or datetime.min, i.filename)):
             role, manual = role_by_image.get(img.id, (None, False))
             images.append({
                 "image_id": img.id,
