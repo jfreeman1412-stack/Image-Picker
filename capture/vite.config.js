@@ -63,6 +63,16 @@ export default defineConfig({
             handler: 'NetworkOnly',
           },
         ],
+        // 2026-06-08 follow-up: take over open clients on every deploy so a
+        // new bundle activates on the next page load without a force-close.
+        // Pairs with registerType: 'autoUpdate' above (the plugin reloads
+        // the page when the new SW takes control). Trade-off acknowledged:
+        // a long-running session could see an unprompted reload mid-action.
+        // For this capture app — short capture/save/sync actions — that
+        // risk is low; the alternative was a force-close on the tablet per
+        // deploy.
+        skipWaiting: true,
+        clientsClaim: true,
       },
     }),
   ],
