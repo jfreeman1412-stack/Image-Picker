@@ -83,7 +83,12 @@ export async function drainOnce({ onProgress, onItemResult } = {}) {
 // (idempotent by norm_name) and remember the id. Returns { playerId } on
 // success, { retry } for network/5xx (try later), or { failed, error } for a
 // kept rejection. See ../PHASE_B5_WALKUP_PLAYER.md.
-async function resolveServerPlayerId(item) {
+//
+// Phase B.6 follow-up (2026-06-08): exported so NeedsAttention's FaceSelectPanel
+// can do the same uuid → server-int dance before hitting /detect + /resolve. A
+// walk-up that was previously uploaded (and rejected at the gate) already has a
+// realPlayerId stored locally, so this is normally a cheap lookup.
+export async function resolveServerPlayerId(item) {
   const local = await getLocalPlayer(item.playerId).catch(() => null);
   if (!local) return { playerId: item.playerId };          // roster player: real id
   if (local.realPlayerId != null) return { playerId: local.realPlayerId };

@@ -20,6 +20,7 @@
 // the server side so this is cheap.
 import { useEffect, useRef, useState } from 'react';
 import { getCaptureBytes } from './db.js';
+import { resolveServerPlayerId } from './syncQueue.js';
 
 export default function NeedsAttention({
   job, items, onReshoot, onDiscard, onResolved, onBack,
@@ -115,6 +116,13 @@ function FaceSelectPanel({ item, onResolved, onCancel }) {
   const [bytes, setBytes] = useState(null);
   const [detect, setDetect] = useState(null);         // { width, height, faces: [...] }
   const [selectedIndex, setSelectedIndex] = useState(null);
+  // Phase B.6 follow-up: a B.5 walk-up item carries a client UUID in
+  // item.playerId; the server endpoints expect the resolved server-side
+  // integer. resolveServerPlayerId is the same uuid→int helper the
+  // drainer uses (idempotent /walkup if not yet mapped). For a normal
+  // roster item this resolves to item.playerId unchanged. Cached so
+  // detect + resolve hit the same id without re-resolving.
+  const [serverPlayerId, setServerPlayerId] = useState(null);
   const imgRef = useRef(null);
   const [imgRect, setImgRect] = useState(null);       // { dispW, dispH } rendered px
 
@@ -124,6 +132,23 @@ function FaceSelectPanel({ item, onResolved, onCancel }) {
     let url = null;
     (async () => {
       try {
+        // Resolve uuid→int FIRST; without this a walk-up's UUID lands in
+        // the URL and FastAPI 422s on the path-int validation.
+        const resolved = await resolveServerPlayerId(item);
+        if (cancelled) return;
+        if (resolved.failed) {
+          setError(resolved.error || 'Could not resolve this player on the server.');
+          setPhase('error');
+          return;
+        }
+        if (resolved.retry) {
+          setError(resolved.error || 'No connection — try again.');
+          setPhase('error');
+          return;
+        }
+        const playerId = resolved.playerId;
+        setServerPlayerId(playerId);
+
         const rec = await getCaptureBytes(item.id);
         if (cancelled) return;
         if (!rec?.bytes) {
@@ -140,7 +165,7 @@ function FaceSelectPanel({ item, onResolved, onCancel }) {
         const fd = new FormData();
         fd.append('file', blob, 'capture.jpg');
         const res = await fetch(
-          `/api/players/${item.playerId}/references/shoot/${item.jobId}/detect`,
+          `/api/players/${playerId}/references/shoot/${item.jobId}/detect`,
           { method: 'POST', body: fd },
         );
         if (cancelled) return;
@@ -183,7 +208,7 @@ function FaceSelectPanel({ item, onResolved, onCancel }) {
   }, []);
 
   const submit = async () => {
-    if (selectedIndex == null || !detect || !bytes) return;
+    if (selectedIndex == null || !detect || !bytes || serverPlayerId == null) return;
     setPhase('resolving');
     try {
       const face = detect.faces[selectedIndex];
@@ -192,7 +217,7 @@ function FaceSelectPanel({ item, onResolved, onCancel }) {
       fd.append('file', blob, 'capture.jpg');
       fd.append('selected_bbox', JSON.stringify(face.bbox));
       const res = await fetch(
-        `/api/players/${item.playerId}/references/shoot/${item.jobId}/resolve`,
+        `/api/players/${serverPlayerId}/references/shoot/${item.jobId}/resolve`,
         { method: 'POST', body: fd },
       );
       if (res.ok) {
