@@ -28,9 +28,9 @@ import {
 const STORAGE_WARN = 0.8; // surface a warning past 80% of quota (§6)
 
 // Live multi-tablet poll cadence (2026-06-08). Twenty seconds is the chosen
-// trade-off between "B sees A's capture promptly" and not hammering the
+// trade-off between "B sees A's activity promptly" and not hammering the
 // shared backend during a multi-tablet shoot.
-const REFERENCE_STATUS_POLL_MS = 20000;
+const ROSTER_POLL_MS = 20000;
 
 
 /**
@@ -47,6 +47,26 @@ async function fetchReferenceStatus(jobId) {
   if (!res.ok) throw new Error(`reference-status HTTP ${res.status}`);
   const body = await res.json();
   return body.player_ids_with_references || [];
+}
+
+
+/**
+ * GET /api/players/roster/{jobId} → array of membership items (player_id,
+ * name, team, is_coach). Used by both the initial fetch and the live poll.
+ *
+ * Unlike fetchReferenceStatus, this returns a LIST not a set: the poll
+ * applies REPLACE semantics on the roster state, which is safe because
+ * the merge with locally-added walkups happens at render time in
+ * `mergedItems` (server-wins-on-collision filter by realPlayerId), and
+ * the `localPlayers` IndexedDB state is structurally separate from
+ * `roster` — so a poll-driven REPLACE can't regress an in-flight local
+ * walkup. Throws on non-2xx; same caller contract as fetchReferenceStatus.
+ */
+async function fetchRoster(jobId) {
+  const res = await fetch(`/api/players/roster/${jobId}`);
+  if (!res.ok) throw new Error(`roster HTTP ${res.status}`);
+  const body = await res.json();
+  return body.items || [];
 }
 
 export default function App() {
@@ -161,57 +181,96 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selectedJob, reloadKey, refreshQueue]);
 
-  // 2026-06-08 — live multi-tablet roster poll. Every REFERENCE_STATUS_POLL_MS
-  // while the user is on the roster screen AND online, refresh the server-
-  // sourced ✓ set so a capture made on the OTHER tablet at this shoot shows
-  // up here without a manual reload. The whole point: at a 2-tablet shoot,
-  // Tablet B's operator can't tell that Tablet A already captured a kid, so
-  // they re-shoot and waste everyone's time (and a "last write wins"
-  // overwrites the better ref). This closes that gap.
+  // 2026-06-08 — live multi-tablet roster poll. Every ROSTER_POLL_MS while
+  // the user is on the roster screen AND online, refresh BOTH the server-
+  // sourced ✓ set AND the server-sourced roster list so any activity on the
+  // OTHER tablet (a fresh capture OR a walkup added) shows up here without
+  // a manual reload. Closes the 2-tablet co-shoot blind spot where B's
+  // operator can't tell A already captured a kid (or added a new player)
+  // and either re-shoots a kid A already did or misses the new player.
   //
-  // Three invariants:
-  //   (1) ADDITIVE union — never REPLACE. The drainer's handleItemResult
-  //       adds player_ids to referencedPlayerIds the moment a local upload
-  //       lands a 200; if the poll were REPLACE and a request started before
-  //       that 200 returned, the poll response (stale snapshot) could remove
-  //       the just-synced player. References-only-grow during a shoot, so
-  //       additive is provably safe.
-  //   (2) Silent skip — offline OR fetch failure → just return. No state
+  // 2026-06-09 extension: the poll now also re-fetches /roster, so a walkup
+  // added on the OTHER tablet appears here within 20s without re-picking
+  // the shoot. The two endpoints fire in parallel via Promise.all; partial
+  // success is treated as full failure (silent skip both) so the dual
+  // state never goes inconsistent — e.g., we never show a new player with
+  // a stale-known ✓ state from an old snapshot.
+  //
+  // Four invariants:
+  //   (1) ADDITIVE union on referencedPlayerIds — never REPLACE. The
+  //       drainer's handleItemResult adds player_ids the moment a local
+  //       upload lands a 200; a REPLACE-semantic poll could regress that
+  //       to grey if its request was inflight when the 200 returned.
+  //       References-only-grow during a shoot, so additive is provably safe.
+  //   (2) REPLACE semantics on roster (the list of memberships) — safe
+  //       because tablet-local walkups live in a SEPARATE `localPlayers`
+  //       state that the poll never touches. `mergedItems` merges
+  //       (roster ∪ localPlayers) at render time with a server-wins-on-
+  //       collision filter (filtered by realPlayerId), so a freshly-synced
+  //       walkup's local copy disappears the moment the poll picks up its
+  //       server membership row — clean handoff, no flicker. An owned
+  //       walkup that's not yet drained stays in localPlayers and is shown
+  //       regardless of poll snapshots (realPlayerId still null → not
+  //       filtered → present in mergedItems).
+  //   (3) Silent skip on offline OR fetch failure (either half) — no state
   //       change, no error UI, no cache clobber. The next tick retries.
-  //   (3) Roster-view-only — the interval clears the moment the user
+  //       All-or-nothing: if /roster succeeds but /reference-status fails
+  //       (or vice versa), we DON'T apply the half-update — otherwise B
+  //       could see a brand-new player from A with a stale ✓ state that
+  //       doesn't reflect whether the server has a reference for them yet.
+  //   (4) Roster-view-only — the interval clears the moment the user
   //       navigates away (deps include `view`), so capture / attention
   //       screens don't poll.
   //
-  // Cache freshness intentionally NOT addressed by the poll: a poll-discovered
-  // capture stays in-memory only, not written to the cached statusIds. The
-  // offline-first cache behavior is preserved exactly as B.3 designed it
-  // (cache reflects the last full fetch). A follow-up could mirror polled
-  // additions into markRosterSynced if the cold-offline-reopen gap matters,
-  // but that's a CHANGE to offline behavior — out of scope here per the
-  // spec's "offline behavior preserved" requirement.
+  // Cache freshness intentionally NOT addressed by the poll: a poll-
+  // discovered ✓ or new walkup stays in-memory only, not written to the
+  // cached roster/statusIds. The offline-first cache behavior is preserved
+  // exactly as B.3 designed it (cache reflects the last full fetch). A
+  // follow-up could mirror polled additions into putRoster/markRosterSynced
+  // if the cold-offline-reopen gap matters, but that's a CHANGE to offline
+  // behavior — out of scope here per the spec's "offline behavior
+  // preserved" requirement.
   useEffect(() => {
     if (view !== 'roster' || !selectedJob) return undefined;
     const jobId = selectedJob.id;
     const tick = async () => {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      let items;
+      let statusIds;
       try {
-        const statusIds = await fetchReferenceStatus(jobId);
-        setReferencedPlayerIds((prev) => {
-          // Additive union — never shrink. Skip the state update entirely
-          // when the polled set adds nothing new, so React doesn't re-render
-          // every 20 seconds during quiet stretches of the shoot.
-          let added = false;
-          const next = new Set(prev);
-          for (const id of statusIds) {
-            if (!next.has(id)) { next.add(id); added = true; }
-          }
-          return added ? next : prev;
-        });
+        [items, statusIds] = await Promise.all([
+          fetchRoster(jobId),
+          fetchReferenceStatus(jobId),
+        ]);
       } catch {
-        // Silent skip — next tick retries.
+        // Silent skip — next tick retries. Partial success is treated as
+        // full failure: Promise.all rejects on any rejection, so we never
+        // apply a half-update that would leave the dual state inconsistent.
+        return;
       }
+      // REPLACE the roster list (see invariant 2). Skip the state update
+      // when the new items shallow-equal the previous (same length + same
+      // ids in order) so React doesn't re-render every 20s during quiet
+      // stretches of the shoot.
+      setRoster((prev) => {
+        if (prev.length === items.length
+            && prev.every((p, i) => p.player_id === items[i].player_id)) {
+          return prev;
+        }
+        return items;
+      });
+      // ADDITIVE union on the ✓ set (see invariant 1). Skip the state
+      // update when nothing new arrived.
+      setReferencedPlayerIds((prev) => {
+        let added = false;
+        const next = new Set(prev);
+        for (const id of statusIds) {
+          if (!next.has(id)) { next.add(id); added = true; }
+        }
+        return added ? next : prev;
+      });
     };
-    const id = setInterval(tick, REFERENCE_STATUS_POLL_MS);
+    const id = setInterval(tick, ROSTER_POLL_MS);
     return () => clearInterval(id);
   }, [view, selectedJob]);
 
