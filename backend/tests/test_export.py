@@ -996,3 +996,149 @@ def test_rename_all_orphan_session_keeps_camera_names(ctx):
     out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
     files = sorted(p.name for p in (out / "To_be_Cropped" / "Color_Swatch").iterdir())
     assert files == ["cs1.png", "cs2.png", "cs3.png"]
+
+
+# ── Reject-leak fix (2026-06-11) ─────────────────────────────────────────────
+#
+# Pre-fix bug: _build_rename_plan_for_session checked rejection per cluster
+# (`if role == "rejected": continue`) but not globally — so a buddy image with
+# ImageRole rows (rejected in cluster A, buddy in cluster B) would skip
+# cluster A's loop iteration but still get included via cluster B's loop. The
+# rejected image then exported under cluster B's renamed basename, silently
+# defeating the operator's reject. Legacy export was always safe — it uses
+# _best_role_map which encodes "rejected wins across all of an image's
+# cluster claims" (priority 0).
+#
+# Reference real-data case: session 79 (10-11 QC) in job 8 had images 7256,
+# 7257, 7260 — each was rejected in cluster 364 but still buddy in cluster
+# 363. _best_role_map resolved them to "rejected" (so legacy export would
+# skip), but the rename plan emitted them as Player_363_006/007/010.png and
+# would copy them into To_be_Cropped/10-11 QC/. Three rejected photos that
+# the customer should never have seen.
+#
+# Fix: also check role_map.get(image_id) == "rejected" inside the cluster
+# loop, in addition to the per-cluster role check. Reject anywhere = skipped
+# everywhere, matching legacy behavior.
+
+
+def test_rename_buddy_rejected_in_all_clusters_skipped(ctx):
+    """Regression lock: buddy image rejected in ALL its clusters is skipped
+    in rename mode (this already worked pre-fix; lock the invariant).
+
+    Test mechanics: rename mode renames files away from their source
+    names — `shared.jpg` becomes `Alice_NNN.jpg` or `Bob_NNN.jpg`. So we
+    detect leaks by the per-cluster sequence COUNT, not by the string
+    "shared". One leaked emission per cluster claim adds one
+    `<Cluster>_NNN.jpg` entry."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Alice", "images": [
+                {"filename": "alice.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "rejected"},   # buddy rejected here
+            ]},
+            {"label": "Bob", "images": [
+                {"filename": "bob.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "rejected"},   # AND rejected here
+            ]},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    # Expected: ONE individual per cluster, nothing else. The buddy is
+    # rejected in both → emits zero copies.
+    assert files == ["Alice_001.jpg", "Bob_001.jpg"], (
+        f"rejected buddy leaked or unexpected file set: {files}"
+    )
+
+
+def test_rename_buddy_rejected_in_some_clusters_skipped(ctx):
+    """THE FIX: buddy image rejected in cluster A and still 'buddy' in
+    cluster B must NOT export in rename mode (legacy already skipped it
+    via _best_role_map; rename now matches). Pre-fix this leaked as
+    `<NonRejectedCluster>_002.jpg`.
+
+    Mirrors the real-data leak found on session 79 / job 8 / images
+    7256, 7257, 7260 — rejected in cluster 364, still buddy in cluster
+    363, leaked as `Player_363_006/007/010.png`."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Alice", "images": [
+                {"filename": "alice.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "buddy"},      # still buddy here
+            ]},
+            {"label": "Bob", "images": [
+                {"filename": "bob.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "rejected"},   # rejected here
+            ]},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    # Pre-fix: shared.jpg emitted as Alice_002.jpg via the cluster-Alice
+    # loop (its per-cluster role is "buddy", not "rejected"), even though
+    # _best_role_map globally resolves it to "rejected". Post-fix: skipped.
+    # Expected: ONLY Alice_001.jpg + Bob_001.jpg.
+    assert files == ["Alice_001.jpg", "Bob_001.jpg"], (
+        f"rejected buddy LEAKED via non-rejected cluster's basename: {files}"
+    )
+
+
+def test_rename_buddy_not_rejected_exports_to_all_kids(ctx):
+    """Don't over-correct: a non-rejected buddy image still exports under
+    EACH cluster that claims it. The fix must skip rejected buddies
+    without affecting non-rejected ones."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Alice", "images": [
+                {"filename": "alice.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "buddy"},      # buddy in both
+            ]},
+            {"label": "Bob", "images": [
+                {"filename": "bob.jpg", "role": "individual"},
+                {"filename": "shared.jpg", "role": "buddy"},      # buddy in both
+            ]},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = sorted(p.name for p in (out / "To_be_Cropped" / "T").iterdir())
+    # shared.jpg buddy in both clusters → exports TWICE, under each cluster's
+    # renamed basename. Critical: the fix must not break this.
+    # Alice: individual (001) + buddy shared (002). Bob: same shape.
+    # Sequence ordering depends on capture_time — both rows have capture_time=None
+    # so tiebreak is image_id (Alice's individual was created first).
+    assert "Alice_001.jpg" in files
+    assert "Alice_002.jpg" in files
+    assert "Bob_001.jpg" in files
+    assert "Bob_002.jpg" in files
+    assert len(files) == 4, (
+        f"non-rejected buddy should export twice (once per cluster): {files}"
+    )
+
+
+def test_rename_single_cluster_image_rejected_skipped(ctx):
+    """Regression lock: a single-cluster image (no buddy expansion)
+    rejected in its only cluster is skipped in rename mode. This worked
+    pre-fix via the per-cluster check; lock it to ensure the new
+    role_map check doesn't break the simple case either."""
+    client, SL, tmp_path = ctx
+    jid, root = _rename_job(SL, tmp_path, team_specs=[{
+        "name": "T", "clusters": [
+            {"label": "Alice", "images": [
+                {"filename": "alice.jpg", "role": "individual"},
+                {"filename": "rejected_solo.jpg", "role": "rejected"},
+            ]},
+        ],
+    }])
+    _rename_export(client, jid)
+    out = Path(client.get(f"/api/jobs/{jid}/export-status").json()["result"]["output_path"])
+    files = {p.name for p in (out / "To_be_Cropped" / "T").iterdir()}
+    assert not any("rejected_solo" in f for f in files), (
+        f"single-cluster rejected image leaked: {files}"
+    )
+    assert any("Alice" in f for f in files)

@@ -1073,6 +1073,17 @@ def _build_rename_plan_for_session(
         for image_id, role in rows:
             if role == "rejected":
                 continue
+            # 2026-06-11 reject-leak fix: also honor the GLOBAL rejected-wins
+            # rule. role above is THIS cluster's ImageRole — but the same
+            # image may have a 'rejected' ImageRole in another cluster
+            # (buddy shot rejected via one of its cluster claims). Legacy
+            # export already enforces this via _best_role_map (priority
+            # {rejected: 0, ...}); the rename plan needs the same gate or
+            # rejected buddies leak under the non-rejected cluster's renamed
+            # basename. Matches legacy behavior: reject anywhere = skipped
+            # everywhere.
+            if role_map.get(image_id) == "rejected":
+                continue
             img = image_by_id.get(image_id)
             if img is None:
                 # Buddy from a different session — Image lives in another
