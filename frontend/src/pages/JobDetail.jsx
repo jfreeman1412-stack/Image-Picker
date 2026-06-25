@@ -7,6 +7,7 @@ import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
 import RosterModal from '../components/RosterModal.jsx';
 import PlayerRosterModal from '../components/PlayerRosterModal.jsx';
+import ConnectivityBanner from '../components/ConnectivityBanner.jsx';
 
 export default function JobDetail() {
   const { id } = useParams();
@@ -165,6 +166,7 @@ export default function JobDetail() {
 
   return (
     <div className="page">
+      <ConnectivityBanner />
       <header className="row-between">
         <div>
           <Link to="/">← All jobs</Link>

@@ -4,6 +4,7 @@ import ClusterCard from '../components/ClusterCard.jsx';
 import ImageModal from '../components/ImageModal.jsx';
 import ReviewActionBar from '../components/ReviewActionBar.jsx';
 import PipelineProgress from '../components/PipelineProgress.jsx';
+import ConnectivityBanner from '../components/ConnectivityBanner.jsx';
 
 export default function SessionDetail() {
   const { id } = useParams();
@@ -144,11 +145,36 @@ export default function SessionDetail() {
   };
 
   const setRole = async (image_id, cluster_id, role) => {
-    await fetch(`/api/sessions/${id}/set-role`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_id, cluster_id, role }),
-    });
+    // 2026-06-25 set-role-defensive: surface failures loudly. Pre-fix this
+    // handler swallowed every failure mode (no res.ok check, no try/catch);
+    // operator edits could silently fail to save during backend restart
+    // windows and the badge would re-render identically because the auto-
+    // rule output happened to match the prior visual state. Mirror the
+    // existing RosterModal.jsx:172-185 res.ok+alert pattern, plus a
+    // try/catch for the network-error case RosterModal lacks. The load()
+    // call at the bottom remains unconditional — refetching server truth
+    // means the badge ends up reflecting the actual persisted role on
+    // failure, alongside the alert that makes it impossible to miss.
+    try {
+      const res = await fetch(`/api/sessions/${id}/set-role`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id, cluster_id, role }),
+      });
+      if (!res.ok) {
+        alert(
+          `That change didn't save (HTTP ${res.status}). The card has been ` +
+          `reloaded to show what's actually in the database. Try again — if it ` +
+          `keeps failing, check the connectivity banner at the top of the page.`,
+        );
+      }
+    } catch (e) {
+      alert(
+        "That change didn't save — the backend may be unreachable. The card has " +
+        "been reloaded to show what's actually in the database. Wait for the " +
+        'connectivity banner to clear, then try again.',
+      );
+    }
     load();
   };
 
@@ -430,6 +456,7 @@ export default function SessionDetail() {
 
   return (
     <div className="page session-page">
+      <ConnectivityBanner />
       <header className="row-between">
         <div>
           {session.job_id ? (
