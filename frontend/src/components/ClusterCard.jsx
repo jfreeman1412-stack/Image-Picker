@@ -283,10 +283,13 @@ export default function ClusterCard({
   // move has (because source stays put). All three call back into
   // runMove for the shared in-flight bookkeeping (busy spinner +
   // success cleanup).
-  const copyToExistingSession = (sessionId) =>
+  // 2026-06-25 Phase B follow-up: pass the target team's display name so the
+  // success confirmation can say "Copied to {teamName}" instead of a bare
+  // session id. Name comes from the dropdown option at the dispatch site.
+  const copyToExistingSession = (sessionId, targetName) =>
     runMove(
-      () => onCopyToSession(cluster.cluster_id, Number(sessionId)),
-      () => copyToExistingSession(sessionId),  // copy has no force; retry no-op
+      () => onCopyToSession(cluster.cluster_id, Number(sessionId), targetName),
+      () => copyToExistingSession(sessionId, targetName),  // copy has no force; retry no-op
     );
   const copyToRosterTeam = (teamName) =>
     runMove(
@@ -306,7 +309,7 @@ export default function ClusterCard({
     const opt = dropdownOptions.find((o) => o.norm_name === pickedTarget);
     if (!opt) return;
     if (copyOpen) {
-      if (opt.session_id != null) copyToExistingSession(opt.session_id);
+      if (opt.session_id != null) copyToExistingSession(opt.session_id, opt.name);
       else copyToRosterTeam(opt.name);
     } else {
       if (opt.session_id != null) moveToExistingSession(opt.session_id, force);

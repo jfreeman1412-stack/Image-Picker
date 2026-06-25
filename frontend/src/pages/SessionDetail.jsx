@@ -424,14 +424,35 @@ export default function SessionDetail() {
   // currently requires a destination session that already exists. (A
   // follow-up could add /copy-to-new-session and /copy-to-add-team
   // mirroring the move endpoints — flagged for after Phase B validates.)
-  const onCopyToSession = async (clusterId, targetSessionId) => {
+  const onCopyToSession = async (clusterId, targetSessionId, targetSessionName) => {
     const res = await fetch(`/api/clusters/${clusterId}/copy-to-session`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target_session_id: Number(targetSessionId) }),
     });
     if (res.ok) {
+      // 2026-06-25 Phase B follow-up: silent SUCCESS is the same UX-failure
+      // class as silent failure (see set-role-defensive). Move gets away with
+      // no confirmation because the source cluster vanishes from the source
+      // view — that's the visible feedback. Copy is the symmetric inverse:
+      // source stays put AND the new cluster lands on a different session
+      // that isn't being viewed, so without an explicit message the operator
+      // can't tell the request even fired. Confirm + offer to navigate to
+      // the target, and surface target_unreviewed so the auto-unreview side
+      // effect isn't another silent surprise either.
+      let body = {};
+      try { body = await res.json(); } catch {}
       await load();
+      const teamName = targetSessionName || `session ${targetSessionId}`;
+      const unreviewLine = body.target_unreviewed
+        ? `\n\n"${teamName}" was marked for re-review (it had been finalised).`
+        : '';
+      const newId = body.new_cluster_id != null ? ` (new cluster #${body.new_cluster_id})` : '';
+      const go = window.confirm(
+        `Copied to "${teamName}"${newId}.${unreviewLine}\n\n` +
+        `OK to open "${teamName}" now, Cancel to stay here.`,
+      );
+      if (go) nav(`/session/${targetSessionId}`);
       return { ok: true };
     }
     let body;
