@@ -65,6 +65,12 @@ export default function ClusterCard({
   const [blockedImpact, setBlockedImpact] = useState(null); // {impact, retry: () => Promise}
   const [moveBusy, setMoveBusy] = useState(false);
   const [addTeamModal, setAddTeamModal] = useState(null);   // {typedName, error} or null
+  // 2026-06-25 move-unlabeled (Phase A): the always-available "Move to
+  // another team…" affordance is collapsed by default. moveOpen flips to
+  // true when the operator clicks the trigger button, expanding the same
+  // picker shape the smart panel uses. See showAlwaysAvailableMove below
+  // for the gate; only relevant when the smart panel is NOT showing.
+  const [moveOpen, setMoveOpen] = useState(false);
 
   // This card is a valid drop target only while an image from a *different*
   // cluster is being dragged.
@@ -157,8 +163,30 @@ export default function ClusterCard({
   // reasons OR the operator already dismissed (so they can undo). Guest
   // clusters never show these — they have their own banner.
   const teamMismatchVisible = visibleReasons.includes('match_team_mismatch');
-  const showMoveCardActions =
+  const smartPanelTriggered =
     !guest && onMoveWithGuards && (teamMismatchVisible || cluster.accepted_cross_team);
+  // 2026-06-25 move-unlabeled (Phase A): the smart-panel trigger above only
+  // fires on labeled clusters whose matched player's roster team disagrees
+  // with the session (or on a previously-dismissed cross-team appearance).
+  // That left UNLABELED clusters ("Player N" — no matched_player_id) and
+  // labeled-but-non-mismatched clusters with no move affordance at all,
+  // even though move-with-guards / move-to-new-session / move-to-add-team
+  // are fully label-agnostic on the backend.
+  //
+  // The fix: an always-available "Move to another team…" trigger on those
+  // cases, which expands the SAME picker JSX the smart panel uses (no
+  // duplication). When moveOpen is true, showMoveCardActions becomes true
+  // and the existing picker renders. Sub-elements specific to the smart
+  // case (the "Likely on wrong team" text, the smart-target primary
+  // button, the "Dismiss as cross-team" button) gate themselves on
+  // smartPanelTriggered so they DON'T appear in the always-available flow.
+  // For labeled-mismatched clusters: smartPanelTriggered is true, the
+  // existing behavior is byte-for-byte unchanged. For unlabeled / labeled-
+  // non-mismatched clusters: the trigger shows, click expands the picker
+  // without the smart-case-specific elements.
+  const showAlwaysAvailableMove =
+    !guest && onMoveWithGuards && !smartPanelTriggered;
+  const showMoveCardActions = smartPanelTriggered || moveOpen;
   // Move-card Phase 2 (2026-06-08): smart suggestion now finds a target
   // whose name matches the matched player's roster team in EITHER form —
   // an existing session (Case 1) or a roster-only team (Case 2). The
@@ -190,6 +218,12 @@ export default function ClusterCard({
         setBlockedImpact(null);
         setPickedTarget('');
         setAddTeamModal(null);
+        // 2026-06-25 move-unlabeled: collapse the always-available picker
+        // back to the trigger button on successful move. Smart panel
+        // unaffected — the underlying cluster vanishes from the session
+        // on a successful move-with-guards, so the panel disappears
+        // with the card.
+        setMoveOpen(false);
         return;
       }
       // 409 with impact: surface the force-confirm prompt.
@@ -374,16 +408,25 @@ export default function ClusterCard({
             </div>
           ) : (
             <>
-              <p className="move-suggestion-text" style={{ margin: 0 }}>
-                <b>Likely on wrong team:</b>{' '}
-                {cluster.match?.player_name && (
-                  <><b>{cluster.match.player_name}</b> is rostered with{' '}
-                  <b>{cluster.match.roster_team}</b> but this card is in{' '}
-                  <b>{currentSessionName}</b>.</>
-                )}
-              </p>
+              {/* 2026-06-25 move-unlabeled: smart-case-specific copy gates
+                  on smartPanelTriggered so it doesn't render in the
+                  always-available flow (where there's no matched player
+                  to reference). */}
+              {smartPanelTriggered && (
+                <p className="move-suggestion-text" style={{ margin: 0 }}>
+                  <b>Likely on wrong team:</b>{' '}
+                  {cluster.match?.player_name && (
+                    <><b>{cluster.match.player_name}</b> is rostered with{' '}
+                    <b>{cluster.match.roster_team}</b> but this card is in{' '}
+                    <b>{currentSessionName}</b>.</>
+                  )}
+                </p>
+              )}
               <div className="actions" style={{ gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
-                {smartTarget && (
+                {/* Smart-target primary button: only in the smart-panel flow
+                    (unlabeled clusters have no roster match → no smart
+                    target). */}
+                {smartPanelTriggered && smartTarget && (
                   <button
                     className="primary"
                     disabled={moveBusy}
@@ -429,13 +472,29 @@ export default function ClusterCard({
                     Move
                   </button>
                 )}
-                <button
-                  className="ghost"
-                  disabled={moveBusy}
-                  onClick={() => onDismissCrossTeam(cluster.cluster_id)}
-                >
-                  Dismiss as cross-team
-                </button>
+                {/* Dismiss button: only in the smart-panel flow. The
+                    always-available flow gets a Cancel that collapses the
+                    picker back to the trigger button instead. */}
+                {smartPanelTriggered ? (
+                  <button
+                    className="ghost"
+                    disabled={moveBusy}
+                    onClick={() => onDismissCrossTeam(cluster.cluster_id)}
+                  >
+                    Dismiss as cross-team
+                  </button>
+                ) : (
+                  <button
+                    className="ghost"
+                    disabled={moveBusy}
+                    onClick={() => {
+                      setMoveOpen(false);
+                      setPickedTarget('');
+                    }}
+                  >
+                    Cancel
+                  </button>
+                )}
               </div>
 
               {/* Move-card Phase 2: "+ Add new team…" modal (Case 3 entry).
@@ -501,6 +560,25 @@ export default function ClusterCard({
               )}
             </>
           )}
+        </div>
+      )}
+
+      {/* 2026-06-25 move-unlabeled (Phase A): the always-available trigger.
+          Renders only when the smart panel isn't already showing (gate
+          ensures one move affordance per card). Clicking opens the same
+          picker JSX above by flipping moveOpen → showMoveCardActions
+          becomes true → existing picker renders, with smart-case-specific
+          sub-elements hidden via smartPanelTriggered gates. */}
+      {showAlwaysAvailableMove && !moveOpen && (
+        <div className="move-card-actions" style={{ marginTop: 4 }}>
+          <button
+            className="ghost"
+            disabled={moveBusy}
+            onClick={() => setMoveOpen(true)}
+            title="Move this cluster to a different team"
+          >
+            Move to another team…
+          </button>
         </div>
       )}
 
