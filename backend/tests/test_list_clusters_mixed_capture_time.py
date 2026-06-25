@@ -22,7 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api.clusters import list_clusters
 from app.db import Base
 from app.models.db_models import (
-    Cluster, Face, Image, Job, Session as DbSession,
+    Cluster, Face, Image, ImageRole, Job, Session as DbSession,
 )
 
 
@@ -72,6 +72,15 @@ def _setup_cluster_with_mixed_capture_times(db):
              det_score=0.9, face_area_ratio=0.2),
         Face(image_id=img2.id, cluster_id=cluster.id, bbox="[0,0,10,10]",
              det_score=0.9, face_area_ratio=0.2),
+        # 2026-06-25: list_clusters now derives image membership from
+        # ImageRole (matches production reality — _sort_cluster writes
+        # one ImageRole per image in the cluster) instead of c.faces, so
+        # this fixture must include them too. Role values are irrelevant
+        # to the sort-key bug under test; 'individual' is a safe default.
+        ImageRole(image_id=img1.id, cluster_id=cluster.id,
+                  role="individual", manual_override=0),
+        ImageRole(image_id=img2.id, cluster_id=cluster.id,
+                  role="individual", manual_override=0),
     ])
     db.commit()
     return sess

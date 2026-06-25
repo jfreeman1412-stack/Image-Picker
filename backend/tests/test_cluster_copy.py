@@ -564,3 +564,30 @@ def test_cluster_response_includes_has_faces(db):
     by_id = {c["cluster_id"]: c for c in out}
     assert by_id[normal.id]["has_faces"] is True
     assert by_id[copy_like.id]["has_faces"] is False
+
+
+def test_list_clusters_returns_images_for_copied_cluster_with_no_faces(db):
+    """Regression for the Phase B display bug: list_clusters must surface a
+    copied cluster's images (read via ImageRole, not c.faces). Otherwise the
+    card shows image_count=N in the header and 0 thumbnails in the body —
+    exactly what the screenshot showed for cluster 6825 (American Legion).
+    End-to-end: real copy via the endpoint, then list_clusters on the target."""
+    from app.api.clusters import list_clusters
+    from app.api.cluster_copy import copy_cluster_to_session
+    _, src, tgt = _job_with_two_sessions(db)
+    c = _cluster_with_images(db, src, image_count=5)
+    result = copy_cluster_to_session(db, c.id, tgt.id)
+    db.expire_all()
+    out = list_clusters(tgt.id, db)
+    copy_row = next(r for r in out if r["cluster_id"] == result["new_cluster_id"])
+    # Header and body now agree — the regression.
+    assert copy_row["image_count"] == 5
+    assert len(copy_row["images"]) == 5
+    assert copy_row["has_faces"] is False
+    # Each thumbnail points at the copy's NEW image_ids (not the source's) —
+    # confirms the read path goes through ImageRole.cluster_id and not some
+    # path-keyed shortcut that would collide source/dest.
+    for img in copy_row["images"]:
+        assert img["thumb_url"] == f"/api/images/{img['image_id']}/thumb"
+        assert img["full_url"] == f"/api/images/{img['image_id']}/full"
+        assert img["role"] in ("individual", "team", "panoramic", "buddy")
