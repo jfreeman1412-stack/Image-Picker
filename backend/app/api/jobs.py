@@ -660,11 +660,21 @@ class RunAllRequest(BaseModel):
 
 def _runall_impact(db: DbSession, session_ids: list[int]) -> dict:
     """Count the manual review work in scope of a run-all wipe.
-    Each non-zero counter is real work the user did that would be lost."""
+    Each non-zero counter is real work the user did that would be lost.
+
+    Phase B addition (2026-06-25): `copied_clusters` counts clusters with
+    ZERO Face rows. These are copies created via
+    `/api/clusters/{id}/copy-to-session` — by design they have no Face
+    rows, so a pipeline re-run (which clears Faces + Clusters + ImageRoles
+    then re-derives from Faces) would silently delete them. Surfacing the
+    count gives the operator a chance to back out before the wipe.
+    """
+    from app.models.db_models import Face
     if not session_ids:
         return {
             "reviewed_teams": 0, "manual_labels": 0,
             "manual_coach_overrides": 0, "manual_role_decisions": 0,
+            "copied_clusters": 0,
         }
     reviewed_teams = (
         db.query(Session)
@@ -690,11 +700,22 @@ def _runall_impact(db: DbSession, session_ids: list[int]) -> dict:
                 ImageRole.manual_override == 1)
         .count()
     )
+    # Copied clusters: those with zero Face rows in scope sessions. Identified
+    # by NOT EXISTS — clearer + cheaper than a left-join + GROUP BY HAVING.
+    copied_clusters = (
+        db.query(Cluster)
+        .filter(
+            Cluster.session_id.in_(session_ids),
+            ~db.query(Face).filter(Face.cluster_id == Cluster.id).exists(),
+        )
+        .count()
+    )
     return {
         "reviewed_teams": reviewed_teams,
         "manual_labels": manual_labels,
         "manual_coach_overrides": manual_coach,
         "manual_role_decisions": manual_roles,
+        "copied_clusters": copied_clusters,
     }
 
 

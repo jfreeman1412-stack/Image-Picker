@@ -149,6 +149,12 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
             "is_coach_for_sort": c.is_coach_for_sort(),
             "manual_coach_override": c.manual_coach_override or 0,
             "accepted_cross_team": bool(c.accepted_cross_team),
+            # Phase B (2026-06-25): has_faces=False indicates a copied cluster
+            # (no Face rows, won't survive a pipeline re-run). FE renders a
+            # "📋 copy" badge for these. Normal pipeline-derived clusters
+            # always have Face rows (one per detected face); a copy created
+            # via /api/clusters/{id}/copy-to-session has none by design.
+            "has_faces": bool(c.faces),
             "guest_of": guest_map.get(c.id),   # None unless a confirmed cross-team guest
             # Phase A.4: reference-match data (additive — existing UI ignores it;
             # A.5 will render it). roster_team is the matched player's team(s)

@@ -365,6 +365,17 @@ export default function JobDetail() {
                   {runAllImpact.impact.manual_role_decisions === 1 ? '' : 's'}
                 </li>
               )}
+              {/* 2026-06-25 Phase B: copied clusters have no face data and
+                  cannot be re-derived by a pipeline re-run. Surface the
+                  count so the operator knows what they're about to lose
+                  before the wipe. */}
+              {runAllImpact.impact.copied_clusters > 0 && (
+                <li>
+                  <b>{runAllImpact.impact.copied_clusters}</b> copied
+                  cluster{runAllImpact.impact.copied_clusters === 1 ? '' : 's'}
+                  {' '}(no face data, cannot be re-derived — re-running deletes them)
+                </li>
+              )}
             </ul>
             <p className="muted">
               Type the job name <code>{runAllImpact.job_name}</code> to confirm:

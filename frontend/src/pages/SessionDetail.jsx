@@ -414,6 +414,53 @@ export default function SessionDetail() {
     return parseMoveResponse(res);
   };
 
+  // 2026-06-25 Phase B (COPY): three parallel handlers for the copy flow.
+  // The copy endpoint takes only target_session_id (no force flag — copy
+  // doesn't have move's manual_override/reviewed-source guards because the
+  // source stays put). Case 2 (roster team without session) and Case 3
+  // (typed name) require resolving to a target_session_id first; the
+  // current backend only exposes /copy-to-session (Case 1). For Phase B,
+  // Cases 2 and 3 surface a friendly inline error explaining the copy
+  // currently requires a destination session that already exists. (A
+  // follow-up could add /copy-to-new-session and /copy-to-add-team
+  // mirroring the move endpoints — flagged for after Phase B validates.)
+  const onCopyToSession = async (clusterId, targetSessionId) => {
+    const res = await fetch(`/api/clusters/${clusterId}/copy-to-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_session_id: Number(targetSessionId) }),
+    });
+    if (res.ok) {
+      await load();
+      return { ok: true };
+    }
+    let body;
+    try { body = await res.json(); } catch { body = null; }
+    if (body?.detail) {
+      const msg = typeof body.detail === 'string'
+        ? body.detail
+        : body.detail.message || JSON.stringify(body.detail);
+      window.alert(`Copy failed: ${msg}`);
+    } else {
+      window.alert(`Copy failed (HTTP ${res.status}).`);
+    }
+    return { ok: false };
+  };
+  const onCopyToNewSession = async (_clusterId, _teamName) => {
+    window.alert(
+      'Copy currently requires a destination session that already exists. ' +
+      'Pick a team from the dropdown that has its own session.',
+    );
+    return { ok: false };
+  };
+  const onCopyToAddTeam = async (_clusterId, _teamName) => {
+    window.alert(
+      'Copy currently requires a destination session that already exists. ' +
+      'Use Move + Create-new-team if you need to create the destination team first.',
+    );
+    return { ok: false };
+  };
+
   const onDismissCrossTeam = async (clusterId) => {
     const res = await fetch(`/api/clusters/${clusterId}/dismiss-cross-team`, {
       method: 'POST',
@@ -523,6 +570,9 @@ export default function SessionDetail() {
             onMoveWithGuards={onMoveWithGuards}
             onMoveToNewSession={onMoveToNewSession}
             onMoveToAddTeam={onMoveToAddTeam}
+            onCopyToSession={onCopyToSession}
+            onCopyToNewSession={onCopyToNewSession}
+            onCopyToAddTeam={onCopyToAddTeam}
             onDismissCrossTeam={onDismissCrossTeam}
             onUndismissCrossTeam={onUndismissCrossTeam}
           />

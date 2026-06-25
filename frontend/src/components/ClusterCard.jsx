@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import TeamPicker, { ADD_NEW_TEAM } from './TeamPicker.jsx';
 
 const ROLE_BADGES = {
   team:       { label: 'TEAM',  className: 'badge badge-team' },
@@ -49,6 +50,15 @@ export default function ClusterCard({
   onMoveToAddTeam,      // async (cluster_id, team_name, force) → {ok, impact?}      (Case 3)
   onDismissCrossTeam,   // async (cluster_id) → void
   onUndismissCrossTeam, // async (cluster_id) → void
+  // 2026-06-25 Phase B (COPY): async (cluster_id, target_session_id) → {ok}.
+  // Distinct from move — COPY duplicates the cluster onto the destination
+  // and leaves the source intact. Used for the coach-on-multiple-teams
+  // case. Re-uses the same dropdown picker as Move via <TeamPicker>; the
+  // pickedTarget/blockedImpact/addTeamModal state is shared (only one
+  // picker is open at a time, gated by moveOpen vs copyOpen).
+  onCopyToSession,      // async (cluster_id, target_session_id) → {ok}
+  onCopyToNewSession,   // async (cluster_id, team_name) → {ok}   (Case 2 parallel for copy)
+  onCopyToAddTeam,      // async (cluster_id, team_name) → {ok}   (Case 3 parallel for copy)
 }) {
   const [editing, setEditing] = useState(false);
   const [label, setLabel] = useState(cluster.label);
@@ -71,6 +81,14 @@ export default function ClusterCard({
   // picker shape the smart panel uses. See showAlwaysAvailableMove below
   // for the gate; only relevant when the smart panel is NOT showing.
   const [moveOpen, setMoveOpen] = useState(false);
+  // 2026-06-25 Phase B (COPY): copyOpen parallels moveOpen. When true,
+  // the operator clicked "Copy to another team…" → the same picker JSX
+  // renders, but the commit handlers dispatch to the copy endpoint rather
+  // than move. Mutually exclusive with moveOpen at the trigger level
+  // (only one picker visible at a time). The picker JSX itself doesn't
+  // care which is set — handleDropdownPick / handleSmartCommit branch on
+  // copyOpen to pick the right action callback.
+  const [copyOpen, setCopyOpen] = useState(false);
 
   // This card is a valid drop target only while an image from a *different*
   // cluster is being dragged.
@@ -186,7 +204,10 @@ export default function ClusterCard({
   // without the smart-case-specific elements.
   const showAlwaysAvailableMove =
     !guest && onMoveWithGuards && !smartPanelTriggered;
-  const showMoveCardActions = smartPanelTriggered || moveOpen;
+  // Phase B: showMoveCardActions now also true when copyOpen, because the
+  // same picker JSX renders for both move and copy. Branches inside the
+  // picker callbacks decide which endpoint to hit.
+  const showMoveCardActions = smartPanelTriggered || moveOpen || copyOpen;
   // Move-card Phase 2 (2026-06-08): smart suggestion now finds a target
   // whose name matches the matched player's roster team in EITHER form —
   // an existing session (Case 1) or a roster-only team (Case 2). The
@@ -198,9 +219,11 @@ export default function ClusterCard({
   const smartIsCase2 = smartTarget && smartTarget.session_id == null;
 
   // The dropdown only ever shows non-archived targets, and excludes the
-  // smart-suggestion target (it already has its own button). The
-  // ADD_NEW_TEAM_SENTINEL is the last option — picking it opens the modal.
-  const ADD_NEW_TEAM = '__add_new_team__';
+  // smart-suggestion target (it already has its own button). Phase B
+  // (2026-06-25): the ADD_NEW_TEAM sentinel now lives on TeamPicker.jsx
+  // since both move + copy share the picker. dropdownOptions stays here
+  // because handleDropdownPick references it to look up the chosen
+  // option's session_id (Case 1 vs Case 2 branch).
   const dropdownOptions = (teamOptions || []).filter(
     (o) => !o.archived && (!smartTarget || o.norm_name !== smartTarget.norm_name),
   );
@@ -224,6 +247,9 @@ export default function ClusterCard({
         // on a successful move-with-guards, so the panel disappears
         // with the card.
         setMoveOpen(false);
+        // Phase B: also collapse the copy picker (one of the two open
+        // states is true; clearing both is idempotent + safe).
+        setCopyOpen(false);
         return;
       }
       // 409 with impact: surface the force-confirm prompt.
@@ -252,15 +278,39 @@ export default function ClusterCard({
       () => moveToTypedTeam(teamName, true),
     );
 
+  // 2026-06-25 Phase B (COPY) parallel dispatchers. No `force` flag —
+  // copy doesn't have the manual_override/reviewed-source guards that
+  // move has (because source stays put). All three call back into
+  // runMove for the shared in-flight bookkeeping (busy spinner +
+  // success cleanup).
+  const copyToExistingSession = (sessionId) =>
+    runMove(
+      () => onCopyToSession(cluster.cluster_id, Number(sessionId)),
+      () => copyToExistingSession(sessionId),  // copy has no force; retry no-op
+    );
+  const copyToRosterTeam = (teamName) =>
+    runMove(
+      () => onCopyToNewSession(cluster.cluster_id, teamName),
+      () => copyToRosterTeam(teamName),
+    );
+  const copyToTypedTeam = (teamName) =>
+    runMove(
+      () => onCopyToAddTeam(cluster.cluster_id, teamName),
+      () => copyToTypedTeam(teamName),
+    );
+
   // Pick from the dropdown. Routes Case 1 vs Case 2 based on session_id.
+  // Branches on copyOpen vs moveOpen to pick the right action callback.
   const handleDropdownPick = (force) => {
     if (!pickedTarget || pickedTarget === ADD_NEW_TEAM) return;
     const opt = dropdownOptions.find((o) => o.norm_name === pickedTarget);
     if (!opt) return;
-    if (opt.session_id != null) {
-      moveToExistingSession(opt.session_id, force);
+    if (copyOpen) {
+      if (opt.session_id != null) copyToExistingSession(opt.session_id);
+      else copyToRosterTeam(opt.name);
     } else {
-      moveToRosterTeam(opt.name, force);
+      if (opt.session_id != null) moveToExistingSession(opt.session_id, force);
+      else moveToRosterTeam(opt.name, force);
     }
   };
 
@@ -277,13 +327,15 @@ export default function ClusterCard({
 
   // Case 3 modal commit. Validates the typed name isn't blank locally
   // (server-side validation is the source of truth for the rest).
+  // Phase B: branches on copyOpen to dispatch to the copy endpoint.
   const handleAddTeamCommit = () => {
     const typed = (addTeamModal?.typedName || '').trim();
     if (!typed) {
       setAddTeamModal({ ...(addTeamModal || {}), error: 'Team name required.' });
       return;
     }
-    moveToTypedTeam(typed, false);
+    if (copyOpen) copyToTypedTeam(typed);
+    else moveToTypedTeam(typed, false);
   };
 
   return (
@@ -337,6 +389,29 @@ export default function ClusterCard({
           </select>
         )}
         <span className="cluster-count">{cluster.image_count} images</span>
+        {/* 2026-06-25 Phase B: cluster created via /copy-to-session. The
+            destination has no Face rows by design, so a pipeline re-run
+            on this session would wipe it (the run-all confirm dialog
+            warns the operator). Surface the copy state inline so the
+            operator knows what they're looking at without having to
+            cross-reference. */}
+        {!guest && cluster.has_faces === false && (
+          <span
+            className="copy-pill"
+            title="This is a copy — duplicated from another team. It has no face data, so a pipeline re-run would delete it."
+            style={{
+              fontSize: '0.85em',
+              padding: '2px 6px',
+              borderRadius: 4,
+              background: '#e9ecf3',
+              color: '#3a4767',
+              border: '1px solid #b8c2d5',
+              marginLeft: 4,
+            }}
+          >
+            📋 copy
+          </span>
+        )}
         {!guest && incomplete === false && (
           <span className="complete-chip" title="Team + pano assigned">✓ complete</span>
         )}
@@ -439,60 +514,37 @@ export default function ClusterCard({
                     {smartIsCase2 && ' (new session)'}
                   </button>
                 )}
-                <select
-                  value={pickedTarget}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v === ADD_NEW_TEAM) {
-                      setPickedTarget('');
-                      setAddTeamModal({ typedName: '', error: null });
-                      return;
-                    }
-                    setPickedTarget(v);
+                {/* 2026-06-25 Phase B: extracted picker. Same dropdown
+                    JSX used for move and copy — branch happens in
+                    handleDropdownPick on copyOpen. mode flips the commit
+                    button label. */}
+                <TeamPicker
+                  teamOptions={teamOptions}
+                  excludeNormName={smartTarget ? smartTarget.norm_name : null}
+                  pickedTarget={pickedTarget}
+                  onPickedTargetChange={setPickedTarget}
+                  onAddTeamClicked={() => {
+                    setPickedTarget('');
+                    setAddTeamModal({ typedName: '', error: null });
                   }}
-                  disabled={moveBusy}
-                >
-                  <option value="">
-                    {smartTarget ? 'Pick different team…' : 'Pick team…'}
-                  </option>
-                  {dropdownOptions.map((opt) => (
-                    <option key={opt.norm_name} value={opt.norm_name}>
-                      {opt.name}
-                      {opt.session_id == null ? ' (no session yet)' : ''}
-                    </option>
-                  ))}
-                  <option disabled>──────────</option>
-                  <option value={ADD_NEW_TEAM}>+ Add new team…</option>
-                </select>
-                {pickedTarget && pickedTarget !== ADD_NEW_TEAM && (
-                  <button
-                    disabled={moveBusy}
-                    onClick={() => handleDropdownPick(false)}
-                  >
-                    Move
-                  </button>
-                )}
-                {/* Dismiss button: only in the smart-panel flow. The
-                    always-available flow gets a Cancel that collapses the
-                    picker back to the trigger button instead. */}
-                {smartPanelTriggered ? (
+                  onCommit={() => handleDropdownPick(false)}
+                  onCancel={() => {
+                    setMoveOpen(false);
+                    setCopyOpen(false);
+                    setPickedTarget('');
+                  }}
+                  busy={moveBusy}
+                  mode={copyOpen ? 'copy' : 'move'}
+                  placeholder={smartTarget ? 'Pick different team…' : 'Pick team…'}
+                />
+                {/* Dismiss button: only in the smart-panel flow. */}
+                {smartPanelTriggered && (
                   <button
                     className="ghost"
                     disabled={moveBusy}
                     onClick={() => onDismissCrossTeam(cluster.cluster_id)}
                   >
                     Dismiss as cross-team
-                  </button>
-                ) : (
-                  <button
-                    className="ghost"
-                    disabled={moveBusy}
-                    onClick={() => {
-                      setMoveOpen(false);
-                      setPickedTarget('');
-                    }}
-                  >
-                    Cancel
                   </button>
                 )}
               </div>
@@ -537,7 +589,7 @@ export default function ClusterCard({
                       disabled={moveBusy}
                       onClick={handleAddTeamCommit}
                     >
-                      Create & move
+                      {copyOpen ? 'Create & copy' : 'Create & move'}
                     </button>
                     <button
                       className="ghost"
@@ -563,14 +615,15 @@ export default function ClusterCard({
         </div>
       )}
 
-      {/* 2026-06-25 move-unlabeled (Phase A): the always-available trigger.
-          Renders only when the smart panel isn't already showing (gate
-          ensures one move affordance per card). Clicking opens the same
-          picker JSX above by flipping moveOpen → showMoveCardActions
-          becomes true → existing picker renders, with smart-case-specific
-          sub-elements hidden via smartPanelTriggered gates. */}
-      {showAlwaysAvailableMove && !moveOpen && (
-        <div className="move-card-actions" style={{ marginTop: 4 }}>
+      {/* 2026-06-25 move-unlabeled (Phase A) + Phase B (COPY): the
+          always-available trigger row. Renders Move + Copy triggers when
+          the smart panel isn't showing AND neither picker is open. When
+          either trigger is clicked, its picker expands using the shared
+          TeamPicker — handleDropdownPick branches on copyOpen vs moveOpen
+          to dispatch the right endpoint. One affordance per click; never
+          two pickers visible at once. */}
+      {showAlwaysAvailableMove && !moveOpen && !copyOpen && (
+        <div className="move-card-actions" style={{ marginTop: 4, gap: 6, display: 'flex', flexWrap: 'wrap' }}>
           <button
             className="ghost"
             disabled={moveBusy}
@@ -579,6 +632,16 @@ export default function ClusterCard({
           >
             Move to another team…
           </button>
+          {onCopyToSession && (
+            <button
+              className="ghost"
+              disabled={moveBusy}
+              onClick={() => setCopyOpen(true)}
+              title="Duplicate this cluster onto another team. The source stays in place. Use this for a coach who belongs to multiple teams."
+            >
+              Copy to another team…
+            </button>
+          )}
         </div>
       )}
 
