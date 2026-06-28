@@ -1,6 +1,54 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import FolderBrowser from '../components/FolderBrowser.jsx';
+import { pickRepresentativeTeam } from '../utils/pickRepresentativeTeam.js';
+
+// 2026-06-28 wizard-mixed-structure fix.
+//
+// Soft "looks like a color check" hint substrings. Case-insensitive
+// substring match. Never auto-excludes — purely visual annotation in
+// the skip-list. Structural signal (lacks-chosen-subfolder) is what
+// actually drives the skip; this list only draws the operator's eye.
+//
+// Keep this TIGHT — generic terms ("photos", "card") would false-flag
+// legitimate team names ("Color Crew", "Wildcards").
+const SOFT_HINT_SUBSTRINGS = [
+  'color', 'swatch', 'chart', 'check',
+  'calibration', 'grey card', 'gray card',
+];
+function looksLikeColorCheck(folderName) {
+  const n = (folderName || '').toLowerCase();
+  return SOFT_HINT_SUBSTRINGS.some(p => n.includes(p));
+}
+
+// Compute the zero-images guard severity from the per-team peeks. Two-tier:
+//   HARD (red, requires explicit second-click): populated==0, OR
+//         (populated==1 AND total≥3). Catches the swatch-hijack: 1 swatch
+//         populated, N real teams empty.
+//   SOFT (yellow, informational): populated<50% AND total≥4. Catches
+//         "maybe you picked the wrong subfolder" without false-alarming
+//         small jobs with a couple legitimately-pending teams.
+//   none: majority populated, OR total<4 (small jobs — operator eyeballs).
+function computeZeroImagesGuard(teamPeeks, imageSubfolder) {
+  if (!teamPeeks || teamPeeks.length === 0) return { level: 'none' };
+  const counts = teamPeeks.map(p => ({
+    name: p.name,
+    images: imageSubfolder
+      ? (p.subfolders.find(s => s.name === imageSubfolder)?.image_count ?? 0)
+      : (p.image_count ?? 0),
+  }));
+  const populated = counts.filter(c => c.images > 0);
+  const empty = counts.filter(c => c.images === 0);
+  const total = counts.length;
+  if (populated.length === 0
+      || (populated.length === 1 && total >= 3)) {
+    return { level: 'hard', populated, empty, total };
+  }
+  if (populated.length < total / 2 && total >= 4) {
+    return { level: 'soft', populated, empty, total };
+  }
+  return { level: 'none', populated, empty, total };
+}
 
 /**
  * New-job wizard. Phase 9 reorders the flow to:
@@ -58,8 +106,23 @@ export default function JobWizard() {
   const [rootPeek, setRootPeek] = useState(null);
   const [hasLines, setHasLines] = useState(null);            // true | false | 'single'
   const [teamFolders, setTeamFolders] = useState([]);
-  const [firstTeamPeek, setFirstTeamPeek] = useState(null);
+  // 2026-06-28 wizard-mixed-structure: was firstTeamPeek (pre-fix the
+  // wizard sampled only teamFolders[0] for structure detection, which let
+  // a non-team first folder (color swatch) hijack the operator's subfolder
+  // choice → silent under-ingest of every real team). Now we peek ALL
+  // team folders in parallel and pickRepresentativeTeam() chooses the
+  // structurally richest one for the 55/56 logic to read.
+  const [representativePeek, setRepresentativePeek] = useState(null);
+  // All per-team peeks. Drives the skip-list and zero-images guard in
+  // step 7 (each entry has subfolders + image_count, so we can derive
+  // "would this team ingest 0 images under the chosen imageSubfolder?").
+  const [teamPeeks, setTeamPeeks] = useState([]);
   const [imageSubfolder, setImageSubfolder] = useState(null);
+  // Hard-confirm acknowledgment for the HARD zero-images guard. Mirrors
+  // the destructive run-all confirm pattern in JobDetail.jsx — operator
+  // must explicitly click "I understand, create anyway" before the
+  // Create button activates when the guard fires HARD.
+  const [hardConfirmAck, setHardConfirmAck] = useState(false);
   const [autoRun, setAutoRun] = useState(true);
 
   const [showFolderPicker, setShowFolderPicker] = useState(false);
@@ -134,32 +197,67 @@ export default function JobWizard() {
         setTeamFolders(rootPeek.subfolders);
         setStep('teams');
       } else {
-        // 'single' — the whole root is one team.
+        // 'single' — the whole root is one team. teamPeeks holds the one
+        // peek so the skip-list/zero-images guard logic doesn't have to
+        // special-case single-team mode.
         const inside = await peek(rootPath);
         const teamName = rootPeek.path.split(/[\\/]/).pop();
+        const singlePeek = { ...inside, name: teamName };
         setTeamFolders([{
           name: teamName,
           subfolder_count: 0,
           image_count: rootPeek.image_count,
           raw_count: rootPeek.raw_count,
         }]);
-        setFirstTeamPeek({ ...inside, name: teamName });
+        setTeamPeeks([singlePeek]);
+        setRepresentativePeek(singlePeek);
         setStep('subfolder');
       }
     } catch (e) { setError(String(e.message || e)); }
     finally { setBusy(false); }
   };
 
-  /** From teams confirmation → /peek first team to find image subfolders. */
+  /** From teams confirmation → /peek EVERY team folder in parallel,
+   *  pick the structurally richest one as the representative for the
+   *  subfolder step. Browser caps concurrent fetches per origin at 6-8
+   *  so a 30-team job runs in ~5 batches; expect ~1.5-2s on UNC.
+   *  Spinner stays up via setBusy until all peeks resolve.
+   *
+   *  Why all folders, not a sample: the bug we're fixing is exactly
+   *  "wrong folder happened to sort first." Sampling 6 evenly-spaced
+   *  folders would still miss a swatch if it landed between samples.
+   *  Cost is bounded by browser concurrency, not folder count.
+   *
+   *  Falls back to teamFolders[0]-only behavior when picker returns
+   *  null (defensive — shouldn't happen given teamFolders is non-empty
+   *  by step 5 gating). */
   const confirmTeams = async () => {
     reset(); setBusy(true);
     try {
-      const firstTeam = teamFolders[0];
-      const teamPath = hasLines === true
-        ? `${rootPath}\\${rootPeek.subfolders[0].name}\\${firstTeam.name}`
-        : `${rootPath}\\${firstTeam.name}`;
-      const inside = await peek(teamPath);
-      setFirstTeamPeek({ ...inside, name: firstTeam.name });
+      const linePrefix = hasLines === true
+        ? `${rootPath}\\${rootPeek.subfolders[0].name}\\`
+        : `${rootPath}\\`;
+      const peekResults = await Promise.all(
+        teamFolders.map(async (t) => {
+          try {
+            const inside = await peek(`${linePrefix}${t.name}`);
+            return { ...inside, name: t.name };
+          } catch (e) {
+            // Single-folder peek failure is non-fatal — that folder just
+            // doesn't get peeked. Log + return null; filtered below so it
+            // doesn't pollute the picker / skip-list / guard.
+            console.warn(`[wizard] peek failed for ${t.name}:`, e);
+            return null;
+          }
+        }),
+      );
+      const peeks = peekResults.filter(Boolean);
+      if (peeks.length === 0) {
+        throw new Error('No team folders could be peeked.');
+      }
+      setTeamPeeks(peeks);
+      const rep = pickRepresentativeTeam(peeks) || peeks[0];
+      setRepresentativePeek(rep);
       setStep('subfolder');
     } catch (e) { setError(String(e.message || e)); }
     finally { setBusy(false); }
@@ -167,6 +265,9 @@ export default function JobWizard() {
 
   const chooseImageLocation = (subfolderName) => {
     setImageSubfolder(subfolderName);
+    // Reset hard-confirm ack — if the operator goes back and re-picks the
+    // subfolder, they must re-acknowledge the guard for the new choice.
+    setHardConfirmAck(false);
     setStep('create');
   };
 
@@ -398,7 +499,11 @@ export default function JobWizard() {
           <p className="muted">{teamFolders.length} teams total.</p>
           <div className="actions">
             <button className="ghost" onClick={() => setStep('structure')}>← Back</button>
-            <button disabled={busy} onClick={confirmTeams}>Looks right →</button>
+            <button disabled={busy} onClick={confirmTeams}>
+              {busy
+                ? `Inspecting ${teamFolders.length} team folder${teamFolders.length === 1 ? '' : 's'}…`
+                : 'Looks right →'}
+            </button>
           </div>
         </section>
       )}
@@ -414,11 +519,11 @@ export default function JobWizard() {
             3. Warning banner + root button disabled when root has 0
                supported images AND a subfolder has > 0 — so the only
                clickable option leads to a non-empty ingest. */}
-      {step === 'subfolder' && firstTeamPeek && (() => {
-        const rootImages = firstTeamPeek.image_count || 0;
-        const rootRaws = firstTeamPeek.raw_count || 0;
+      {step === 'subfolder' && representativePeek && (() => {
+        const rootImages = representativePeek.image_count || 0;
+        const rootRaws = representativePeek.raw_count || 0;
         // Best subfolder = highest image_count, ties broken by name asc.
-        const subs = [...(firstTeamPeek.subfolders || [])]
+        const subs = [...(representativePeek.subfolders || [])]
           .sort((a, b) => (b.image_count - a.image_count) || a.name.localeCompare(b.name));
         const bestSub = subs.find((s) => s.image_count > 0) || null;
         // Recommended marker fires when the best subfolder has more
@@ -438,10 +543,18 @@ export default function JobWizard() {
         <section className="card">
           <h2>Where are the images?</h2>
           <p>
-            Looking inside <code>{firstTeamPeek.name}</code>: found{' '}
+            Looking inside <code>{representativePeek.name}</code>: found{' '}
             <b>{rootImages}</b> images and <b>{rootRaws}</b> raws
-            in the team-folder root, plus <b>{firstTeamPeek.subfolders.length}</b> subfolders.
+            in the team-folder root, plus <b>{representativePeek.subfolders.length}</b> subfolders.
           </p>
+          {teamPeeks.length > 1 && (
+            <p className="muted" style={{ fontSize: '0.9em' }}>
+              (Showing structure from <code>{representativePeek.name}</code> as the
+              representative folder. The skip-list on the next step will tell
+              you which of the {teamPeeks.length} team folders lack your chosen
+              subfolder.)
+            </p>
+          )}
           {showRawWarning && (
             <p className="warn" style={{ background: '#fff3cd', padding: 8, borderRadius: 4 }}>
               ⚠ The team-folder root has <b>0 supported-format images</b>
@@ -492,8 +605,30 @@ export default function JobWizard() {
         );
       })()}
 
-      {/* Step 7: Create + progress */}
-      {step === 'create' && (
+      {/* Step 7: Create + progress
+          2026-06-28 wizard-mixed-structure: this step now derives a
+          skip-list + zero-images guard from teamPeeks so the operator
+          confirms BEFORE creating instead of discovering after ingest
+          that only the swatch populated and every real team is empty.
+          The guard is the load-bearing safety net for the silent
+          under-ingest path; the skip-list is informational. */}
+      {step === 'create' && (() => {
+        // Derive skip-list: any team whose peek lacks the chosen
+        // imageSubfolder. When imageSubfolder is null (root pick),
+        // nothing is skipped at ingest by the backend — but the
+        // zero-images guard catches that case.
+        const willSkip = imageSubfolder
+          ? teamPeeks.filter(p =>
+              !p.subfolders.some(s => s.name === imageSubfolder),
+            )
+          : [];
+        const willIngest = teamPeeks.filter(p => !willSkip.includes(p));
+        const guard = computeZeroImagesGuard(teamPeeks, imageSubfolder);
+        // The Create button is gated when the HARD guard fires AND the
+        // operator hasn't explicitly acknowledged. Matches the
+        // destructive-run-all confirm pattern.
+        const hardGated = guard.level === 'hard' && !hardConfirmAck;
+        return (
         <section className="card">
           <h2>{importMode ? 'Confirm and import' : 'Confirm and create'}</h2>
           {!creatingJobId ? (
@@ -505,9 +640,99 @@ export default function JobWizard() {
                 )}
                 <li>Folder: <code>{rootPath}</code></li>
                 <li>Structure: {hasLines === true ? 'lines → teams' : hasLines === 'single' ? 'single team' : 'teams'}</li>
-                <li>Teams: <b>{teamFolders.length}</b></li>
+                <li>
+                  Teams: <b>{teamFolders.length}</b> total
+                  {willSkip.length > 0 && (
+                    <> &middot; <b>{willIngest.length}</b> will ingest
+                    &middot; <b>{willSkip.length}</b> will be skipped</>
+                  )}
+                </li>
                 <li>Images in: {imageSubfolder ? <code>{imageSubfolder}/</code> : 'team-folder root'}</li>
               </ul>
+
+              {/* Skip-list — informational. Surfaces folders the backend
+                  will skip at ingest (existing skipped_teams mechanism,
+                  jobs.py:209/222/272). Soft color-check hint annotated. */}
+              {willSkip.length > 0 && (
+                <div className="card" style={{ background: '#f4f4f4', padding: 10, marginBottom: 8 }}>
+                  <p style={{ marginTop: 0 }}>
+                    These <b>{willSkip.length}</b> folder{willSkip.length === 1 ? '' : 's'}{' '}
+                    will be skipped at ingest because they lack the{' '}
+                    <code>{imageSubfolder}</code> subfolder:
+                  </p>
+                  <ul style={{ marginBottom: 0 }}>
+                    {willSkip.map(p => (
+                      <li key={p.name}>
+                        <b>{p.name}</b>
+                        {looksLikeColorCheck(p.name) && (
+                          <span className="muted" style={{ marginLeft: 6 }}>
+                            (looks like a color check)
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Zero-images guard — HARD case (red). The load-bearing
+                  safety net: this catches the swatch-hijack where the
+                  operator's subfolder choice would silently zero-ingest
+                  every real team. Requires explicit second click. */}
+              {guard.level === 'hard' && (
+                <div
+                  className="card"
+                  style={{
+                    background: '#fce4e4', borderLeft: '4px solid #b00020',
+                    padding: 12, marginBottom: 8,
+                  }}
+                >
+                  <p style={{ marginTop: 0 }}>
+                    <b>⚠ Stop — this looks wrong.</b>
+                  </p>
+                  <p>
+                    Only <b>{guard.populated.length}</b> of <b>{guard.total}</b>{' '}
+                    team folder{guard.total === 1 ? '' : 's'} will ingest images
+                    {guard.populated.length > 0 && (
+                      <> (<b>{guard.populated.map(p => p.name).join(', ')}</b>)</>
+                    )}.
+                    The other <b>{guard.empty.length}</b> will be empty.
+                  </p>
+                  <p>
+                    {imageSubfolder
+                      ? <>Did you pick the wrong subfolder? Real team folders
+                        usually have <code>Adjusted</code> or similar.</>
+                      : <>Did you mean to pick a subfolder like <code>Adjusted</code>{' '}
+                        instead of the team-folder root? Most renditions live
+                        in a subfolder.</>}
+                  </p>
+                  <label style={{ display: 'block', marginTop: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={hardConfirmAck}
+                      onChange={(e) => setHardConfirmAck(e.target.checked)}
+                    />
+                    {' '}I understand, create anyway
+                  </label>
+                </div>
+              )}
+
+              {/* SOFT case (yellow): informational, no extra click. */}
+              {guard.level === 'soft' && (
+                <div
+                  className="card"
+                  style={{
+                    background: '#fff3cd', borderLeft: '4px solid #b58900',
+                    padding: 10, marginBottom: 8,
+                  }}
+                >
+                  <p style={{ marginTop: 0, marginBottom: 0 }}>
+                    <b>{guard.populated.length} of {guard.total}</b> team
+                    folders will ingest images. Verify this is correct.
+                  </p>
+                </div>
+              )}
+
               <label className="auto-run-toggle">
                 <input
                   type="checkbox"
@@ -518,7 +743,7 @@ export default function JobWizard() {
               </label>
               <div className="actions">
                 <button className="ghost" onClick={() => setStep('subfolder')}>← Back</button>
-                <button disabled={busy} onClick={create}>
+                <button disabled={busy || hardGated} onClick={create}>
                   {busy
                     ? (importMode ? 'Importing…' : 'Creating…')
                     : (importMode ? 'Import images' : 'Create job')}
@@ -564,7 +789,8 @@ export default function JobWizard() {
             </div>
           )}
         </section>
-      )}
+        );
+      })()}
     </div>
   );
 }
