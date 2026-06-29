@@ -539,7 +539,17 @@ export default function ClusterCard({
                     button label. */}
                 <TeamPicker
                   teamOptions={teamOptions}
-                  excludeNormName={smartTarget ? smartTarget.norm_name : null}
+                  // 2026-06-29: gate the picker's own filter on
+                  // smartPanelTriggered too — when the smart panel ISN'T
+                  // rendering the smart-target as a primary button, the
+                  // operator needs to reach it via this dropdown. Mirrors
+                  // the local dropdownOptions filter above (which is for
+                  // pick routing only — the rendered dropdown comes from
+                  // here). Missing this filter site was why ce15a3c
+                  // didn't actually fix the user-visible bug.
+                  excludeNormName={
+                    smartTarget && smartPanelTriggered ? smartTarget.norm_name : null
+                  }
                   pickedTarget={pickedTarget}
                   onPickedTargetChange={setPickedTarget}
                   onAddTeamClicked={() => {
