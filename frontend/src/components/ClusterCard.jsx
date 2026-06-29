@@ -219,13 +219,29 @@ export default function ClusterCard({
   const smartIsCase2 = smartTarget && smartTarget.session_id == null;
 
   // The dropdown only ever shows non-archived targets, and excludes the
-  // smart-suggestion target (it already has its own button). Phase B
-  // (2026-06-25): the ADD_NEW_TEAM sentinel now lives on TeamPicker.jsx
-  // since both move + copy share the picker. dropdownOptions stays here
-  // because handleDropdownPick references it to look up the chosen
-  // option's session_id (Case 1 vs Case 2 branch).
+  // smart-suggestion target ONLY WHEN the smart panel is actually rendering
+  // it as a primary button — otherwise the operator has no path to reach
+  // that team from this card.
+  //
+  // 2026-06-29 follow-up to job 63 / session 714 / cluster 7137: the
+  // smart panel gates on match_team_mismatch + accepted_cross_team
+  // (smartPanelTriggered). match_team_mismatch ITSELF gates on
+  // match_tier=="high" (roster_check.py:99) — so a low/medium-tier
+  // face-matched cluster gets no smart panel even though its API
+  // response still carries match.roster_team. Pre-fix, smartTarget was
+  // still found (independent of tier) and the dropdown excluded it,
+  // making the matched player's roster team unreachable. Now the
+  // exclusion only fires when smartPanelTriggered is true, which is the
+  // case where the dedicated smart-panel button is visible.
+  //
+  // Phase B (2026-06-25): the ADD_NEW_TEAM sentinel now lives on
+  // TeamPicker.jsx since both move + copy share the picker.
+  // dropdownOptions stays here because handleDropdownPick references it
+  // to look up the chosen option's session_id (Case 1 vs Case 2 branch).
   const dropdownOptions = (teamOptions || []).filter(
-    (o) => !o.archived && (!smartTarget || o.norm_name !== smartTarget.norm_name),
+    (o) => !o.archived && (
+      !smartTarget || !smartPanelTriggered || o.norm_name !== smartTarget.norm_name
+    ),
   );
 
   // Centralised force-confirm + busy bookkeeping. `runner` is an async
