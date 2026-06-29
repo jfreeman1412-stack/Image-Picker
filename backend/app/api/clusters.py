@@ -83,20 +83,38 @@ def list_clusters(session_id: int, db: DbSession = Depends(get_db)):
 
     out = []
     for c in s.clusters:
-        # 2026-06-25 Phase B follow-up: derive cluster image membership from
-        # ImageRole (the load-bearing "image belongs to this cluster" relation
-        # that export also uses), not from c.faces (the upstream clustering
-        # primitive). For pipeline clusters the two agree — every image with
-        # a Face row also has an ImageRole row from _sort_cluster — but only
-        # ImageRole survives a copy-to-session (Face rows are not duplicated
-        # by design). Without this, copied clusters render their persisted
-        # image_count in the header but with zero thumbnails in the body
-        # (the screenshot bug on cluster 6825). It also aligns the card's
-        # source of truth with export's: both rename-mode + legacy-mode
-        # exports consult ImageRole + Image rows, so what the operator sees
-        # in the card is now what export will actually deliver.
+        # 2026-06-29: derive cluster image membership for DISPLAY from
+        # ImageRole UNION Face — three cluster classes coexist in production
+        # and they each populate the two relations differently:
+        #
+        #   - Normal pipeline cluster: every image has BOTH a Face row
+        #     (clustering primitive) AND an ImageRole row (assigned by
+        #     _sort_cluster). Union = either set; no double-count, no
+        #     change vs the pre-Phase-B c.faces-only read.
+        #   - Copy-to-session (Phase B, 2026-06-25): Image+ImageRole rows
+        #     duplicated, Face rows NOT duplicated. ImageRole is the only
+        #     populated relation. Union = ImageRole — matches 9dbf889.
+        #   - Buddy-only coach: faces only appear in multi-face shots that
+        #     "belong to" another cluster's solo subject. _sort_cluster
+        #     intentionally writes NO ImageRole rows for the coach (the
+        #     buddy shot's ImageRole goes to the kid). Faces only. Union
+        #     = Face — restores the pre-9dbf889 ability to view + act on
+        #     these coach cards. review_reason='coach_no_solo_image'.
+        #
+        # The 2026-06-25 fix was correct that the card's source of truth
+        # should align with export's (ImageRole), but missed that the
+        # buddy-only-coach class exists outside ImageRole's scope. UNION
+        # is the reconciliation — display covers all three; export still
+        # consults ImageRole alone (correct — coach buddy shots already
+        # export via the kid's ImageRole). See [[face-vs-imagerole-membership]].
+        #
+        # role_by_image stays ImageRole-keyed. For buddy-only-coach buddy
+        # shots, the lookup returns no entry → role=None displayed on the
+        # thumbnail (matches pre-9dbf889 behavior — operator sees the
+        # photo but no role chip on it from the coach's vantage).
         role_rows = db.query(ImageRole).filter(ImageRole.cluster_id == c.id).all()
-        image_ids = {r.image_id for r in role_rows}
+        face_image_ids = {f.image_id for f in c.faces}
+        image_ids = {r.image_id for r in role_rows} | face_image_ids
         image_rows = db.query(Image).filter(Image.id.in_(image_ids)).all()
         role_by_image = {r.image_id: (r.role, bool(r.manual_override)) for r in role_rows}
 

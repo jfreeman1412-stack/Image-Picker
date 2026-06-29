@@ -591,3 +591,72 @@ def test_list_clusters_returns_images_for_copied_cluster_with_no_faces(db):
         assert img["thumb_url"] == f"/api/images/{img['image_id']}/thumb"
         assert img["full_url"] == f"/api/images/{img['image_id']}/full"
         assert img["role"] in ("individual", "team", "panoramic", "buddy")
+
+
+def test_list_clusters_surfaces_buddy_only_coach_images_via_face_union(db):
+    """Regression pin for the 2026-06-29 follow-up: list_clusters must
+    surface a buddy-only coach's buddy-shot thumbnails. This class of
+    cluster has Face rows pointing at multi-face images, but NO ImageRole
+    rows because the buddy shot's ImageRole belongs to the kid who's
+    the solo subject. 9dbf889 read membership via ImageRole only and
+    silently broke 228 coach cards across history; the UNION restored
+    them. Pre-9dbf889 behavior: operator saw the buddy shot on the
+    coach's card with no role chip — same as this assertion below.
+
+    Production example: cluster 6940 in session 697 had one Face row
+    at image_id=40967, a 2-face shot. That image's only ImageRole row
+    belonged to cluster 6939 (AnnaBeth-Monson, role='buddy'). Pre-fix
+    the coach card was empty."""
+    from app.api.clusters import list_clusters
+    _, src, _ = _job_with_two_sessions(db)
+    # The kid's cluster: solo image + buddy shot. ImageRole on both.
+    kid = Cluster(
+        session_id=src.id, image_count=2,
+        auto_label="The-Kid", is_likely_coach=0,
+    )
+    db.add(kid); db.commit(); db.refresh(kid)
+    solo = Image(session_id=src.id, path="/tmp/solo.jpg", filename="solo.jpg",
+                 capture_time=datetime(2026, 1, 1, 12, 0, 0))
+    buddy_shot = Image(session_id=src.id, path="/tmp/buddy.jpg", filename="buddy.jpg",
+                       capture_time=datetime(2026, 1, 1, 12, 1, 0))
+    db.add_all([solo, buddy_shot]); db.commit()
+    db.refresh(solo); db.refresh(buddy_shot)
+    db.add_all([
+        Face(image_id=solo.id, cluster_id=kid.id, bbox="[0,0,10,10]",
+             det_score=0.9, face_area_ratio=0.2),
+        Face(image_id=buddy_shot.id, cluster_id=kid.id, bbox="[0,0,10,10]",
+             det_score=0.9, face_area_ratio=0.2),
+        ImageRole(image_id=solo.id, cluster_id=kid.id,
+                  role="team", manual_override=0),
+        ImageRole(image_id=buddy_shot.id, cluster_id=kid.id,
+                  role="buddy", manual_override=0),
+    ])
+    # The coach's cluster: ONLY a Face row at the buddy shot. No ImageRole
+    # (matches production _sort_cluster behavior for coach_no_solo_image).
+    # image_count=0 because the cluster owns no images of its own.
+    coach = Cluster(
+        session_id=src.id, image_count=0,
+        is_likely_coach=1, review_reason="coach_no_solo_image",
+    )
+    db.add(coach); db.commit(); db.refresh(coach)
+    db.add(Face(image_id=buddy_shot.id, cluster_id=coach.id, bbox="[0,0,10,10]",
+                det_score=0.9, face_area_ratio=0.2))
+    db.commit()
+
+    out = list_clusters(src.id, db)
+    coach_row = next(r for r in out if r["cluster_id"] == coach.id)
+    # The buddy shot must surface on the coach's card despite the
+    # cluster having zero ImageRole rows — this is the regression pin.
+    assert len(coach_row["images"]) == 1
+    assert coach_row["images"][0]["filename"] == "buddy.jpg"
+    # role=None on the coach's view of the buddy shot — the ImageRole
+    # belongs to the kid's cluster, not the coach's. role_by_image is
+    # still ImageRole-keyed, so the lookup returns no entry.
+    assert coach_row["images"][0]["role"] is None
+    # And the kid's card still surfaces both images, unchanged — proves
+    # the union doesn't double-count for pipeline clusters where Face
+    # and ImageRole overlap.
+    kid_row = next(r for r in out if r["cluster_id"] == kid.id)
+    assert len(kid_row["images"]) == 2
+    kid_roles = sorted(img["role"] for img in kid_row["images"])
+    assert kid_roles == ["buddy", "team"]
