@@ -366,6 +366,30 @@ body {
 }
 .picker-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* A–Z / Newest segmented sort toggle (mirrors the editor's control). */
+.sort-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sort-toggle-label { font-size: 0.85rem; color: var(--text-muted); }
+.sort-toggle .seg {
+  flex: 1;
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.sort-toggle .seg.active {
+  color: #fff;
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+.sort-toggle .seg:active { opacity: 0.85; }
+
 /* ── Roster screen (Section 3; filters added in Section 4) ──────────────────
  * Full-height flex column: a fixed header over a scrollable list. The global
  * html/body overflow:hidden stops page bounce; the list scrolls internally. */

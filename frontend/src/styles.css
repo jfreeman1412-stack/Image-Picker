@@ -1157,14 +1157,47 @@ button.primary-cta:hover:not(:disabled) {
 /* ── Phase 4.6: archive/delete UI ───────────────────────────────────────── */
 .job-card { position: relative; }
 
+.list-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 14px 0;
+}
+
 .show-archived-toggle {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin: 14px 0;
   font-size: 13px;
   color: var(--text-muted);
   cursor: pointer;
+}
+.list-controls .show-archived-toggle { margin: 0; }
+
+/* A–Z / Newest segmented sort toggle (mirrors capture's control). */
+.sort-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sort-toggle-label {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.sort-toggle .seg {
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+}
+.sort-toggle .seg.active {
+  background: var(--bg-elev-3);
+  border-color: var(--accent);
+  color: var(--text);
 }
 
 .card-menu {

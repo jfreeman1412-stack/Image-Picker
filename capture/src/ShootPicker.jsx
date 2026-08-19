@@ -11,6 +11,12 @@ import { useEffect, useState } from 'react';
 import {
   getShoots, putShoots, getCachedRosterJobIds, putRoster,
 } from './db.js';
+import { sortJobs, DEFAULT_SORT_MODE, isSortMode } from './jobSort.js';
+
+// Per-device sticky preference for the A–Z / Newest shoot-list toggle. A–Z is
+// the default; "Newest" recovers the backend created_at-DESC order. Mirrors
+// the editor app's JobList control — keep the two in lockstep.
+const SORT_KEY = 'capture:shoot-sort';
 
 export default function ShootPicker({ onPick }) {
   const [jobs, setJobs] = useState([]);
@@ -20,6 +26,15 @@ export default function ShootPicker({ onPick }) {
   const [cachedIds, setCachedIds] = useState(new Set());
   const [downloading, setDownloading] = useState(new Set());
   const [errors, setErrors] = useState({});           // jobId → message
+  const [sortMode, setSortMode] = useState(() => {
+    try {
+      const v = localStorage.getItem(SORT_KEY);
+      return isSortMode(v) ? v : DEFAULT_SORT_MODE;
+    } catch { return DEFAULT_SORT_MODE; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(SORT_KEY, sortMode); } catch { /* storage blocked */ }
+  }, [sortMode]);
 
   const load = async () => {
     setStatus('loading');
@@ -76,6 +91,7 @@ export default function ShootPicker({ onPick }) {
   };
 
   const online = source === 'network';
+  const sortedJobs = sortJobs(jobs, sortMode);
 
   return (
     <main className="screen picker-screen">
@@ -103,9 +119,31 @@ export default function ShootPicker({ onPick }) {
           </p>
         )}
 
+        {status === 'ready' && jobs.length > 1 && (
+          <div className="sort-toggle" role="group" aria-label="Sort shoots by">
+            <span className="sort-toggle-label">Sort</span>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'name' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'name'}
+              onClick={() => setSortMode('name')}
+            >
+              A–Z
+            </button>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'newest' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'newest'}
+              onClick={() => setSortMode('newest')}
+            >
+              Newest
+            </button>
+          </div>
+        )}
+
         {status === 'ready' && jobs.length > 0 && (
           <ul className="shoot-list">
-            {jobs.map((job) => {
+            {sortedJobs.map((job) => {
               const cached = cachedIds.has(job.id);
               const busy = downloading.has(job.id);
               return (

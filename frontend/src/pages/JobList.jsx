@@ -4,6 +4,13 @@ import CardMenu from '../components/CardMenu.jsx';
 import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
 import NewShootModal from '../components/NewShootModal.jsx';
+import { sortJobs, DEFAULT_SORT_MODE, isSortMode } from '../utils/jobSort.js';
+
+// Per-device sticky preference for the A–Z / Newest job-list toggle. A–Z is
+// the default (the point of the feature is browsing jobs alphabetically);
+// "Newest" recovers the original created_at-DESC order. Flip DEFAULT_SORT_MODE
+// in utils/jobSort.js if the default should ever be "Newest" instead.
+const SORT_KEY = 'player-sort:job-sort';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -23,6 +30,15 @@ export default function JobList() {
   const [toast, setToast] = useState(null);     // {message, actionLabel, onAction}
   const [confirm, setConfirm] = useState(null); // {job}
   const [showNewShoot, setShowNewShoot] = useState(false);
+  const [sortMode, setSortMode] = useState(() => {
+    try {
+      const v = localStorage.getItem(SORT_KEY);
+      return isSortMode(v) ? v : DEFAULT_SORT_MODE;
+    } catch { return DEFAULT_SORT_MODE; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(SORT_KEY, sortMode); } catch { /* storage blocked */ }
+  }, [sortMode]);
 
   const load = async () => {
     const q = showArchived ? '?include_archived=true' : '';
@@ -56,6 +72,8 @@ export default function JobList() {
     setToast({ message: `Job "${job.name}" deleted.` });
   };
 
+  const sortedJobs = sortJobs(jobs, sortMode);
+
   return (
     <div className="page">
       <header className="row-between">
@@ -75,14 +93,38 @@ export default function JobList() {
         </div>
       </header>
 
-      <label className="show-archived-toggle">
-        <input
-          type="checkbox"
-          checked={showArchived}
-          onChange={(e) => setShowArchived(e.target.checked)}
-        />
-        Show archived
-      </label>
+      <div className="list-controls">
+        <label className="show-archived-toggle">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={(e) => setShowArchived(e.target.checked)}
+          />
+          Show archived
+        </label>
+
+        {jobs && jobs.length > 1 && (
+          <div className="sort-toggle" role="group" aria-label="Sort jobs by">
+            <span className="sort-toggle-label">Sort</span>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'name' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'name'}
+              onClick={() => setSortMode('name')}
+            >
+              A–Z
+            </button>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'newest' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'newest'}
+              onClick={() => setSortMode('newest')}
+            >
+              Newest
+            </button>
+          </div>
+        )}
+      </div>
 
       {jobs === null && <p className="muted">Loading…</p>}
 
@@ -99,7 +141,7 @@ export default function JobList() {
 
       {jobs && jobs.length > 0 && (
         <div className="job-grid">
-          {jobs.map(j => {
+          {sortedJobs.map(j => {
             const teams = j.session_count || 0;
             const reviewedCount = j.reviewed_count || 0;
             const pct = teams > 0 ? Math.round((reviewedCount / teams) * 100) : 0;
