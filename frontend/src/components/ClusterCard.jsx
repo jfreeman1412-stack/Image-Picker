@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import TeamPicker, { ADD_NEW_TEAM } from './TeamPicker.jsx';
+import { flagLabel } from '../utils/reviewFlags.js';
 
 const ROLE_BADGES = {
   team:       { label: 'TEAM',  className: 'badge badge-team' },
@@ -444,7 +445,7 @@ export default function ClusterCard({
         )}
         {!guest && visibleReasons.map(reason => (
           <span key={reason} className="review-badge" title={reason}>
-            ⚠ {reason}
+            ⚠ {flagLabel(reason)}
           </span>
         ))}
       </div>

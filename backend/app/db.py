@@ -46,6 +46,8 @@ _PHASE2_COLUMNS = {
         ("yaw", "FLOAT"),
         ("pitch", "FLOAT"),
         ("face_area_ratio", "FLOAT"),
+        # 2026-08: landmark smile signal for pano non-smiling preference.
+        ("smile_score", "FLOAT"),
     ],
     "clusters": [
         ("is_likely_coach", "INTEGER DEFAULT 0"),

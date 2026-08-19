@@ -225,10 +225,12 @@ def detect_faces(image_path: Path) -> List[dict]:
             "yaw": float | None,            # head pose yaw, degrees
             "pitch": float | None,          # head pose pitch, degrees
             "face_area_ratio": float | None, # bbox area / image area
+            "smile_score": float | None,    # landmark smile signal [0,1]; None = un-scorable
         }
     Returns [] if the image cannot be loaded.
     """
     from app.services.image_io import read_bgr
+    from app.services.smile import smile_score_from_landmarks
 
     img = read_bgr(image_path)
     if img is None:
@@ -275,6 +277,13 @@ def detect_faces(image_path: Path) -> List[dict]:
 
         area_ratio = (bbox_w * bbox_h) / img_area if img_area else None
 
+        # Landmark smile signal from the 2d106det landmarks buffalo_l already
+        # produced (see services/smile.py). Missing landmarks → None → treated
+        # downstream as non-smiling (conservative), never crashes detection.
+        smile_score = smile_score_from_landmarks(
+            getattr(f, "landmark_2d_106", None), getattr(f, "kps", None),
+        )
+
         out.append({
             "bbox": [int(x1), int(y1), bbox_w, bbox_h],
             "embedding": np.asarray(f.normed_embedding, dtype=np.float32),
@@ -283,5 +292,6 @@ def detect_faces(image_path: Path) -> List[dict]:
             "yaw": yaw_val,
             "pitch": pitch_val,
             "face_area_ratio": float(area_ratio) if area_ratio is not None else None,
+            "smile_score": smile_score,
         })
     return out

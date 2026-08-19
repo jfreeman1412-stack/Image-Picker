@@ -95,8 +95,13 @@ class Face(Base):
     bbox = Column(String)  # JSON [x, y, w, h]
     embedding = Column(LargeBinary)  # numpy float32 .tobytes()
     det_score = Column(Float)
-    expression = Column(String, nullable=True)  # smiling | serious | unknown
+    expression = Column(String, nullable=True)  # smiling | serious | unknown (FER)
     expression_score = Column(Float, nullable=True)
+    # 2026-08: landmark-geometry smile score in [0,1] (services/smile.py).
+    # Continuous by design so the smiling/neutral threshold can be retuned at
+    # sort time without re-running detection. Drives pano non-smiling
+    # preference; NULL = un-scorable (treated as non-smiling). Auto-migrated.
+    smile_score = Column(Float, nullable=True)
     age = Column(Float, nullable=True)  # InsightFace age estimate
     yaw = Column(Float, nullable=True)              # head pose yaw, degrees
     pitch = Column(Float, nullable=True)            # head pose pitch, degrees

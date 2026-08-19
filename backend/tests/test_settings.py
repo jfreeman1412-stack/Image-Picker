@@ -47,7 +47,7 @@ def test_post_hides_one_flag_others_stay_true(client):
     assert r.status_code == 200
     body = r.json()
     assert body["team_pick_not_smiling"] is False
-    assert body["pano_pick_smiling"] is True
+    assert body["pano_smiling_fallback"] is True
     # Persists across a fresh GET.
     body2 = client.get("/api/settings/flag-visibility").json()
     assert body2["team_pick_not_smiling"] is False

@@ -3,15 +3,22 @@
 This module is intentionally pure (no I/O, no DB). Hand it a list of image
 records for one cluster and it returns a role assignment.
 
-Rules (Phase 3 — order + pose, with smile as sanity check only):
+Rules (order + pose, then NON-SMILING preference for the pano):
   1. Sort cluster images by capture_time ascending.
   2. Single-face images (face_count == 1) are candidates for team and pano.
   3. team = the last single-face image. No expression condition.
-  4. pano = walk backward from team. First preceding single-face image with
-     is_acceptable_pose() == True wins. If none of the preceding singles pass
-     the pose check, pano stays None and review reason 'no_clean_pano_pose'
-     is added (no second-to-last fallback — better to surface "pick one
-     manually" than to silently guess).
+  4. pano is chosen among the preceding single-face images that pass
+     is_acceptable_pose(), taken in "walk back from team" order (closest-to-
+     team first = the position prior for the pano pose). Among those
+     already-acceptable candidates a NON-smiling frame is PREFERRED (landmark
+     smile_score below threshold; see services/smile.py); the position prior
+     breaks ties. Non-smiling is a preference among acceptable poses only — it
+     never lets a badly-posed neutral shot beat a well-posed one. If EVERY
+     acceptable candidate is smiling, the best-positioned one is still picked
+     and 'pano_smiling_fallback' is flagged — pano is never left empty over
+     expression. If NO preceding single passes the pose check, pano stays None
+     with 'no_clean_pano_pose' (better to surface "pick one manually" than to
+     silently guess a bad pose).
   5. Multi-face images are always 'buddy'.
   6. Everything else in the cluster is 'individual'.
   7. If the cluster has no single-face images at all → review reason
@@ -19,9 +26,11 @@ Rules (Phase 3 — order + pose, with smile as sanity check only):
   8. If the cluster has exactly one single-face image (= team only) → pano
      is None, review reason 'no_pano_candidate'.
 
-Sanity-check flags added after the picks (not affecting selection):
-  - team pick is not classified 'smiling' → 'team_pick_not_smiling'
-  - pano pick is classified 'smiling'    → 'pano_pick_smiling'
+Sanity-check flag added after the picks (does not affect selection):
+  - team pick is not classified 'smiling' (FER expression) →
+    'team_pick_not_smiling'. The pano's smile handling lives in rule 4 and
+    uses the landmark smile_score, not FER (FER under-scores kids' smiles —
+    see services/smile.py and expression.py Phase 4.4).
 
 Valid role values: 'team' | 'panoramic' | 'individual' | 'buddy' | 'rejected'.
 'rejected' is set only by manual override; the auto-sort never produces it.
@@ -34,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.services.pose_check import is_acceptable_pose
+from app.services.smile import is_smiling
 
 
 @dataclass
@@ -41,11 +51,12 @@ class ImageRecord:
     image_id: int
     capture_time: float                       # unix ts; sortable
     face_count: int                           # from face detection
-    expression: str = "unknown"               # smile classifier output; sanity-only now
+    expression: str = "unknown"               # FER label; team_pick_not_smiling only
     yaw: Optional[float] = None               # head pose degrees
     pitch: Optional[float] = None
     det_score: Optional[float] = None
     face_area_ratio: Optional[float] = None
+    smile_score: Optional[float] = None       # landmark smile [0,1]; drives pano preference
 
     def pose_metadata(self) -> dict:
         return {
@@ -120,7 +131,7 @@ def assign_roles(
     else:
         team_idx = None
 
-    # ── Pano pick: walk backward from team, first acceptable pose wins ────
+    # ── Pano pick: acceptable pose + prefer non-smiling, position as tiebreak ─
     pano_idx: Optional[int] = None
     if manual_pano_idx is not None:
         pano_idx = manual_pano_idx
@@ -129,16 +140,27 @@ def assign_roles(
             i for i in auto_singles
             if i < team_idx and i != manual_team_idx
         ]
-        # walk backward (i.e. from highest index downward)
-        for i in reversed(preceding_singles):
-            if is_acceptable_pose(ordered[i].pose_metadata()):
-                pano_idx = i
-                break
-        if pano_idx is None:
-            if preceding_singles:
-                review_reasons.append("no_clean_pano_pose")
+        # Pose-acceptable candidates in "walk back from team" order
+        # (closest-to-team first) — this ordering IS the position prior.
+        acceptable = [
+            i for i in reversed(preceding_singles)
+            if is_acceptable_pose(ordered[i].pose_metadata())
+        ]
+        if acceptable:
+            # Prefer a NON-smiling frame; the walk-back order breaks ties so a
+            # neutral frame closest to the team shot wins. If every acceptable
+            # candidate is smiling, still pick the best-positioned one and flag
+            # the fallback — pano is never left empty over expression.
+            non_smiling = [i for i in acceptable if not is_smiling(ordered[i].smile_score)]
+            if non_smiling:
+                pano_idx = non_smiling[0]
             else:
-                review_reasons.append("no_pano_candidate")
+                pano_idx = acceptable[0]
+                review_reasons.append("pano_smiling_fallback")
+        elif preceding_singles:
+            review_reasons.append("no_clean_pano_pose")
+        else:
+            review_reasons.append("no_pano_candidate")
 
     # ── Cluster-level review reasons for missing structure ────────────────
     has_any_single_face = any(img.face_count == 1 for img in ordered)
@@ -159,11 +181,12 @@ def assign_roles(
         else:
             roles[img.image_id] = "individual"
 
-    # ── Sanity-check flags from the smile classifier ──────────────────────
+    # ── Sanity-check flag: team photos should be smiling (FER expression) ──
+    # The pano's smile handling is in the selection above (landmark
+    # smile_score → prefer non-smiling, flag pano_smiling_fallback), so there
+    # is no separate FER-based pano flag anymore.
     if team_idx is not None and ordered[team_idx].expression != "smiling":
         review_reasons.append("team_pick_not_smiling")
-    if pano_idx is not None and ordered[pano_idx].expression == "smiling":
-        review_reasons.append("pano_pick_smiling")
 
     return SortResult(
         roles=roles,

@@ -1,20 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-
-const FLAG_LABELS = {
-  team_pick_not_smiling: 'Team pick not smiling',
-  pano_pick_smiling: 'Pano pick smiling',
-  no_clean_pano_pose: 'No clean pano pose',
-  no_pano_candidate: 'No pano candidate',
-  no_single_face_images: 'No single-face images',
-  ambiguous_copyright: 'Ambiguous copyright',
-  outlier_high: 'Outlier image count (high)',
-  outlier_low: 'Outlier image count (low)',
-  no_team_pick: 'No team pick',
-  no_pano_pick: 'No pano pick',
-  coach_no_solo_image: 'Coach has no solo image',
-  empty_cluster: 'Empty cluster',
-};
+import { FLAG_LABELS } from '../utils/reviewFlags.js';
 
 export default function Settings() {
   const [vis, setVis] = useState(null);

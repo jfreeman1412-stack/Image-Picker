@@ -16,7 +16,11 @@ router = APIRouter()
 # Keep in sync with everything cluster.review_reason can contain.
 KNOWN_FLAGS = [
     "team_pick_not_smiling",
-    "pano_pick_smiling",
+    # 2026-08: pano selection now PREFERS a non-smiling frame; this flag fires
+    # only when every acceptable candidate was smiling and it had to fall back
+    # to one. Replaces the old advisory "pano_pick_smiling" (which fired on any
+    # smiling pano, because selection used to ignore expression).
+    "pano_smiling_fallback",
     "no_clean_pano_pose",
     "no_pano_candidate",
     "no_single_face_images",

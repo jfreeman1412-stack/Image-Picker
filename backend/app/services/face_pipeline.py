@@ -98,6 +98,7 @@ def run_pipeline(db: DbSession, session_id: int) -> None:
                     yaw=det.get("yaw"),
                     pitch=det.get("pitch"),
                     face_area_ratio=det.get("face_area_ratio"),
+                    smile_score=det.get("smile_score"),
                 ))
             # Commit + progress every few images so the UI updates smoothly
             # without thrashing SQLite on every single image.
@@ -442,5 +443,6 @@ def _build_image_records_for_cluster(
             pitch=f.pitch,
             det_score=f.det_score,
             face_area_ratio=f.face_area_ratio,
+            smile_score=f.smile_score,
         ))
     return records

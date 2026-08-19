@@ -1,23 +1,31 @@
 """Unit tests for sort_rules. These ARE the spec — keep them passing.
 
-Phase 3 update: pano picking is order+pose based; smile is a sanity-check
-signal only. _rec defaults to GOOD pose data so existing tests don't all hit
-the no-pose-data fallback path; tests that want to exercise the pose filter
-pass bad poses explicitly via yaw/pitch/det_score/area.
+Pano picking is order + pose gated, THEN prefers a non-smiling frame among the
+acceptable candidates (2026-08). Pano "smiling" is the landmark smile_score
+(>= smile.SMILE_THRESHOLD), NOT the FER `expression` field — expression now
+only drives the team_pick_not_smiling sanity flag. _rec defaults to GOOD pose
+data and smile_score=None (un-scorable → treated as non-smiling) so existing
+order/pose tests are unaffected; smile tests set smile_score explicitly.
 """
+from app.services.smile import SMILE_THRESHOLD
 from app.services.sort_rules import (
     ImageRecord, assign_roles, assign_roles_coach,
 )
+
+_SMILING = SMILE_THRESHOLD + 0.2      # unambiguously smiling
+_NEUTRAL = SMILE_THRESHOLD - 0.2      # unambiguously non-smiling
 
 
 def _rec(
     image_id, t, face_count, expression="unknown",
     yaw=0.0, pitch=0.0, det_score=0.95, face_area_ratio=0.15,
+    smile_score=None,
 ):
     return ImageRecord(
         image_id=image_id, capture_time=t,
         face_count=face_count, expression=expression,
         yaw=yaw, pitch=pitch, det_score=det_score, face_area_ratio=face_area_ratio,
+        smile_score=smile_score,
     )
 
 
@@ -181,26 +189,89 @@ def test_team_pick_serious_flags_review():
     assert "team_pick_not_smiling" in r.review_reasons
 
 
-def test_pano_pick_smiling_flags_review():
-    """Pano is picked by order, but if it's smiling, surface the warning."""
+def test_pano_all_smiling_falls_back_and_flags():
+    """Every acceptable pano candidate smiling → still pick, flag the fallback."""
     images = [
-        _rec(1, 1.0, 1, "smiling"),  # pano fallback / walk-back, smiling
-        _rec(2, 2.0, 1, "smiling"),  # team
+        _rec(1, 1.0, 1, smile_score=_SMILING),  # only pano candidate, smiling
+        _rec(2, 2.0, 1, smile_score=_SMILING),  # team
     ]
     r = assign_roles(images)
-    assert r.panoramic_image_id == 1
-    assert "pano_pick_smiling" in r.review_reasons
+    assert r.panoramic_image_id == 1                      # never left empty
+    assert "pano_smiling_fallback" in r.review_reasons
 
 
-def test_both_sanity_flags_coexist():
-    """A single cluster can carry both team_pick_not_smiling and pano_pick_smiling."""
+def test_team_not_smiling_and_pano_fallback_coexist():
+    """team_pick_not_smiling (FER expression) and pano_smiling_fallback
+    (landmark smile_score) are independent signals that can co-occur."""
     images = [
-        _rec(1, 1.0, 1, "smiling"),  # pano → smiling triggers pano_pick_smiling
-        _rec(2, 2.0, 1, "serious"),  # team → not smiling triggers team_pick_not_smiling
+        _rec(1, 1.0, 1, smile_score=_SMILING),           # pano → all-smiling fallback
+        _rec(2, 2.0, 1, expression="serious"),           # team → not smiling (FER)
     ]
     r = assign_roles(images)
     assert "team_pick_not_smiling" in r.review_reasons
-    assert "pano_pick_smiling" in r.review_reasons
+    assert "pano_smiling_fallback" in r.review_reasons
+
+
+# ── Non-smiling pano preference (the 2026-08 feature) ──────────────────────────
+
+
+def test_pano_prefers_nonsmiling_over_closer_smiling():
+    """A neutral frame wins even when a smiling frame sits closer to the team.
+
+    Walk-back-closest would pick 3 (smiling, adjacent to team). The non-smiling
+    preference picks 2 instead — and does NOT flag a fallback, because a neutral
+    frame was available.
+    """
+    images = [
+        _rec(1, 1.0, 1, smile_score=_SMILING),   # smiling
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # neutral — should win
+        _rec(3, 3.0, 1, smile_score=_SMILING),   # smiling, closest to team
+        _rec(4, 4.0, 1, smile_score=_SMILING),   # team
+    ]
+    r = assign_roles(images)
+    assert r.panoramic_image_id == 2
+    assert "pano_smiling_fallback" not in r.review_reasons
+
+
+def test_pano_nonsmiling_closest_to_team_tiebreak():
+    """Among multiple non-smiling candidates, the one closest to team wins."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=_NEUTRAL),   # neutral, earlier
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # neutral, closest to team → wins
+        _rec(3, 3.0, 1, smile_score=_SMILING),   # team
+    ]
+    r = assign_roles(images)
+    assert r.panoramic_image_id == 2
+
+
+def test_pano_pose_gate_dominates_smile_preference():
+    """A non-smiling but badly-posed frame must NOT beat a well-posed smiling one.
+
+    Frame 2 is neutral but yaw=40° (fails the pose gate), so it's not a
+    candidate at all; the well-posed smiling frame 1 is picked and flagged as a
+    smiling fallback. Non-smiling is a preference among acceptable poses only.
+    """
+    images = [
+        _rec(1, 1.0, 1, smile_score=_SMILING),               # well-posed, smiling
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL, yaw=40.0),     # neutral but bad pose
+        _rec(3, 3.0, 1, smile_score=_SMILING),               # team
+    ]
+    r = assign_roles(images)
+    assert r.panoramic_image_id == 1
+    assert r.roles[2] == "individual"                        # bad-pose neutral not used
+    assert "pano_smiling_fallback" in r.review_reasons
+
+
+def test_pano_unknown_smile_treated_as_nonsmiling():
+    """smile_score=None (un-scorable) is treated as non-smiling → eligible pano,
+    no fallback flag (conservative degraded mode)."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=None),   # un-scorable
+        _rec(2, 2.0, 1, smile_score=_SMILING),  # team
+    ]
+    r = assign_roles(images)
+    assert r.panoramic_image_id == 1
+    assert "pano_smiling_fallback" not in r.review_reasons
 
 
 def test_unknown_expression_triggers_team_not_smiling_flag():
