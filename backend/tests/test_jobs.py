@@ -469,3 +469,178 @@ def test_stage_capture_excludes_archived(client):
     assert jid in {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
     client.post(f"/api/jobs/{jid}/archive")
     assert jid not in {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
+
+
+# ── 2026-09-10: ingest-walker guard + flat-folder auto-fallback ───────────
+
+
+def _touch_png(path):
+    """Write a valid 1-byte PNG at `path` — cheaper than PIL for shape tests."""
+    from PIL import Image as PILImage
+    PILImage.new("RGB", (4, 4), "white").save(path)
+
+
+def _touch_cr3(path):
+    """Write a 1-byte pseudo-RAW at `path`. Content doesn't matter — the walker
+    only cares about the extension, and .cr3 is in RAW_EXTS not SUPPORTED_EXTS."""
+    path.write_bytes(b"\x00")
+
+
+def test_iter_team_folders_flat_folder_with_files_yields_root(tmp_path):
+    """Flat folder = only images, no subdirs. Under has_lines=False the walker
+    yields root itself so ingest treats it as one team. This is the fix for
+    the job-115 silent-success case (imported 12 PNGs directly into a leaf
+    folder, ended up with a 'done' job that had 0 sessions)."""
+    from app.api.jobs import _iter_team_folders
+    root = tmp_path / "Flat"
+    root.mkdir()
+    _touch_png(root / "a.png")
+    _touch_png(root / "b.png")
+
+    yielded = list(_iter_team_folders(root, has_lines=False))
+    assert yielded == [root]
+
+
+def test_iter_team_folders_subdirs_and_loose_files_yields_only_subdirs(tmp_path):
+    """Locking today's behavior: a shoot folder with team subdirs + loose
+    RAW sidecars at root still yields ONLY the team subdirs. The
+    root-level files (RAWs in real jobs) are ignored, same as always."""
+    from app.api.jobs import _iter_team_folders
+    root = tmp_path / "Shoot"
+    (root / "TeamA").mkdir(parents=True)
+    (root / "TeamB").mkdir(parents=True)
+    _touch_png(root / "TeamA" / "a.png")
+    _touch_png(root / "TeamB" / "b.png")
+    # Loose sidecar files at root — must be ignored.
+    _touch_cr3(root / "sidecar.CR3")
+    _touch_png(root / "loose.png")
+
+    yielded = list(_iter_team_folders(root, has_lines=False))
+    assert sorted(p.name for p in yielded) == ["TeamA", "TeamB"]
+
+
+def test_iter_team_folders_empty_root_yields_nothing(tmp_path):
+    """No subdirs, no supported files. Walker yields nothing; the endpoint
+    guard picks it up and 400s."""
+    from app.api.jobs import _iter_team_folders
+    root = tmp_path / "Empty"
+    root.mkdir()
+
+    assert list(_iter_team_folders(root, has_lines=False)) == []
+
+
+def test_iter_team_folders_only_raw_files_no_fallback(tmp_path):
+    """Root with only RAW files (no SUPPORTED_EXTS) doesn't trigger the
+    fallback — RAW_EXTS aren't ingestable, so a folder with only .cr3 /
+    .nef is 'nothing to ingest' from the pipeline's perspective."""
+    from app.api.jobs import _iter_team_folders
+    root = tmp_path / "RawOnly"
+    root.mkdir()
+    _touch_cr3(root / "one.CR3")
+    _touch_cr3(root / "two.CR3")
+
+    assert list(_iter_team_folders(root, has_lines=False)) == []
+
+
+def test_iter_team_folders_has_lines_empty_yields_nothing_no_fallback(tmp_path):
+    """has_lines=True is untouched by the fallback — an empty leagues-shape
+    structure is a real structural error, and the guard should 400 it."""
+    from app.api.jobs import _iter_team_folders
+    root = tmp_path / "Leagues"
+    root.mkdir()
+    _touch_png(root / "stray.png")   # would trip has_lines=False fallback,
+                                     # but under has_lines=True we still yield nothing.
+
+    assert list(_iter_team_folders(root, has_lines=True)) == []
+
+
+def test_create_400_when_root_empty(client, tmp_path):
+    """Sync guard: POST /api/jobs against a completely empty folder is a
+    400, not a green 'done' with 0 sessions. Also verifies the response
+    message names the accepted shapes for the user."""
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+
+    r = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(empty),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "No team folders or importable images" in detail
+    assert ".jpg" in detail   # message enumerates supported extensions
+
+
+def test_create_200_flat_folder_creates_one_session_named_after_folder(
+    client, tmp_path, monkeypatch,
+):
+    """Flat single-team folder auto-fallback: 5 PNGs directly under root,
+    no subdirs. Ingest completes with 1 session named after the folder,
+    5 Image rows attached to that session. This is the exact shape that
+    used to silently succeed with 0 sessions (job 115, 2026-09-10)."""
+    monkeypatch.setattr(jobs_module, "run_pipeline", lambda *a, **k: None)
+    root = tmp_path / "Adjusted"
+    root.mkdir()
+    for i in range(5):
+        _touch_png(root / f"IMG_{i:03d}.png")
+
+    r = client.post("/api/jobs", json={
+        "name": "MU Seniors", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ingest_total"] == 1
+    jid = body["job_id"]
+
+    # TestClient ran the background ingest inline.
+    status = client.get(f"/api/jobs/{jid}/ingest-status").json()
+    assert status["status"] == "done"
+    assert status["progress"] == 1
+    assert status["total"] == 1
+
+    detail = client.get(f"/api/jobs/{jid}").json()
+    assert len(detail["sessions"]) == 1
+    sess = detail["sessions"][0]
+    assert sess["name"] == "Adjusted"
+    assert sess["image_count"] == 5
+
+
+def test_ingest_marks_error_when_all_teams_skipped_missing_subfolder(
+    client, tmp_path,
+):
+    """Async guard: the walker yielded team folders but every one was
+    skipped for a missing subfolder → 0 images added. Must not finish
+    as ingest_status='done'; must be 'error' with a structured message
+    that keeps skipped_teams alongside."""
+    root = tmp_path / "Shoot"
+    (root / "TeamA").mkdir(parents=True)
+    (root / "TeamB").mkdir(parents=True)
+    # Neither team has the expected "JPG" subfolder.
+
+    r = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root),
+        "has_lines": False, "image_subfolder_name": "JPG", "auto_run": False,
+    })
+    assert r.status_code == 200, r.text
+    jid = r.json()["job_id"]
+
+    status = client.get(f"/api/jobs/{jid}/ingest-status").json()
+    assert status["status"] == "error"
+    assert {t["name"] for t in status["skipped_teams"]} == {"TeamA", "TeamB"}
+    # The ingest_status endpoint surfaces the message so the UI can render it.
+    assert status.get("error"), "expected an error message on the status payload"
+
+
+def test_import_images_400_when_root_empty(client, tmp_path):
+    """The sync guard fires on /import-images too, not just /jobs POST.
+    Same message shape; same silent-success prevention."""
+    jid = client.post("/api/jobs/shoot", json={"name": "S"}).json()["job_id"]
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+    r = client.post(f"/api/jobs/{jid}/import-images", json={
+        "root_path": str(empty), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    })
+    assert r.status_code == 400
+    assert "No team folders or importable images" in r.json()["detail"]

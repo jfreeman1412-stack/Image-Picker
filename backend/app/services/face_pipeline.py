@@ -17,6 +17,7 @@ is fine; agent can move to RQ/Celery later if needed.
 import json
 import logging
 import statistics
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,23 @@ from app.services.labeling import derive_cluster_label
 from app.services.cluster_matching import match_session_clusters
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-10 pipeline serialization lock (Fix 1 of the concurrency wedge
+# response, see memory pipeline-concurrency-wedge). Every code path through
+# run_pipeline must acquire this lock, so at most one pipeline executes at
+# a time. The shared FER (TensorFlow) and InsightFace (ONNX) model
+# instances are NOT thread-safe for concurrent inference — under parallel
+# triggers they deadlock inside native model code, silently, with no
+# exception raised. Serializing at the pipeline boundary is the coarsest
+# and safest fix: impossible to bypass a code path, no per-stage lock
+# ordering to get wrong, no shared-model-instance surprise. Perf note: on
+# the production single-GPU box this is not a real slowdown — one pipeline
+# is already the effective throughput ceiling for GPU-bound stages.
+#
+# Ordering guarantee: this is the ONLY module-level lock in the pipeline.
+# No nested acquisition, no risk of AB/BA deadlock with itself.
+_PIPELINE_LOCK = threading.Lock()
 
 
 def _set_progress(db: DbSession, session: Session, stage: str, current: int, total: int) -> None:
@@ -60,7 +78,25 @@ def _log_stage(session_name: str, stage: str, start: float) -> float:
 
 
 def run_pipeline(db: DbSession, session_id: int) -> None:
-    """Run the full pipeline for one session. Idempotent: clears prior results."""
+    """Run the full pipeline for one session. Idempotent: clears prior results.
+
+    Serialized: every call goes through `_PIPELINE_LOCK`, so concurrent
+    triggers (multiple run-alls, /run overlapping with an ingest auto_run
+    chain, etc.) queue rather than executing in parallel. Two concurrent
+    calls previously deadlocked the shared FER/InsightFace model instances
+    and left sessions stuck at status='running' with no exception raised —
+    see memory pipeline-concurrency-wedge for the full failure mode.
+    """
+    with _PIPELINE_LOCK:
+        _run_pipeline_locked(db, session_id)
+
+
+def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
+    """Inner pipeline body — MUST be called from run_pipeline (holds the lock)
+    or from a test that acquires the lock itself. Kept as a separate
+    function so the `with` block above stays a one-liner and the body's
+    existing indentation is unchanged (the whole point is a diff that's
+    easy to review + hard to accidentally regress out of the lock)."""
     session = db.query(Session).get(session_id)
     if session is None:
         raise ValueError(f"Session {session_id} not found")

@@ -28,10 +28,13 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import DATA_DIR, SessionLocal, get_db
-from app.models.db_models import Cluster, ImageRole, Image, Job, PlayerMembership, Session
+from app.models.db_models import (
+    Cluster, Face, ImageRole, Image, Job, PlayerMembership, Session,
+)
 from app.api.sessions import pipeline_progress_fields
 from app.services.eta import eta_seconds
 from app.services.face_pipeline import run_pipeline
@@ -129,7 +132,19 @@ class ImportImagesRequest(BaseModel):
 
 
 def _iter_team_folders(root: Path, has_lines: bool):
-    """Yield team folders given the wizard's structural choice."""
+    """Yield team folders given the wizard's structural choice.
+
+    Flat-folder auto-fallback (2026-09-10, has_lines=False only): when root
+    has no subdirs but does contain importable images at the top level,
+    yield root itself so the ingest treats it as a single team. Session
+    name comes from root.name. Fixes the silent-success case that used to
+    complete as ingest_status='done' with 0 sessions when the operator
+    pointed the wizard at a leaf folder like `.../MU Football Seniors/
+    Adjusted/` where the images sat directly rather than inside per-team
+    subfolders. Root-level files are STILL ignored when subdirs exist —
+    that path is unchanged (matches the legitimate "team subdir + RAW
+    sidecars at root" shape).
+    """
     if has_lines:
         for line_dir in sorted(root.iterdir()):
             if not line_dir.is_dir():
@@ -138,9 +153,19 @@ def _iter_team_folders(root: Path, has_lines: bool):
                 if team_dir.is_dir():
                     yield team_dir
     else:
-        for team_dir in sorted(root.iterdir()):
-            if team_dir.is_dir():
+        team_dirs = [d for d in sorted(root.iterdir()) if d.is_dir()]
+        if team_dirs:
+            for team_dir in team_dirs:
                 yield team_dir
+            return
+        # No subdirs — fall back to root-as-single-team iff at least one
+        # supported image file exists at the top level. A completely empty
+        # root yields nothing so the endpoint guard raises 400.
+        if any(
+            p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+            for p in root.iterdir()
+        ):
+            yield root
 
 
 def _find_or_create_session_for_team(
@@ -212,6 +237,12 @@ def _ingest_job(
         # which folders merged into which existing teams.
         merged: list[dict] = []
         done = 0
+        # 2026-09-10 async-guard: track total images actually added across
+        # every team. If this stays 0 after the loop (walker yielded teams
+        # but each one was skipped or contained no supported files), we
+        # promote to ingest_status='error' instead of a silent 'done'.
+        total_ingested = 0
+        session_ids: list[int] = []
         try:
             team_dirs = list(_iter_team_folders(root, has_lines))
             for team_dir in team_dirs:
@@ -248,6 +279,7 @@ def _ingest_job(
                     )
 
                 count = ingest_folder(db, session.id, image_source)
+                total_ingested += count
                 done += 1
                 # Progress counts FOLDERS visited (not unique sessions). The
                 # session-count divergence after merge is cosmetic; the progress
@@ -261,7 +293,6 @@ def _ingest_job(
                     " (merged)" if was_merged else "",
                 )
 
-            job.ingest_status = "done"
             job.ingest_current_team = None
             # ingest_error doubles as a structured-notes channel for non-fatal
             # events: pre-Phase-1 it held skipped_teams from missing subfolders;
@@ -272,9 +303,32 @@ def _ingest_job(
                 notes["skipped_teams"] = skipped
             if merged:
                 notes["merged_folders"] = merged
-            job.ingest_error = json.dumps(notes) if notes else None
-            session_ids = [s.id for s in job.sessions if not s.archived]
-            db.commit()
+            # Async guard (2026-09-10): even after the sync guard at the
+            # endpoint, we can still land here with 0 images actually added
+            # — e.g. every team folder was skipped for a missing subfolder,
+            # or every team folder was empty of supported files. Don't let
+            # the operator see a green 'done' with nothing to work on.
+            if total_ingested == 0:
+                job.ingest_status = "error"
+                notes["message"] = (
+                    f"Import completed but 0 images were added across "
+                    f"{len(team_dirs)} team folder(s). Check skipped_teams "
+                    f"for reasons, or verify the folder(s) contain "
+                    f".jpg/.jpeg/.png/.tif/.tiff files."
+                )
+                job.ingest_error = json.dumps(notes)
+                logger.warning(
+                    "[ingest] Job %s finished with 0 images across %d team "
+                    "folder(s); marked error. skipped=%d, root=%s",
+                    job_id, len(team_dirs), len(skipped), root,
+                )
+                # Leave session_ids empty so auto_run below is a no-op.
+                db.commit()
+            else:
+                job.ingest_status = "done"
+                job.ingest_error = json.dumps(notes) if notes else None
+                session_ids = [s.id for s in job.sessions if not s.archived]
+                db.commit()
         except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
             logger.exception("[ingest] Job %s failed", job_id)
             job.ingest_status = "error"
@@ -297,6 +351,28 @@ def _ingest_job(
                     )
 
 
+def _reject_empty_root(root: Path, has_lines: bool, subfolder: Optional[str]) -> None:
+    """Guard for the 0-team / 0-image case (2026-09-10). The walker's
+    flat-folder auto-fallback handles single-team leaf folders correctly, so
+    a team_total of 0 after the walker means the path is genuinely empty (or
+    structurally wrong for has_lines=True). Log at WARNING level BEFORE
+    raising so the failure is visible in the backend console — the whole
+    silent-success incident (job 115, 2026-09-10) was invisible precisely
+    because this code path logged nothing. See memory
+    silent-success-equals-silent-failure.
+    """
+    logger.warning(
+        "[ingest] Rejected empty root: %s (has_lines=%s, subfolder=%r)",
+        root, has_lines, subfolder,
+    )
+    raise HTTPException(
+        400,
+        f"No team folders or importable images at {root}. Check the folder "
+        f"structure — expected either team subfolders or a flat folder "
+        f"containing .jpg/.jpeg/.png/.tif/.tiff files.",
+    )
+
+
 @router.post("")
 def create_job(
     payload: CreateJobRequest, background: BackgroundTasks,
@@ -314,6 +390,8 @@ def create_job(
 
     # Count teams up front so the progress bar has a denominator immediately.
     team_total = sum(1 for _ in _iter_team_folders(root, payload.has_lines))
+    if team_total == 0:
+        _reject_empty_root(root, payload.has_lines, payload.image_subfolder_name)
 
     job = Job(
         name=payload.name,
@@ -377,6 +455,8 @@ def import_images(
         raise HTTPException(400, f"Folder not found: {payload.root_path}")
 
     team_total = sum(1 for _ in _iter_team_folders(root, payload.has_lines))
+    if team_total == 0:
+        _reject_empty_root(root, payload.has_lines, payload.image_subfolder_name)
     job.root_path = str(root.resolve())
     job.has_lines = 1 if payload.has_lines else 0
     job.image_subfolder_name = payload.image_subfolder_name
@@ -405,9 +485,16 @@ def ingest_status(job_id: int, db: DbSession = Depends(get_db)):
     if job.ingest_error:
         try:
             parsed = json.loads(job.ingest_error)
-            if isinstance(parsed, dict) and "skipped_teams" in parsed:
-                skipped_teams = parsed["skipped_teams"]
-                error_msg = None
+            if isinstance(parsed, dict):
+                skipped_teams = parsed.get("skipped_teams", []) or []
+                # 2026-09-10 async-guard: when the ingest sets status='error'
+                # for the 0-images-added case it packs both skipped_teams
+                # AND a human-readable message into the same JSON blob.
+                # Surface the message as the top-level error so the wizard
+                # renders it; fall back to null when there's no message
+                # (the legacy skipped_teams-only case, which is a warning
+                # attached to a successful ingest and shouldn't set error).
+                error_msg = parsed.get("message")
         except (ValueError, TypeError):
             pass
 
@@ -811,6 +898,18 @@ class ExportJobRequest(BaseModel):
     # session folder. Images with no ImageRole (truly orphan — no cluster
     # claim) keep their camera filename. See PHASE_C3 design + memory.
     rename_by_player: bool = False
+    # 2026-09-08: pull buddy shots out of To_be_Cropped/ into a sibling
+    # Buddies/ tree so the cropping team can process individuals and
+    # buddies in two clean passes instead of manually separating them.
+    # Rule: an image is diverted iff its best role is 'individual' or
+    # 'buddy' AND it has >=2 detected faces. Team/pano roles keep today's
+    # layout untouched (verified 2026-09-08: 98%+ team-role images are
+    # single-face; role-gating removes the rare-multi-face edge). Toggle
+    # OFF = byte-identical to pre-build export (Buddies/ isn't even
+    # created). Rejected-wins reuses the existing _best_role_map path,
+    # so a rejected buddy never leaks into the Buddies tree. Applies to
+    # both legacy and rename-by-player modes.
+    split_buddies: bool = False
 
 
 _ROLE_PRIORITY = {
@@ -847,6 +946,48 @@ def _best_role_map(db: DbSession, image_ids: list[int]) -> dict[int, str]:
         image_id: min(roles, key=lambda r: _ROLE_PRIORITY.get(r, 99))
         for image_id, roles in by_image.items()
     }
+
+
+def _face_count_map(db: DbSession, image_ids: list[int]) -> dict[int, int]:
+    """{image_id: detected face count} for the buddy-split decision.
+
+    Buddy = image with >=2 detected Face rows, per the 2026-09-08 spec. The
+    signal is detection-based (Face.image_id), not assignment-based (ImageRole)
+    — a photobomber shows up in the buddy tree the same as a shot-as-buddy
+    pair, and that's intentional (rare + visible either way).
+
+    One GROUP BY replaces the N+1 that a per-image count would cost during
+    export. Images with no Face rows are absent from the return dict; callers
+    should treat "missing" as 0. Both buddy-only coach clusters (Face-only,
+    no ImageRole for the buddy shot) and copy-clusters (ImageRole-only, no
+    Face rows on the target side) are correctly represented here — face_count
+    reflects the detection on the underlying image regardless of which
+    cluster-membership relation ended up populated. See memory
+    face-vs-imagerole-membership.
+    """
+    if not image_ids:
+        return {}
+    rows = (
+        db.query(Face.image_id, func.count(Face.id))
+        .filter(Face.image_id.in_(image_ids))
+        .group_by(Face.image_id)
+        .all()
+    )
+    return {image_id: count for image_id, count in rows}
+
+
+def _goes_to_buddies(role: str | None, face_count: int, split_buddies: bool) -> bool:
+    """The buddy-split decision, in one place so both export modes stay in
+    lockstep and the dry-run simulator answers the same question the writer
+    does. Role-gated to individual/buddy — team/pano skip the buddy tree
+    even on the rare multi-face frame (verified 2026-09-08: <=2% of team-role
+    images have face_count >=2; role is the semantically correct signal for
+    'what pass does the cropping team run on this photo')."""
+    if not split_buddies:
+        return False
+    if role not in ("individual", "buddy"):
+        return False
+    return face_count >= 2
 
 
 def _exportable_sessions(job: Job):
@@ -1061,10 +1202,14 @@ def _derive_export_basename(
 
 def _build_rename_plan_for_session(
     db: DbSession, session: Session, role_map: dict[int, str],
-) -> list[tuple[Path, str, str | None]]:
-    """Produce (src_path, basename, secondary_subdir) entries for ONE session
-    under rename mode. secondary_subdir is 'Team Images' or 'Pano Images'
-    when role is team/panoramic, else None.
+) -> list[tuple[Path, str, str | None, int]]:
+    """Produce (src_path, basename, secondary_subdir, image_id) entries for ONE
+    session under rename mode. secondary_subdir is 'Team Images' or 'Pano
+    Images' when role is team/panoramic, else None. image_id is the source
+    Image row's id — needed by the buddy-split decision at export time to
+    look up the per-image detected face count (buddy shots appear multiple
+    times, once per claiming cluster, all with the same image_id, so the
+    per-image face_count answer is stable across those plan entries).
 
     Per-cluster iteration: each cluster in this session contributes its
     ImageRole rows (excluding rejected). Buddy images naturally produce
@@ -1076,7 +1221,7 @@ def _build_rename_plan_for_session(
     image_by_id = {img.id: img for img in session.images}
     seen_in_rename: set[int] = set()    # image ids that got at least one
                                         # ImageRole-driven rename plan entry
-    out: list[tuple[Path, str, str | None]] = []
+    out: list[tuple[Path, str, str | None, int]] = []
 
     for cluster in session.clusters:
         # Collect this cluster's ImageRole rows (one query per cluster keeps
@@ -1139,12 +1284,12 @@ def _build_rename_plan_for_session(
         if team_image_id is not None:
             img = image_by_id.get(team_image_id) or db.query(Image).get(team_image_id)
             basename = _derive_export_basename(cluster, "team", 0, img.filename)
-            out.append((Path(img.path), basename, "Team Images"))
+            out.append((Path(img.path), basename, "Team Images", team_image_id))
             seen_in_rename.add(team_image_id)
         if pano_image_id is not None:
             img = image_by_id.get(pano_image_id) or db.query(Image).get(pano_image_id)
             basename = _derive_export_basename(cluster, "panoramic", 0, img.filename)
-            out.append((Path(img.path), basename, "Pano Images"))
+            out.append((Path(img.path), basename, "Pano Images", pano_image_id))
             seen_in_rename.add(pano_image_id)
 
         # Individuals + buddy share a sequence; sort by capture_time.
@@ -1157,7 +1302,7 @@ def _build_rename_plan_for_session(
         for seq, (_, image_id, role) in enumerate(seq_only, start=1):
             img = image_by_id.get(image_id) or db.query(Image).get(image_id)
             basename = _derive_export_basename(cluster, role, seq, img.filename)
-            out.append((Path(img.path), basename, None))
+            out.append((Path(img.path), basename, None, image_id))
             seen_in_rename.add(image_id)
 
     # Orphan images: in session.images but never picked up by any cluster's
@@ -1167,7 +1312,7 @@ def _build_rename_plan_for_session(
             continue
         if role_map.get(img.id) == "rejected":
             continue
-        out.append((Path(img.path), img.filename, None))
+        out.append((Path(img.path), img.filename, None, img.id))
 
     return out
 
@@ -1176,6 +1321,7 @@ def _run_export(
     job_id: int, mode: str, overwrite: bool,
     destination_path: str | None = None,
     rename_by_player: bool = False,
+    split_buddies: bool = False,
 ) -> None:
     """Background task: the actual copy/move, updating Job.export_* as it
     goes so the modal can show a live bar + ETA."""
@@ -1197,13 +1343,27 @@ def _run_export(
             pano_root = out_root / "Pano Images"
             for d in (website_root, team_root, pano_root):
                 d.mkdir(parents=True, exist_ok=True)
+            # Buddies/ is a sibling tree that only exists when split_buddies
+            # is ON. Keeping the mkdir gated is the load-bearing "off =
+            # byte-identical" guarantee — with the toggle off, the export
+            # output is indistinguishable from the pre-build code path.
+            buddies_root = out_root / "Buddies" if split_buddies else None
+            if buddies_root is not None:
+                buddies_root.mkdir(parents=True, exist_ok=True)
 
             to_export, sessions_skipped = _exportable_sessions(job)
 
             # One bulk SQL fetch for every image's best role — replaces the
             # per-image _best_role calls that turned into N+1 queries.
-            role_map = _best_role_map(
-                db, [img.id for s in to_export for img in s.images],
+            all_image_ids = [img.id for s in to_export for img in s.images]
+            role_map = _best_role_map(db, all_image_ids)
+            # 2026-09-08: buddy-split face_count is a single GROUP BY on Face
+            # rows, hoisted here so we pay it once per export rather than
+            # once per session. When the toggle is off we skip the query
+            # entirely — the empty dict makes _goes_to_buddies return False
+            # for every entry, so off-mode has literally zero extra cost.
+            face_count_map = (
+                _face_count_map(db, all_image_ids) if split_buddies else {}
             )
             files_copied = 0
             files_skipped_rejected = 0
@@ -1220,6 +1380,17 @@ def _run_export(
                 pano_team = pano_root / safe_team
                 for d in (website_team, team_team, pano_team):
                     d.mkdir(parents=True, exist_ok=True)
+                # Per-team buddy subdir mirrors To_be_Cropped/<team>/ so
+                # each team's buddy shots land in a matching folder. Empty
+                # when a team has no >=2-face individual/buddy images — same
+                # pattern as an empty Team Images/<team>/ when a cluster
+                # never picked a group shot. buddies_team stays None (and
+                # unused below) when the toggle is off.
+                buddies_team = (
+                    buddies_root / safe_team if buddies_root is not None else None
+                )
+                if buddies_team is not None:
+                    buddies_team.mkdir(parents=True, exist_ok=True)
 
                 # Build copy plans on the main thread so destination paths are
                 # reserved sequentially (no race between workers on _unique_path).
@@ -1236,6 +1407,11 @@ def _run_export(
                 # fall back to camera filename.
                 srcs: list[Path] = []
                 roles: list[str] = []
+                # Parallel to srcs; the buddy-split decision looks up
+                # face_count via image_id. Both modes populate this — legacy
+                # from session.images loop, rename from the plan tuple's
+                # 4th element added 2026-09-08.
+                src_image_ids: list[int] = []
                 # For rename mode we override the per-source basename used by
                 # _allocate_dests. legacy mode leaves this empty and
                 # _allocate_dests uses src.name as today.
@@ -1247,20 +1423,22 @@ def _run_export(
 
                 if rename_by_player:
                     plan = _build_rename_plan_for_session(db, session, role_map)
-                    for src, basename, secondary_subdir in plan:
+                    for src, basename, secondary_subdir, image_id in plan:
                         if not src.exists():
                             logger.warning("Source missing for export: %s", src)
                             continue
                         srcs.append(src)
                         # The role tag here is only used for progress / failure
-                        # bookkeeping; the actual destination subdir is encoded
-                        # in rename_secondary so legacy code paths that branch
-                        # on `role == "team"` stay unconfused.
+                        # bookkeeping AND (2026-09-08) the buddy-split decision;
+                        # the actual destination subdir for secondaries is
+                        # encoded in rename_secondary so legacy code paths that
+                        # branch on `role == "team"` stay unconfused.
                         roles.append(
                             "team" if secondary_subdir == "Team Images"
                             else "panoramic" if secondary_subdir == "Pano Images"
                             else "individual"
                         )
+                        src_image_ids.append(image_id)
                         rename_basenames.append(basename)
                         if secondary_subdir:
                             rename_secondary[str(src)] = secondary_subdir
@@ -1283,11 +1461,61 @@ def _run_export(
                             continue
                         srcs.append(src)
                         roles.append(role)
+                        src_image_ids.append(image.id)
                         rename_basenames.append(None)
 
-                website_dsts = _allocate_dests(
-                    srcs, website_team, basenames=rename_basenames,
-                )
+                # Buddy-split partition (2026-09-08). Toggle OFF → every entry
+                # goes to website_team, byte-identical to pre-build code path
+                # (Buddies/ is never mkdir'd either — see the per-team setup
+                # above). Toggle ON → images whose best role is individual or
+                # buddy AND face_count >=2 route to buddies_team instead. The
+                # per-image face count is one bulk GROUP BY on Face rows.
+                # team/pano role images stay in website_team even on the rare
+                # multi-face frame — role is the semantically correct split
+                # criterion for "which cropping pass does this belong to."
+                # rejected-wins holds because rejected images never entered
+                # srcs (filtered via role_map above).
+                if split_buddies and srcs:
+                    to_buddies_flags = [
+                        _goes_to_buddies(role, face_count_map.get(iid, 0), True)
+                        for role, iid in zip(roles, src_image_ids)
+                    ]
+                else:
+                    to_buddies_flags = [False] * len(srcs)
+
+                if any(to_buddies_flags):
+                    buddies_srcs = [
+                        s for s, b in zip(srcs, to_buddies_flags) if b
+                    ]
+                    normal_srcs = [
+                        s for s, b in zip(srcs, to_buddies_flags) if not b
+                    ]
+                    buddies_basenames = [
+                        bn for bn, b in zip(rename_basenames, to_buddies_flags) if b
+                    ]
+                    normal_basenames = [
+                        bn for bn, b in zip(rename_basenames, to_buddies_flags) if not b
+                    ]
+                    buddies_dsts = _allocate_dests(
+                        buddies_srcs, buddies_team, basenames=buddies_basenames,
+                    )
+                    normal_dsts = _allocate_dests(
+                        normal_srcs, website_team, basenames=normal_basenames,
+                    )
+                    # Weave back into original srcs order so the threadpool
+                    # loop below still zips (src, role, website_dst) safely
+                    # and per-image progress accounting is unchanged.
+                    website_dsts = []
+                    b_iter = iter(buddies_dsts)
+                    n_iter = iter(normal_dsts)
+                    for is_buddy in to_buddies_flags:
+                        website_dsts.append(
+                            next(b_iter) if is_buddy else next(n_iter)
+                        )
+                else:
+                    website_dsts = _allocate_dests(
+                        srcs, website_team, basenames=rename_basenames,
+                    )
                 # Build secondary plans. Rename mode resolves via
                 # rename_secondary (per-source subdir choice); legacy mode
                 # picks via role tag like today.
@@ -1457,6 +1685,7 @@ def export_job(
     background.add_task(
         _run_export, job.id, payload.mode, payload.overwrite,
         payload.destination_path, payload.rename_by_player,
+        payload.split_buddies,
     )
     return {"job_id": job.id, "export_total": total}
 

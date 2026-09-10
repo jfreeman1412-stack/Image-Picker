@@ -16,6 +16,12 @@ export default function ExportModal({ job, onClose }) {
   // before becoming the default. When ON, filenames derive from each
   // cluster's display_label() + role suffix or sequence number.
   const [renameByPlayer, setRenameByPlayer] = useState(false);
+  // 2026-09-08: per-export buddy-split toggle. Default OFF — off-mode is
+  // byte-identical to today's export. When ON, images with 2+ detected
+  // faces whose best role is individual/buddy get pulled out of
+  // To_be_Cropped/ into a sibling Buddies/ tree that mirrors the same
+  // team subfolder structure. Team/pano roles stay put.
+  const [splitBuddies, setSplitBuddies] = useState(false);
   const [phase, setPhase] = useState('form'); // form | running | done | error
   const [status, setStatus] = useState(null); // /export-status payload
   const [error, setError] = useState(null);
@@ -49,6 +55,7 @@ export default function ExportModal({ job, onClose }) {
     // Sending legacyDefault verbatim is harmless but unnecessary.
     const body = { mode, overwrite };
     if (renameByPlayer) body.rename_by_player = true;
+    if (splitBuddies) body.split_buddies = true;
     const trimmed = (destination || '').trim();
     if (trimmed && trimmed !== legacyDefault) body.destination_path = trimmed;
     const res = await fetch(`/api/jobs/${job.id}/export`, {
@@ -121,6 +128,16 @@ export default function ExportModal({ job, onClose }) {
                        onChange={e => setRenameByPlayer(e.target.checked)} />
                 Rename files by player (clustered photos use the player's name; buddy
                 photos get a copy per kid; orphan/calibration images keep camera names)
+              </label>
+            </div>
+            <div className="form-row">
+              <label>
+                <input type="checkbox" checked={splitBuddies}
+                       onChange={e => setSplitBuddies(e.target.checked)} />
+                Split buddy photos into a separate <code>Buddies/</code> tree
+                (images with 2+ detected faces get pulled out of{' '}
+                <code>To_be_Cropped/</code> so individuals and buddies can be
+                cropped in two clean passes; team/pano photos are unaffected)
               </label>
             </div>
             {error && <p className="error">{error}</p>}
