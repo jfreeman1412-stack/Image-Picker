@@ -26,6 +26,7 @@ from app.api import (
     matching, players, references, roster, settings,
 )
 from app.db import init_db
+from app.services.pipeline_watchdog import start_watchdog
 
 
 @asynccontextmanager
@@ -34,6 +35,11 @@ async def lifespan(app: FastAPI):
     # TODO: warm up InsightFace model here so the first request isn't slow.
     # from app.services.face_detector import get_detector
     # get_detector()
+    # 2026-09-10 (Fix 3 of pipeline-concurrency-wedge): reap zombie
+    # status='running' sessions left behind by prior process death (or
+    # any wedge Fix 1's serialization lock somehow doesn't prevent).
+    # Runs one startup pass after a grace period, then every 60s.
+    start_watchdog()
     yield
 
 

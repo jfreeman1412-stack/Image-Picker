@@ -2,7 +2,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, DateTime, Float, ForeignKey, Index, LargeBinary,
-    PrimaryKeyConstraint, UniqueConstraint,
+    PrimaryKeyConstraint, UniqueConstraint, event,
 )
 from sqlalchemy.orm import relationship
 
@@ -67,10 +67,38 @@ class Session(Base):
     # normalize_name(name) for roster mismatch comparison. Survives roster
     # re-uploads — the user keeps their mappings.
     roster_team_alias = Column(String, nullable=True)
+    # 2026-09-10 (Fix 3 of pipeline-concurrency-wedge): timestamp of the
+    # last `status` change. Stamped automatically by the SQLAlchemy
+    # attribute event registered below, so every code path that assigns
+    # session.status transparently keeps this in sync — no risk of
+    # missing a call site. The watchdog uses this as the single truthful
+    # signal for "how long has this session been at its current status."
+    # A stage-based fallback (progress_stage_started_at) alone wasn't
+    # sufficient because run-all marks sessions status='running' upfront
+    # before the pipeline even reaches them, so there'd be no stage
+    # timestamp yet to reap by.
+    status_updated_at = Column(DateTime, nullable=True)
 
     job = relationship("Job", back_populates="sessions")
     images = relationship("Image", back_populates="session", cascade="all, delete-orphan")
     clusters = relationship("Cluster", back_populates="session", cascade="all, delete-orphan")
+
+
+@event.listens_for(Session.status, "set", propagate=True)
+def _stamp_status_updated_at(target, value, old_value, _initiator):
+    """Auto-stamp Session.status_updated_at whenever .status is assigned.
+
+    Fires on both INSERT (initial status='pending') and UPDATE (status
+    transitions). We stamp unconditionally even when value == old_value —
+    a re-assign of the same status is still a signal of "something
+    touched this session just now" (used by the watchdog to distinguish
+    a session that's been re-marked 'running' by a new run-all from one
+    that's been sitting 'running' for hours).
+
+    NoLoad-style old_value comparison would be an optimization for later
+    if we care; today the cost is one datetime.utcnow() call per set.
+    """
+    target.status_updated_at = datetime.utcnow()
 
 
 class Image(Base):

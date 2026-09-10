@@ -82,6 +82,15 @@ _PHASE2_COLUMNS = {
         ("progress_stage_started_at", "DATETIME"),
         # Phase 6.1: per-session CSV-team override (folder->roster mapping).
         ("roster_team_alias", "VARCHAR"),
+        # 2026-09-10 (Fix 3 of pipeline-concurrency-wedge): auto-stamped
+        # timestamp of the last status change, used by the watchdog to
+        # reap stale status='running' rows. NULL on pre-existing rows
+        # after migration; the watchdog treats NULL as "very old" and
+        # reaps it, which is the correct behavior since any pre-migration
+        # row still marked 'running' is a zombie by definition.
+        # SCHEMA CHANGE: requires a full backend restart to run the
+        # ALTER TABLE via _migrate_phase2 — --reload does NOT trigger it.
+        ("status_updated_at", "DATETIME"),
     ],
     # Phase B.6 (2026-06-08): provenance for how a reference was accepted.
     # NULL → captured normally (pre-B.6 or the unchanged B.2 PUT path).
