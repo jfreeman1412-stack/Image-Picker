@@ -17,10 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db, SessionLocal
-from app.models.db_models import Cluster, Face, ImageRole, RosterEntry, Session
+from app.models.db_models import (
+    Cluster, Face, Image, ImageRole, RosterEntry, Session,
+)
 from app.services.eta import eta_seconds
 from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
@@ -184,16 +187,34 @@ def run(session_id: int, background: BackgroundTasks, db: DbSession = Depends(ge
 
 @router.get("")
 def list_sessions(db: DbSession = Depends(get_db), legacy_only: bool = False):
-    """List sessions. `legacy_only=True` returns only jobless (Phase 1–3) sessions."""
+    """List sessions. `legacy_only=True` returns only jobless (Phase 1–3) sessions.
+
+    Image counts come from one bulk GROUP BY on the images table rather than
+    the ORM's lazy-loaded `s.images` (which would fire a separate SELECT
+    per session — an N+1 that pushed this endpoint to 20+ seconds and
+    timing out once the DB reached ~900 sessions, 2026-09-10). One query
+    for all image counts, dict lookup per session, no round-trips.
+    """
     q = db.query(Session).order_by(Session.created_at.desc())
     if legacy_only:
         q = q.filter(Session.job_id.is_(None))
     sessions = q.all()
+
+    # Bulk image_count. Not filtered by session_ids because SQLite has a
+    # ~999-parameter cap in `.in_()` and the sessions table can outgrow
+    # that; scanning all images once is still O(n) and much faster than
+    # per-session lazy loads.
+    image_counts = dict(
+        db.query(Image.session_id, func.count(Image.id))
+        .group_by(Image.session_id)
+        .all()
+    )
+
     return [
         {
             "id": s.id, "name": s.name, "status": s.status,
             "created_at": s.created_at.isoformat() if s.created_at else None,
-            "image_count": len(s.images),
+            "image_count": image_counts.get(s.id, 0),
             "job_id": s.job_id,
         }
         for s in sessions
