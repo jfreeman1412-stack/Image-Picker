@@ -348,11 +348,32 @@ def set_role(session_id: int, payload: SetRoleRequest, db: DbSession = Depends(g
     if payload.role not in VALID_ROLES:
         raise HTTPException(400, f"Invalid role: {payload.role}")
 
-    cluster = db.query(Cluster).filter_by(
-        id=payload.cluster_id, session_id=session_id,
-    ).first()
+    # 2026-09-14 F1: resolve cluster by id alone, then explicitly disambiguate
+    # "genuinely missing" (404) from "cluster was moved out of this session
+    # since the frontend last rendered" (409). Pre-fix this returned a bare
+    # 404 for BOTH cases; after a move-with-guards mutates cluster.session_id,
+    # any set-role fired from a stale source-page render would 404 with no
+    # actionable message and the frontend's set-role-defensive alert would
+    # say "That change didn't save (HTTP 404)" — which is technically true
+    # but doesn't tell the operator the cluster is fine, just elsewhere.
+    # The 409 gives the frontend a specific reason to auto-refresh and
+    # surface a "cluster moved — refreshed" message instead. See F2 for
+    # the frontend optimistic-clear that closes the race window in the
+    # common single-user case; this backend guard catches the residual
+    # multi-tab / another-user-moved-it / RosterModal cases.
+    cluster = db.query(Cluster).get(payload.cluster_id)
     if cluster is None:
         raise HTTPException(404, "Cluster not found")
+    if cluster.session_id != session_id:
+        raise HTTPException(409, detail={
+            "error": "cluster_moved",
+            "message": (
+                "This cluster is no longer in this session — it was moved "
+                "to another team. Refresh to see the current cluster list."
+            ),
+            "cluster_id": cluster.id,
+            "current_session_id": cluster.session_id,
+        })
 
     if payload.role in SOLO_ROLES:
         existing_solos = db.query(ImageRole).filter(

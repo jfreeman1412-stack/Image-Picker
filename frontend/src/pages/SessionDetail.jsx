@@ -162,11 +162,26 @@ export default function SessionDetail() {
         body: JSON.stringify({ image_id, cluster_id, role }),
       });
       if (!res.ok) {
-        alert(
-          `That change didn't save (HTTP ${res.status}). The card has been ` +
-          `reloaded to show what's actually in the database. Try again — if it ` +
-          `keeps failing, check the connectivity banner at the top of the page.`,
-        );
+        // 2026-09-14 F1 companion: parse the cluster_moved 409 and give
+        // the operator a specific message so she knows the cluster is
+        // fine, just on a different team's page — not a real failure.
+        // The load() below refreshes this page so the stale card
+        // disappears immediately.
+        let detail = null;
+        try { detail = (await res.json())?.detail; } catch { /* keep null */ }
+        if (res.status === 409 && detail?.error === 'cluster_moved') {
+          alert(
+            detail.message
+            || "That cluster has been moved to another team. This page has "
+            + "been refreshed — navigate to the new team to edit roles on it."
+          );
+        } else {
+          alert(
+            `That change didn't save (HTTP ${res.status}). The card has been `
+            + `reloaded to show what's actually in the database. Try again — if it `
+            + `keeps failing, check the connectivity banner at the top of the page.`,
+          );
+        }
       }
     } catch (e) {
       alert(
@@ -364,8 +379,22 @@ export default function SessionDetail() {
   // surface a friendlier inline message via window.alert for now — they
   // shouldn't happen through the UI's happy paths but the operator deserves
   // a clear message if one does.
-  const parseMoveResponse = async (res) => {
+  // 2026-09-14 F2: optimistic-clear the moved cluster from local state
+  // BEFORE the reload fetch begins. Pre-fix, load() took ~200-500ms and
+  // the source-session UI kept rendering the stale card until it
+  // returned; a click on that card's role chip in that window fired
+  // set-role against a cluster whose session_id had already moved,
+  // producing a 404 (now a 409 via F1 — but the user shouldn't see it
+  // at all in the common case). Removing the moved cluster from
+  // `clusters` state synchronously closes the race window entirely.
+  // load() still runs afterward and reconfirms server truth (would
+  // catch e.g. a merged-into-existing case where the target session's
+  // cluster set changed too).
+  const parseMoveResponse = async (res, movedClusterId) => {
     if (res.ok) {
+      if (movedClusterId != null) {
+        setClusters(prev => prev.filter(c => c.cluster_id !== movedClusterId));
+      }
       await load();
       return { ok: true };
     }
@@ -393,7 +422,7 @@ export default function SessionDetail() {
         force: !!force,
       }),
     });
-    return parseMoveResponse(res);
+    return parseMoveResponse(res, clusterId);
   };
 
   const onMoveToNewSession = async (clusterId, teamName, force) => {
@@ -402,7 +431,7 @@ export default function SessionDetail() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ team_name: teamName, force: !!force }),
     });
-    return parseMoveResponse(res);
+    return parseMoveResponse(res, clusterId);
   };
 
   const onMoveToAddTeam = async (clusterId, teamName, force) => {
@@ -411,7 +440,7 @@ export default function SessionDetail() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ team_name: teamName, force: !!force }),
     });
-    return parseMoveResponse(res);
+    return parseMoveResponse(res, clusterId);
   };
 
   // 2026-06-25 Phase B (COPY): three parallel handlers for the copy flow.
