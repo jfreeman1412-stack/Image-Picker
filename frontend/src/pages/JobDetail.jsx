@@ -96,6 +96,17 @@ export default function JobDetail() {
           setRunAllConfirmText('');
           return;     // wait for the confirm dialog
         }
+        // Fix 2 of pipeline-concurrency-wedge: friendly copy for the
+        // idempotency 409s. The button disable below stops most double-
+        // clicks from ever hitting these, but a race between two tabs
+        // or a stale banner can still trip them — friendlier than the
+        // generic "HTTP 409" fallback.
+        if (detail?.error === 'run_all_in_progress'
+            || detail?.error === 'session_run_in_progress') {
+          alert(detail.message || 'A pipeline run is already active for this job.');
+          load();     // refresh state so the disable kicks in
+          return;
+        }
       }
       if (!res.ok) {
         alert(`Couldn't start (HTTP ${res.status}).`);
@@ -180,8 +191,23 @@ export default function JobDetail() {
           </p>
         </div>
         <div className="actions">
-          <button onClick={runAll} disabled={running}>
-            {running ? 'Kicking off…' : 'Run pipeline on all teams'}
+          {/* Fix 2 of pipeline-concurrency-wedge (2026-09-14) UX polish:
+              also disable while any team in this job is 'running'.
+              Backend 409 remains the real safety net — this cuts the
+              cases where the 409 ever needs to fire. `running` covers
+              the ~200ms fetch window; runningSessions.length covers the
+              entire pipeline duration (job.sessions is polled every
+              second while anyRunning per the effect above). */}
+          <button
+            onClick={runAll}
+            disabled={running || runningSessions.length > 0}
+            title={runningSessions.length > 0
+              ? 'Pipeline is currently running for this job — wait for it to finish.'
+              : undefined}
+          >
+            {runningSessions.length > 0
+              ? 'Pipeline running…'
+              : running ? 'Kicking off…' : 'Run pipeline on all teams'}
           </button>
           <button
             onClick={() => setShowRoster(true)}
