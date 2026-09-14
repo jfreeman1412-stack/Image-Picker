@@ -52,6 +52,21 @@ logger = logging.getLogger(__name__)
 # No nested acquisition, no risk of AB/BA deadlock with itself.
 _PIPELINE_LOCK = threading.Lock()
 
+# 2026-09-14 sqlite-lock fix: batch sizes for mid-stage commits in the two
+# stages that were holding the SQLite write lock for the entire stage
+# under one transaction (clustering: per-iteration db.flush() piles up
+# writes; sorting: per-cluster DELETE + INSERTs). Each commit ends the
+# write transaction, releasing the lock so any pending user UPDATE (e.g.
+# a manual role change from the editor) can proceed within busy_timeout
+# rather than surface as "database is locked" after 10s. Tuned
+# conservatively: too-frequent commits over-fsync (WAL commits are still
+# real disk writes); too-infrequent defeats the purpose. Detecting
+# already commits every 3 images via _set_progress and doesn't need
+# adjustment. Values chosen from Joey's session profile (hundreds of
+# faces per cluster stage, dozens of clusters per sort stage).
+_CLUSTERING_BATCH = 25   # commit every 25 faces processed
+_SORTING_BATCH = 5       # commit every 5 clusters sorted
+
 
 def _set_progress(db: DbSession, session: Session, stage: str, current: int, total: int) -> None:
     """Stamp progress on the session row. Committed so a separate read DB
@@ -191,7 +206,17 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
             labels = clustering.cluster_embeddings(embeddings)
 
             label_to_cluster: dict[int, Cluster] = {}
-            for face, label in zip(faces, labels):
+            # 2026-09-14 sqlite-lock fix: commit every _CLUSTERING_BATCH faces
+            # so the write lock releases periodically instead of being held
+            # for the entire clustering stage. On big sessions this stage
+            # ran tens of seconds under one transaction, causing user edits
+            # elsewhere in the app to hit "database is locked" after our
+            # 10s busy_timeout expired. Batched commits are safe: a mid-
+            # stage crash still recovers cleanly via _clear_prior_results,
+            # which wipes by session_id/image_id (not by relational
+            # integrity to partial cluster state). See face_pipeline safety
+            # analysis at commit 104700a's follow-up conversation.
+            for face_idx, (face, label) in enumerate(zip(faces, labels), start=1):
                 if label == -1:
                     # Issue 5: promote noise face to its own singleton Cluster
                     # row. One row per noise face — no shared label key.
@@ -203,18 +228,20 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
                     db.add(singleton)
                     db.flush()  # assign id
                     face.cluster_id = singleton.id
-                    continue
-                cluster_row = label_to_cluster.get(label)
-                if cluster_row is None:
-                    cluster_row = Cluster(
-                        session_id=session_id,
-                        needs_review=0,
-                        image_count=0,
-                    )
-                    db.add(cluster_row)
-                    db.flush()  # assign id
-                    label_to_cluster[label] = cluster_row
-                face.cluster_id = cluster_row.id
+                else:
+                    cluster_row = label_to_cluster.get(label)
+                    if cluster_row is None:
+                        cluster_row = Cluster(
+                            session_id=session_id,
+                            needs_review=0,
+                            image_count=0,
+                        )
+                        db.add(cluster_row)
+                        db.flush()  # assign id
+                        label_to_cluster[label] = cluster_row
+                    face.cluster_id = cluster_row.id
+                if face_idx % _CLUSTERING_BATCH == 0:
+                    db.commit()
             db.commit()
         stage_start = _log_stage(session.name, "clustering", stage_start)
 
@@ -316,9 +343,18 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
         db.refresh(session)
         total_clusters = len(session.clusters)
         _set_progress(db, session, "sorting", 0, total_clusters)
+        # 2026-09-14 sqlite-lock fix: batch commits every _SORTING_BATCH
+        # clusters. Each _sort_cluster issues a DELETE + INSERTs; without
+        # batching the write txn stayed open for the entire loop, holding
+        # the write lock long enough to time out concurrent user role
+        # changes. See _CLUSTERING_BATCH docstring above for the safety
+        # rationale (mid-stage crash still recovers via
+        # _clear_prior_results on re-run).
         for i, c in enumerate(session.clusters, start=1):
             _sort_cluster(db, c)
             session.progress_current = i
+            if i % _SORTING_BATCH == 0:
+                db.commit()
         db.commit()
         stage_start = _log_stage(session.name, "sorting", stage_start)
 
