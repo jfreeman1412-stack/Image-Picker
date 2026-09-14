@@ -40,6 +40,7 @@ from app.api.sessions import pipeline_progress_fields
 from app.services.eta import eta_seconds
 from app.services.face_pipeline import run_pipeline
 from app.services.ingest import RAW_EXTS, SUPPORTED_EXTS, ingest_folder
+from app.services import pipeline_locks
 
 logger = logging.getLogger(__name__)
 
@@ -939,13 +940,49 @@ def run_all(
                 "job_name": job.name,
             })
 
+    # 2026-09-14 Fix 2 of pipeline-concurrency-wedge: atomic idempotency
+    # gate. Reject overlapping run-alls and reject if any of this job's
+    # non-archived sessions is currently being individually /run — the
+    # in-memory set is authoritative, independent of any stale
+    # status='running' rows the watchdog handles separately. See
+    # app.services.pipeline_locks for the membership contract.
+    with pipeline_locks.TRIGGER_LOCK:
+        if job_id in pipeline_locks.ACTIVE_RUN_ALLS:
+            raise HTTPException(409, detail={
+                "error": "run_all_in_progress",
+                "message": "A run-all is already running for this job.",
+                "job_id": job_id,
+            })
+        conflicting = pipeline_locks.ACTIVE_SESSION_RUNS.intersection(session_ids)
+        if conflicting:
+            raise HTTPException(409, detail={
+                "error": "session_run_in_progress",
+                "message": (
+                    "A pipeline run is already active for "
+                    f"{len(conflicting)} session(s) in this job — "
+                    "let it finish before starting a run-all."
+                ),
+                "session_ids": sorted(conflicting),
+            })
+        pipeline_locks.ACTIVE_RUN_ALLS.add(job_id)
+        pipeline_locks.ACTIVE_SESSION_RUNS.update(session_ids)
+
     def _run_all():
-        for sid in session_ids:
-            with SessionLocal() as bg_db:
-                try:
-                    run_pipeline(bg_db, sid)
-                except Exception:
-                    logger.exception("Pipeline failed for session %s", sid)
+        # The `finally` release is load-bearing (see pipeline_locks docs):
+        # a leaked slot would permanently lock this job out until backend
+        # restart, which is strictly worse than the wasteful double-run
+        # the gate prevents. Tested explicitly for exception paths.
+        try:
+            for sid in session_ids:
+                with SessionLocal() as bg_db:
+                    try:
+                        run_pipeline(bg_db, sid)
+                    except Exception:
+                        logger.exception("Pipeline failed for session %s", sid)
+        finally:
+            with pipeline_locks.TRIGGER_LOCK:
+                pipeline_locks.ACTIVE_RUN_ALLS.discard(job_id)
+                pipeline_locks.ACTIVE_SESSION_RUNS.difference_update(session_ids)
 
     background.add_task(_run_all)
 

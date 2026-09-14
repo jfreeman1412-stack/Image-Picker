@@ -29,6 +29,7 @@ from app.services.ingest import ingest_folder
 from app.services.face_pipeline import run_pipeline
 from app.services.roster import normalize_name
 from app.services.roster_check import session_norm_team
+from app.services import pipeline_locks
 
 logger = logging.getLogger(__name__)
 
@@ -172,12 +173,48 @@ def run(session_id: int, background: BackgroundTasks, db: DbSession = Depends(ge
     s = db.query(Session).get(session_id)
     if s is None:
         raise HTTPException(404, "Session not found")
+    # Keep the DB-status check as a secondary defense-in-depth signal — the
+    # in-memory set below is authoritative for idempotency (Fix 2 of
+    # pipeline-concurrency-wedge), but a legit 'running' row from a
+    # different-source trigger still deserves the same 409 rather than a
+    # confusing "in_progress but not in ACTIVE_SESSION_RUNS" state.
     if s.status == "running":
         raise HTTPException(409, "Pipeline already running")
 
+    # 2026-09-14 Fix 2 of pipeline-concurrency-wedge: atomic idempotency
+    # gate. Reject overlapping /run for the same session, AND reject if the
+    # parent job is currently mid-run-all (which reserves its session_ids
+    # in ACTIVE_SESSION_RUNS upfront, so the intersection check below
+    # catches it — the explicit ACTIVE_RUN_ALLS check is a redundant safety
+    # net in case reservation logic is ever refactored). See
+    # app.services.pipeline_locks for the membership contract.
+    with pipeline_locks.TRIGGER_LOCK:
+        if session_id in pipeline_locks.ACTIVE_SESSION_RUNS:
+            raise HTTPException(409, detail={
+                "error": "session_run_in_progress",
+                "message": "A pipeline run is already running for this session.",
+                "session_id": session_id,
+            })
+        if s.job_id is not None and s.job_id in pipeline_locks.ACTIVE_RUN_ALLS:
+            raise HTTPException(409, detail={
+                "error": "run_all_in_progress",
+                "message": (
+                    "A run-all is already running for this session's job "
+                    "— the session will run as part of it."
+                ),
+                "job_id": s.job_id,
+            })
+        pipeline_locks.ACTIVE_SESSION_RUNS.add(session_id)
+
     def _run():
-        with SessionLocal() as bg_db:
-            run_pipeline(bg_db, session_id)
+        # `finally` release is load-bearing — see pipeline_locks docs and
+        # the run_all counterpart in jobs.py.
+        try:
+            with SessionLocal() as bg_db:
+                run_pipeline(bg_db, session_id)
+        finally:
+            with pipeline_locks.TRIGGER_LOCK:
+                pipeline_locks.ACTIVE_SESSION_RUNS.discard(session_id)
 
     background.add_task(_run)
     s.status = "running"
