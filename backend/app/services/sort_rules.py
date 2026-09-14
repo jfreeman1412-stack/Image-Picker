@@ -27,10 +27,14 @@ Rules (order + pose, then NON-SMILING preference for the pano):
      is None, review reason 'no_pano_candidate'.
 
 Sanity-check flag added after the picks (does not affect selection):
-  - team pick is not classified 'smiling' (FER expression) →
-    'team_pick_not_smiling'. The pano's smile handling lives in rule 4 and
-    uses the landmark smile_score, not FER (FER under-scores kids' smiles —
-    see services/smile.py and expression.py Phase 4.4).
+  - team pick is confidently classified 'serious' by FER (i.e. not
+    'smiling' AND not 'unknown') → 'team_pick_not_smiling'. 'unknown' is
+    treated as "no signal" and does NOT fire the flag — otherwise every
+    team pick would trip it whenever fer's import chain fails (moviepy
+    v2 dropped `moviepy.editor`, which fer 22.5.1 imports; see
+    expression.py's lazy import). The pano's smile handling lives in
+    rule 4 and uses the landmark smile_score, not FER (FER under-scores
+    kids' smiles — see services/smile.py and expression.py Phase 4.4).
 
 Valid role values: 'team' | 'panoramic' | 'individual' | 'buddy' | 'rejected'.
 'rejected' is set only by manual override; the auto-sort never produces it.
@@ -185,7 +189,16 @@ def assign_roles(
     # The pano's smile handling is in the selection above (landmark
     # smile_score → prefer non-smiling, flag pano_smiling_fallback), so there
     # is no separate FER-based pano flag anymore.
-    if team_idx is not None and ordered[team_idx].expression != "smiling":
+    #
+    # 2026-09-14: only flag when FER confidently classifies the team pick as
+    # NOT smiling. "unknown" (fer disabled / crop too small / classify
+    # failure) is treated as "not enough signal to complain" — a face we
+    # couldn't classify shouldn't fire a false-positive nag. Before this
+    # change, an unavailable fer stack (see expression.py's lazy import)
+    # caused every face to land at "unknown" → every team got the flag →
+    # UI noise on every review page. See memory pipeline-concurrency-wedge
+    # follow-up + the fer-disabled report in the conversation trail.
+    if team_idx is not None and ordered[team_idx].expression not in ("smiling", "unknown"):
         review_reasons.append("team_pick_not_smiling")
 
     return SortResult(

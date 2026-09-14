@@ -274,15 +274,23 @@ def test_pano_unknown_smile_treated_as_nonsmiling():
     assert "pano_smiling_fallback" not in r.review_reasons
 
 
-def test_unknown_expression_triggers_team_not_smiling_flag():
-    """'unknown' isn't 'smiling' → counts as not-smiling for the sanity flag."""
+def test_unknown_expression_does_not_trigger_team_not_smiling_flag():
+    """'unknown' = "we couldn't classify" (fer import failed, crop too
+    small, classify raised) → NO signal, don't fire the flag.
+
+    2026-09-14: flipped from the prior "unknown fires the flag" assertion.
+    That behavior meant every team got team_pick_not_smiling whenever fer's
+    lazy import failed (which happens today with moviepy v2 installed),
+    cluttering every review page with false positives. Only a confidently-
+    'serious' team pick should fire the nag now. See sort_rules.py:188.
+    """
     images = [
         _rec(1, 1.0, 1, "smiling"),
-        _rec(2, 2.0, 1, "unknown"),  # team
+        _rec(2, 2.0, 1, "unknown"),  # team — un-classifiable, not a nag
     ]
     r = assign_roles(images)
     assert r.team_image_id == 2
-    assert "team_pick_not_smiling" in r.review_reasons
+    assert "team_pick_not_smiling" not in r.review_reasons
 
 
 # ── Coach sort variant ────────────────────────────────────────────────────────
