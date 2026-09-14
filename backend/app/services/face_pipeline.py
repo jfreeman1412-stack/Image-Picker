@@ -431,9 +431,23 @@ def _sort_cluster(db: DbSession, cluster_row: Cluster) -> None:
         result = assign_roles(records, manual_roles=manual_roles)
 
     # Wipe only auto rows; preserve manual overrides.
+    # 2026-09-14 SAWarning cleanup: synchronize_session="fetch" tells
+    # SQLAlchemy to run a SELECT before the DELETE and expire the matching
+    # objects from the session identity map. Without this, the previous
+    # synchronize_session=False left stale persistent ImageRole objects in
+    # the identity map; the subsequent db.add(ImageRole(...)) with the same
+    # PK triggered a noisy "identity key ... conflicts with persistent
+    # instance ... replacing it" SAWarning at every commit downstream
+    # (set-role, reassign, merge-clusters, move-with-guards, and the
+    # pipeline's own sorting stage). Cosmetic — the DB row was already
+    # gone via the bulk DELETE so no unique-constraint violation, and
+    # commits still succeeded — but the warnings drowned out real
+    # diagnostic log lines. "fetch" costs one extra SELECT per call
+    # (cheap: it's a small filtered index scan on image_roles); worth it
+    # for clean logs.
     db.query(ImageRole).filter_by(
         cluster_id=cluster_row.id, manual_override=0,
-    ).delete(synchronize_session=False)
+    ).delete(synchronize_session="fetch")
 
     for image_id, role in result.roles.items():
         if image_id in manual_roles:
