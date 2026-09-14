@@ -18,6 +18,7 @@ DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 import errno
 import json
 import logging
+import re
 import shutil
 import threading
 import time
@@ -87,6 +88,11 @@ def peek_folder(payload: PeekRequest):
                 "subfolder_count": sub_count,
                 "image_count": sub_images,
                 "raw_count": sub_raws,
+                # 2026-09-14 wizard preview: same _extract_line_key the
+                # ingest merge logic uses, so the frontend groups the
+                # multi-line preview by the identical convention that
+                # scopes cross-line merges. No JS regex duplication.
+                "line_key": _extract_line_key(entry.name),
             })
         elif entry.is_file():
             ext = entry.suffix.lower()
@@ -168,22 +174,85 @@ def _iter_team_folders(root: Path, has_lines: bool):
             yield root
 
 
+# 2026-09-14 multi-line duplicate-name fix. Extracts the "line identity" from
+# a top-level folder name so cross-line same-team-name merges (see
+# _find_or_create_session_for_team) don't collapse e.g. Line 1/10U Gold and
+# Line 2/10U Gold into a single session. Regex covers the operator's real
+# naming convention: "Line 1", "Line 1-Lauren", "Line 2 Team and Pano",
+# "line 1 composite and team" — all "Line N" prefixed. Fallback (no "Line N"
+# match) is the full top-level folder name, lowercased. This preserves the
+# within-line naturals+composite merge that jobs 40/57/63 rely on: both
+# "Line 1 Team and Pano" and "Line 1- Lauren Standard" map to "line 1", so
+# a team appearing in both merges into one session. Two lines' matching
+# team-name folders (line 1/10U Gold + line 2/10U Gold) map to "line 1" vs
+# "line 2" — different line_keys, no merge. See memory
+# match-team-alias-issue for the merge rule this line-scopes.
+_LINE_KEY_RE = re.compile(r"^\s*line\s*(\d+)", re.IGNORECASE)
+
+
+def _extract_line_key(top_level_name: str) -> str:
+    """Return a normalized line identifier from a top-level folder name.
+
+    Returns "line N" when the folder name matches the operator's "Line N"
+    prefix convention (case + spacing insensitive). Otherwise returns the
+    lowercased+stripped folder name itself, so unrecognized top-level names
+    become their own line identity — safe fallback: an unmatched folder
+    can only merge with other folders sharing the exact same top-level
+    name, not with random "Line N" folders.
+    """
+    if top_level_name is None:
+        return ""
+    m = _LINE_KEY_RE.match(top_level_name)
+    if m:
+        return f"line {m.group(1)}"
+    return top_level_name.strip().lower()
+
+
+def _session_line_key(session: Session, job_root: Optional[str]) -> str:
+    """Compute a session's line_key from its source_path relative to the job
+    root. Falls back to "" for sessions with NULL source_path (e.g. the
+    move-card "add new team" auto-created sessions in cluster_move.py) or
+    when the source_path doesn't sit under the job root — those cases
+    have no filesystem line concept, so they get a distinct empty key
+    that never collides with a real "line N".
+    """
+    if not session.source_path or not job_root:
+        return ""
+    try:
+        rel = Path(session.source_path).relative_to(Path(job_root))
+    except ValueError:
+        return ""
+    parts = rel.parts
+    if not parts:
+        return ""
+    return _extract_line_key(parts[0])
+
+
 def _find_or_create_session_for_team(
-    db: DbSession, job_id: int, team_name: str, source_path: str,
+    db: DbSession, job_id: int, job_root: Optional[str],
+    team_name: str, source_path: str, line_key: str,
 ) -> tuple[Session, bool]:
-    """Phase 1 merge-for-clustering (2026-06-09): if the job already has a
-    non-archived session whose normalize_name(name) matches this team's,
-    return that session and don't create a new one. Otherwise create a
-    fresh pending session and return it.
+    """Phase 1 merge-for-clustering (2026-06-09), line-scoped (2026-09-14):
+    if the job already has a non-archived session whose normalize_name(name)
+    matches this team's AND whose extracted line_key matches, return that
+    session and don't create a new one. Otherwise create a fresh pending
+    session and return it.
 
     Returns (session, was_merged) where was_merged=True iff we returned
     an existing session.
 
-    Job-wide scope: any same-named folder anywhere in this job is a merge
-    target (cross-line same-name collision risk accepted — team names are
-    unique across lines in the operator's roster-driven outdoor shoots).
+    Line-scoped merge (2026-09-14): the merge target must share the same
+    line_key (derived from the top-level folder under job.root_path). This
+    keeps the within-line naturals+composite merge (jobs 40/57/63:
+    "Line 1 Team and Pano/TeamA" + "Line 1- Lauren Standard/TeamA" both
+    key on "line 1" → one session) while producing separate sessions for
+    duplicate team names across lines (line 1/10U Gold + line 2/10U Gold
+    → two sessions). The old job-wide scope silently collapsed the latter
+    into the first-line session — see the bug diagnosis in this file's
+    conversation trail.
+
     Normalized matching via normalize_name() catches case / whitespace /
-    dash variants between paired folders.
+    dash variants between paired folders within the same line.
 
     Archived sessions are NOT eligible merge targets — the operator hid
     them deliberately, so a fresh ingest of the same name creates a fresh
@@ -206,8 +275,11 @@ def _find_or_create_session_for_team(
             .all()
         )
         for s in existing:
-            if normalize_name(s.name) == target_norm:
-                return s, True
+            if normalize_name(s.name) != target_norm:
+                continue
+            if _session_line_key(s, job_root) != line_key:
+                continue
+            return s, True
     new_sess = Session(
         job_id=job_id, name=team_name, source_path=source_path,
         status="pending",
@@ -245,6 +317,7 @@ def _ingest_job(
         session_ids: list[int] = []
         try:
             team_dirs = list(_iter_team_folders(root, has_lines))
+            job_root_str = str(root.resolve())
             for team_dir in team_dirs:
                 image_source = team_dir
                 if subfolder:
@@ -263,8 +336,29 @@ def _ingest_job(
                 job.ingest_current_team = team_dir.name
                 db.commit()
 
+                # 2026-09-14 multi-line duplicate-name fix: derive the
+                # line_key from the top-level folder under the job root so
+                # the merge lookup below is line-scoped. has_lines=True
+                # yields root/<line>/<team> — parts[0] is the line folder.
+                # has_lines=False yields root/<team> (team_dir IS the
+                # top-level) — parts[0] is the team folder itself; that's
+                # fine because there's no line concept in flat mode, and
+                # each team ends up with its own line_key which is the
+                # same key it'd match against on any merge attempt. The
+                # flat-fallback case (team_dir == root) hits the empty
+                # parts branch and gets an empty line_key — the walker
+                # never yields more than one folder there, so nothing to
+                # merge with either way.
+                try:
+                    rel = team_dir.resolve().relative_to(root.resolve())
+                    top_level = rel.parts[0] if rel.parts else ""
+                except ValueError:
+                    top_level = team_dir.name
+                line_key = _extract_line_key(top_level)
+
                 session, was_merged = _find_or_create_session_for_team(
-                    db, job_id, team_dir.name, str(team_dir.resolve()),
+                    db, job_id, job_root_str,
+                    team_dir.name, str(team_dir.resolve()), line_key,
                 )
                 if was_merged:
                     merged.append({
@@ -628,6 +722,13 @@ def get_job(
             "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
             "archived": bool(s.archived),
             "archived_at": s.archived_at.isoformat() if s.archived_at else None,
+            # 2026-09-14 multi-line duplicate-name fix: computed from
+            # source_path relative to job.root_path so the JobDetail UI
+            # can render a "Line N" chip disambiguating same-named
+            # sessions across lines. Empty string when source_path is
+            # NULL (auto-created move-card sessions) or doesn't sit
+            # under the job root — treat those as "no line concept."
+            "line_key": _session_line_key(s, job.root_path),
             **pipeline_progress_fields(s),
         })
 

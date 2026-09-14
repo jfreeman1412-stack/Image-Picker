@@ -74,13 +74,21 @@ def _existing_session(db, job, name, archived=False):
 # ── _find_or_create_session_for_team helper (the merge core) ─────────────
 
 
+# _existing_session sets source_path=f"/tmp/{name}" so relative to
+# job.root_path="/tmp" that resolves to top-level parts[0] = <name>. The
+# fallback branch of _extract_line_key returns the lowercased folder name,
+# so passing line_key=<name>.lower() below matches the existing session's
+# computed key. This exercises the merge logic without needing a real
+# "Line N" folder structure; the "line 1"/"line 2" cross-line separation
+# is covered by the integration tests below (test_multi_line_duplicate_...).
 def test_helper_creates_session_when_no_match(db):
     """No existing session with matching normalized name → create new,
     was_merged=False."""
     from app.api.jobs import _find_or_create_session_for_team
     job = _job(db)
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="Team One", source_path="/tmp/line1/Team One",
+        db, job.id, job_root="/tmp", team_name="Team One",
+        source_path="/tmp/line1/Team One", line_key="line 1",
     )
     assert was_merged is False
     assert s.name == "Team One"
@@ -94,8 +102,11 @@ def test_helper_returns_existing_session_on_literal_match(db):
     from app.api.jobs import _find_or_create_session_for_team
     job = _job(db)
     existing = _existing_session(db, job, "Team One")
+    # existing.source_path is "/tmp/Team One" → parts[0]="Team One" →
+    # fallback line_key "team one". Match that on the incoming call.
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="Team One", source_path="/tmp/line1c/Team One",
+        db, job.id, job_root="/tmp", team_name="Team One",
+        source_path="/tmp/line1c/Team One", line_key="team one",
     )
     assert was_merged is True
     assert s.id == existing.id
@@ -109,7 +120,8 @@ def test_helper_normalizes_case(db):
     job = _job(db)
     existing = _existing_session(db, job, "Team One")
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="team one", source_path="/tmp/x",
+        db, job.id, job_root="/tmp", team_name="team one",
+        source_path="/tmp/Team One", line_key="team one",
     )
     assert was_merged is True
     assert s.id == existing.id
@@ -122,7 +134,8 @@ def test_helper_normalizes_whitespace_and_dashes(db):
     job = _job(db)
     existing = _existing_session(db, job, "Team One")
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="Team-One", source_path="/tmp/x",
+        db, job.id, job_root="/tmp", team_name="Team-One",
+        source_path="/tmp/Team One", line_key="team one",
     )
     assert was_merged is True
     assert s.id == existing.id
@@ -136,7 +149,8 @@ def test_helper_skips_archived_sessions_creates_new(db):
     job = _job(db)
     archived = _existing_session(db, job, "Team One", archived=True)
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="Team One", source_path="/tmp/line1/Team One",
+        db, job.id, job_root="/tmp", team_name="Team One",
+        source_path="/tmp/line1/Team One", line_key="line 1",
     )
     assert was_merged is False
     assert s.id != archived.id
@@ -150,7 +164,8 @@ def test_helper_scoped_to_job(db):
     job_b = _job(db, name="JobB")
     _existing_session(db, job_a, "Team One")
     s, was_merged = _find_or_create_session_for_team(
-        db, job_b.id, team_name="Team One", source_path="/tmp/x",
+        db, job_b.id, job_root="/tmp", team_name="Team One",
+        source_path="/tmp/Team One", line_key="team one",
     )
     assert was_merged is False
     assert s.job_id == job_b.id
@@ -162,10 +177,29 @@ def test_helper_different_names_stay_separate(db):
     job = _job(db)
     _existing_session(db, job, "Team One")
     s, was_merged = _find_or_create_session_for_team(
-        db, job.id, team_name="Team Two", source_path="/tmp/x",
+        db, job.id, job_root="/tmp", team_name="Team Two",
+        source_path="/tmp/Team Two", line_key="team two",
     )
     assert was_merged is False
     assert s.name == "Team Two"
+
+
+def test_helper_scoped_by_line_key_no_cross_line_merge(db):
+    """2026-09-14 multi-line duplicate-name fix — the merge is now scoped
+    by line_key. A 'Team One' in line 2 does NOT merge into an existing
+    'Team One' in line 1: they get separate sessions."""
+    from app.api.jobs import _find_or_create_session_for_team
+    job = _job(db)
+    # Existing session for line 1's Team One.
+    _existing_session(db, job, "Team One")  # source_path=/tmp/Team One
+    # Same-named team, different line — different line_key.
+    s, was_merged = _find_or_create_session_for_team(
+        db, job.id, job_root="/tmp", team_name="Team One",
+        source_path="/tmp/line2/Team One", line_key="line 2",
+    )
+    assert was_merged is False
+    assert s.name == "Team One"
+    assert s.source_path == "/tmp/line2/Team One"
 
 
 # ── _ingest_job integration: synthetic folder structures ─────────────────
@@ -385,3 +419,128 @@ def test_ingest_job_no_merge_path_unchanged_regression(db, tmp_path):
     job = db.query(Job).get(job.id)
     notes = json.loads(job.ingest_error) if job.ingest_error else {}
     assert "merged_folders" not in notes  # no merge → no notes key
+
+
+# ── 2026-09-14 multi-line duplicate-name fix regression tests ────────────
+
+
+def test_multi_line_duplicate_team_names_no_cross_line_merge(db, tmp_path):
+    """Two lines each with a same-named team → TWO separate sessions.
+    Before the 2026-09-14 line-scoped-merge fix, cross-line same-name
+    folders silently collapsed into the first-encountered line's session
+    (Line 2's images got mixed into Line 1's Rockets). Now they stay
+    separate."""
+    import json
+    root = tmp_path / "shoot"
+    root.mkdir()
+    # Line 1: Rockets + Falcons
+    (root / "Line 1").mkdir()
+    (root / "Line 1" / "Rockets").mkdir()
+    _make_image(root / "Line 1" / "Rockets" / "l1r1.jpg")
+    (root / "Line 1" / "Falcons").mkdir()
+    _make_image(root / "Line 1" / "Falcons" / "l1f1.jpg")
+    # Line 2: Rockets + Falcons (duplicate names — the bug case)
+    (root / "Line 2").mkdir()
+    (root / "Line 2" / "Rockets").mkdir()
+    _make_image(root / "Line 2" / "Rockets" / "l2r1.jpg")
+    (root / "Line 2" / "Falcons").mkdir()
+    _make_image(root / "Line 2" / "Falcons" / "l2f1.jpg")
+
+    # Need the job's root_path pointed at the real folder so the line_key
+    # extraction in _find_or_create_session_for_team sees "Line 1"/"Line 2"
+    # as parts[0] of each session's source_path.
+    job = Job(name="MultiLine", root_path=str(root), has_lines=1)
+    db.add(job); db.commit(); db.refresh(job)
+    _run_ingest(str(db.bind.url), job.id, root, has_lines=True)
+
+    db.expire_all()
+    sessions = db.query(DbSess).filter_by(job_id=job.id).all()
+    # 4 folders on disk, 2 unique names — but line-scoped: 4 sessions.
+    assert len(sessions) == 4
+    names = sorted(s.name for s in sessions)
+    assert names == ["Falcons", "Falcons", "Rockets", "Rockets"]
+
+    # Rockets sessions: one under Line 1, one under Line 2. Each has 1 image.
+    rockets = [s for s in sessions if s.name == "Rockets"]
+    r_paths = sorted(s.source_path for s in rockets)
+    assert r_paths[0].endswith("Line 1\\Rockets") or r_paths[0].endswith("Line 1/Rockets")
+    assert r_paths[1].endswith("Line 2\\Rockets") or r_paths[1].endswith("Line 2/Rockets")
+    for s in rockets:
+        assert len(db.query(Image).filter_by(session_id=s.id).all()) == 1
+
+    # No merged_folders in notes — nothing merged.
+    job = db.query(Job).get(job.id)
+    notes = json.loads(job.ingest_error) if job.ingest_error else {}
+    assert "merged_folders" not in notes
+
+
+def test_multi_line_within_line_naturals_composite_still_merges(db, tmp_path):
+    """The within-line naturals+composite merge that jobs 40/57/63 rely on
+    is preserved: "Line 1 Team and Pano/Rockets" + "Line 1- Lauren Standard/
+    Rockets" both extract to line_key='line 1' and merge into ONE session."""
+    import json
+    root = tmp_path / "shoot"
+    root.mkdir()
+    # Two top-level folders both belonging to Line 1 (composite + naturals).
+    (root / "Line 1 Team and Pano").mkdir()
+    (root / "Line 1 Team and Pano" / "Rockets").mkdir()
+    _make_image(root / "Line 1 Team and Pano" / "Rockets" / "comp1.png")
+    _make_image(root / "Line 1 Team and Pano" / "Rockets" / "comp2.png")
+
+    (root / "Line 1- Lauren Standard").mkdir()
+    (root / "Line 1- Lauren Standard" / "Rockets").mkdir()
+    _make_image(root / "Line 1- Lauren Standard" / "Rockets" / "nat1.jpg")
+
+    # Second team, only in one line — separate session.
+    (root / "Line 1 Team and Pano" / "Falcons").mkdir()
+    _make_image(root / "Line 1 Team and Pano" / "Falcons" / "f1.png")
+
+    job = Job(name="OutdoorLine1", root_path=str(root), has_lines=1)
+    db.add(job); db.commit(); db.refresh(job)
+    _run_ingest(str(db.bind.url), job.id, root, has_lines=True)
+
+    db.expire_all()
+    sessions = db.query(DbSess).filter_by(job_id=job.id).all()
+    # 3 folders on disk (2 Rockets + 1 Falcons) → 2 sessions after merge.
+    assert len(sessions) == 2
+    names = sorted(s.name for s in sessions)
+    assert names == ["Falcons", "Rockets"]
+
+    # Rockets session has both composite PNGs AND the natural JPG.
+    rockets = next(s for s in sessions if s.name == "Rockets")
+    imgs = db.query(Image).filter_by(session_id=rockets.id).all()
+    assert len(imgs) == 3
+    suffixes = sorted({Path(i.path).suffix.lower() for i in imgs})
+    assert suffixes == [".jpg", ".png"]
+
+    # merged_folders SHOULD record the within-line merge.
+    job = db.query(Job).get(job.id)
+    notes = json.loads(job.ingest_error) if job.ingest_error else {}
+    merged = notes.get("merged_folders", [])
+    assert len(merged) == 1
+    assert merged[0]["folder_name"] == "Rockets"
+    assert merged[0]["into_session_name"] == "Rockets"
+
+
+def test_extract_line_key_regex_and_fallback():
+    """Unit: line_key extraction covers the operator's real folder naming
+    conventions from jobs 40/57/63/95/96/100/103/118 in production DB,
+    plus the fallback for non-'Line N' top-level names."""
+    from app.api.jobs import _extract_line_key
+    # "Line N" prefix variants — all match the same line_key across
+    # spacing / hyphen / dash / trailing labels.
+    assert _extract_line_key("Line 1") == "line 1"
+    assert _extract_line_key("Line 2") == "line 2"
+    assert _extract_line_key("Line 1- Lauren Standard") == "line 1"
+    assert _extract_line_key("Line 1 Team and Pano") == "line 1"
+    assert _extract_line_key("Line 2-Joey-7") == "line 2"
+    assert _extract_line_key("line 1 composite and team") == "line 1"
+    assert _extract_line_key("LINE 3") == "line 3"
+    # Fallback: no "Line N" pattern → lowercased folder name.
+    assert _extract_line_key("Senior Line") == "senior line"
+    assert _extract_line_key("IND Pano Team") == "ind pano team"
+    assert _extract_line_key("Taylor-7") == "taylor-7"
+    assert _extract_line_key("6-2-2026") == "6-2-2026"
+    # Empty / None safety.
+    assert _extract_line_key("") == ""
+    assert _extract_line_key(None) == ""

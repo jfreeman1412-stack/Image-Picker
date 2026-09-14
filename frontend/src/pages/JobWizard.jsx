@@ -21,6 +21,44 @@ function looksLikeColorCheck(folderName) {
   return SOFT_HINT_SUBSTRINGS.some(p => n.includes(p));
 }
 
+// 2026-09-14 multi-line preview: normalize a team name the same way the
+// backend's normalize_name() does (services/roster.py) so the wizard's
+// cross-line duplicate detection matches the ingest merge-scope
+// comparison exactly. NFKD-fold, drop every non-alphanumeric, lowercase.
+// A false negative (missed warning) just means the operator won't see the
+// chip — backend still splits correctly by line_key; a false positive
+// (over-eager warning) would nag on legit distinct names — so we mirror
+// the backend precisely rather than doing a looser toLowerCase() only.
+function normalizeTeamName(s) {
+  if (!s) return '';
+  // NFKD then strip combining diacritics (U+0300-U+036F), then drop
+  // every non-alphanumeric, then lowercase.
+  const folded = s.normalize('NFKD').replace(/[̀-ͯ]/g, '');
+  return folded.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Given linesData, return a Set of normalized team names that appear in
+// MORE THAN ONE line — those are the duplicates that post-fix will land
+// as separate sessions. Within-line duplicates (a team folder existing
+// twice under the same line — impossible under has_lines=true walker but
+// defensively deduped) don't count.
+function findCrossLineDuplicates(linesData) {
+  if (!linesData || linesData.length <= 1) return new Set();
+  const counts = new Map();
+  for (const ln of linesData) {
+    const seenInLine = new Set();
+    for (const t of ln.teams) {
+      const norm = normalizeTeamName(t.name);
+      if (!norm || seenInLine.has(norm)) continue;
+      seenInLine.add(norm);
+      counts.set(norm, (counts.get(norm) || 0) + 1);
+    }
+  }
+  return new Set(
+    [...counts.entries()].filter(([, c]) => c > 1).map(([n]) => n),
+  );
+}
+
 // Compute the zero-images guard severity from the per-team peeks. Two-tier:
 //   HARD (red, requires explicit second-click): populated==0, OR
 //         (populated==1 AND total≥3). Catches the swatch-hijack: 1 swatch
@@ -55,7 +93,7 @@ function computeZeroImagesGuard(teamPeeks, imageSubfolder) {
  *   1. Job name
  *   2. Roster Y/N + optional CSV upload (stashed locally, POSTed after create)
  *   3. Job folder (browse modal or paste path) → /peek root
- *   4. Lines / Teams / Single → /peek first line if needed
+ *   4. Lines / Teams / Single → /peek every top-level line in parallel
  *   5. Verify team folders
  *   6. Where the images live (team-folder root or named subfolder)
  *   7. Confirm & create (POST /jobs, then auto-POST roster, then poll ingest)
@@ -106,6 +144,14 @@ export default function JobWizard() {
   const [rootPeek, setRootPeek] = useState(null);
   const [hasLines, setHasLines] = useState(null);            // true | false | 'single'
   const [teamFolders, setTeamFolders] = useState([]);
+  // 2026-09-14 multi-line preview: teams grouped by line, populated by
+  // chooseStructure(true) after peeking EVERY top-level line folder in
+  // parallel (was: only line 1). Each entry is
+  // { line_key, line_name, teams: [{ name, subfolder_count, image_count,
+  //   raw_count }] }. Only used when hasLines===true; empty otherwise.
+  // Drives the step-5 grouped display + duplicate-name warning + the
+  // per-team peek paths in confirmTeams.
+  const [linesData, setLinesData] = useState([]);
   // 2026-06-28 wizard-mixed-structure: was firstTeamPeek (pre-fix the
   // wizard sampled only teamFolders[0] for structure detection, which let
   // a non-team first folder (color swatch) hijack the operator's subfolder
@@ -187,19 +233,54 @@ export default function JobWizard() {
     setBusy(true);
     try {
       if (choice === true) {
-        const firstLine = rootPeek.subfolders[0];
-        if (!firstLine) throw new Error('No line folders found at root.');
-        const linePath = `${rootPath}\\${firstLine.name}`;
-        const inside = await peek(linePath);
-        setTeamFolders(inside.subfolders);
+        // 2026-09-14 multi-line preview: peek EVERY top-level line folder
+        // in parallel so step 5 shows the whole shoot, not just line 1.
+        // Backend attaches line_key to each entry via the same
+        // _extract_line_key used by the ingest merge scope, so grouping
+        // here matches how sessions will be scoped at import time.
+        const lineFolders = (rootPeek.subfolders || []);
+        if (lineFolders.length === 0) throw new Error('No line folders found at root.');
+        const linePeekResults = await Promise.all(
+          lineFolders.map(async (lf) => {
+            try {
+              const inside = await peek(`${rootPath}\\${lf.name}`);
+              return {
+                line_key: lf.line_key || lf.name.toLowerCase(),
+                line_name: lf.name,
+                teams: inside.subfolders || [],
+              };
+            } catch (e) {
+              console.warn(`[wizard] peek failed for line ${lf.name}:`, e);
+              return null;
+            }
+          }),
+        );
+        const lines = linePeekResults.filter(Boolean)
+          // Drop empty line folders (nothing to import from them).
+          .filter(ln => ln.teams.length > 0);
+        if (lines.length === 0) throw new Error('No team folders found under any line.');
+        setLinesData(lines);
+        // Flatten teams with line metadata so downstream steps (subfolder
+        // decision, skip-list, zero-images guard) see every team across
+        // every line — was: teamFolders held line 1's teams only.
+        const flatTeams = lines.flatMap(ln =>
+          ln.teams.map(t => ({
+            ...t,
+            line_key: ln.line_key,
+            line_name: ln.line_name,
+          })),
+        );
+        setTeamFolders(flatTeams);
         setStep('teams');
       } else if (choice === false) {
+        setLinesData([]);
         setTeamFolders(rootPeek.subfolders);
         setStep('teams');
       } else {
         // 'single' — the whole root is one team. teamPeeks holds the one
         // peek so the skip-list/zero-images guard logic doesn't have to
         // special-case single-team mode.
+        setLinesData([]);
         const inside = await peek(rootPath);
         const teamName = rootPeek.path.split(/[\\/]/).pop();
         const singlePeek = { ...inside, name: teamName };
@@ -234,19 +315,31 @@ export default function JobWizard() {
   const confirmTeams = async () => {
     reset(); setBusy(true);
     try {
-      const linePrefix = hasLines === true
-        ? `${rootPath}\\${rootPeek.subfolders[0].name}\\`
-        : `${rootPath}\\`;
+      // 2026-09-14 multi-line: each team now carries its own line_name
+      // (populated by chooseStructure for has_lines=true), so build the
+      // peek path per-team instead of prefixing with only line 1. For
+      // has_lines=false / 'single', t.line_name is undefined and the
+      // path collapses to root\team, matching the old behavior.
       const peekResults = await Promise.all(
         teamFolders.map(async (t) => {
+          const path = t.line_name
+            ? `${rootPath}\\${t.line_name}\\${t.name}`
+            : `${rootPath}\\${t.name}`;
           try {
-            const inside = await peek(`${linePrefix}${t.name}`);
-            return { ...inside, name: t.name };
+            const inside = await peek(path);
+            // Preserve line metadata + dedupe display name so downstream
+            // consumers can still key on (line_key, name) for duplicates.
+            return {
+              ...inside,
+              name: t.name,
+              line_key: t.line_key,
+              line_name: t.line_name,
+            };
           } catch (e) {
             // Single-folder peek failure is non-fatal — that folder just
             // doesn't get peeked. Log + return null; filtered below so it
             // doesn't pollute the picker / skip-list / guard.
-            console.warn(`[wizard] peek failed for ${t.name}:`, e);
+            console.warn(`[wizard] peek failed for ${t.line_name || ''}\\${t.name}:`, e);
             return null;
           }
         }),
@@ -483,30 +576,105 @@ export default function JobWizard() {
         </section>
       )}
 
-      {/* Step 5: Verify teams */}
-      {step === 'teams' && (
+      {/* Step 5: Verify teams
+          2026-09-14 multi-line preview: when hasLines===true, group by
+          line. linesData is populated by chooseStructure (all lines
+          peeked in parallel). Single-line and flat modes fall through
+          to the flat list, keeping the pre-change appearance. Duplicate
+          team names across lines get a chip so the operator knows the
+          post-fix backend will land them as separate sessions. */}
+      {step === 'teams' && (() => {
+        const multiLine = hasLines === true && linesData.length > 1;
+        const dupeSet = multiLine ? findCrossLineDuplicates(linesData) : new Set();
+        const totalTeams = multiLine
+          ? linesData.reduce((sum, ln) => sum + ln.teams.length, 0)
+          : teamFolders.length;
+        const totalImages = multiLine
+          ? linesData.reduce(
+              (sum, ln) => sum + ln.teams.reduce((s, t) => s + (t.image_count || 0), 0),
+              0,
+            )
+          : teamFolders.reduce((s, t) => s + (t.image_count || 0), 0);
+        return (
         <section className="card">
           <h2>Verify team folders</h2>
-          <p>These look like the team folders {hasLines === true ? '(under the first line)' : ''}:</p>
-          <ul className="folder-list">
-            {teamFolders.map((f) => (
-              <li key={f.name}>
-                <b>{f.name}</b>
-                <span className="muted"> · {f.subfolder_count} subfolders · {f.image_count} images · {f.raw_count} raws</span>
-              </li>
-            ))}
-          </ul>
-          <p className="muted">{teamFolders.length} teams total.</p>
+          {multiLine ? (
+            <>
+              <p>
+                Found <b>{linesData.length} lines</b> containing <b>{totalTeams} teams</b> total
+                {' '}({totalImages} images across the shoot).
+              </p>
+              {dupeSet.size > 0 && (
+                <p className="warn" style={{ background: '#fff3cd', padding: 8, borderRadius: 4 }}>
+                  ⚠ <b>{dupeSet.size} team name{dupeSet.size === 1 ? '' : 's'} appear across multiple lines.</b>{' '}
+                  Post-fix, each line's copy will become its own separate session (correct
+                  behavior for age-group lines with reused names — line 1's "10U Gold" ≠
+                  line 2's "10U Gold"). Confirm this is intended before creating.
+                </p>
+              )}
+              {linesData.map((ln) => {
+                const lineImages = ln.teams.reduce((s, t) => s + (t.image_count || 0), 0);
+                return (
+                  <div key={ln.line_name} style={{ marginTop: 12 }}>
+                    <h3 style={{ marginBottom: 4, fontSize: '1em' }}>
+                      {ln.line_name}
+                      <span className="muted" style={{ fontWeight: 'normal', fontSize: '0.9em' }}>
+                        {' '}· {ln.teams.length} team{ln.teams.length === 1 ? '' : 's'} · {lineImages} images
+                      </span>
+                    </h3>
+                    <ul className="folder-list">
+                      {ln.teams.map((f) => {
+                        const isDupe = dupeSet.has(normalizeTeamName(f.name));
+                        return (
+                          <li key={`${ln.line_name}\\${f.name}`}>
+                            <b>{f.name}</b>
+                            {isDupe && (
+                              <span
+                                style={{
+                                  marginLeft: 6, padding: '1px 6px',
+                                  background: '#fff3cd', color: '#856404',
+                                  border: '1px solid #ffeaa7', borderRadius: 3,
+                                  fontSize: '0.8em', fontWeight: 'bold',
+                                }}
+                                title="This team name appears in more than one line — post-fix each will land as its own session."
+                              >
+                                also in another line
+                              </span>
+                            )}
+                            <span className="muted"> · {f.subfolder_count} subfolders · {f.image_count} images · {f.raw_count} raws</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                );
+              })}
+            </>
+          ) : (
+            <>
+              <p>These look like the team folders:</p>
+              <ul className="folder-list">
+                {teamFolders.map((f) => (
+                  <li key={f.name}>
+                    <b>{f.name}</b>
+                    <span className="muted"> · {f.subfolder_count} subfolders · {f.image_count} images · {f.raw_count} raws</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="muted">{teamFolders.length} teams total.</p>
+            </>
+          )}
           <div className="actions">
             <button className="ghost" onClick={() => setStep('structure')}>← Back</button>
             <button disabled={busy} onClick={confirmTeams}>
               {busy
-                ? `Inspecting ${teamFolders.length} team folder${teamFolders.length === 1 ? '' : 's'}…`
+                ? `Inspecting ${totalTeams} team folder${totalTeams === 1 ? '' : 's'}…`
                 : 'Looks right →'}
             </button>
           </div>
         </section>
-      )}
+        );
+      })()}
 
       {/* Step 6: Image subfolder
           2026-06-08: surface the renditions-in-subfolder case. Job 55
