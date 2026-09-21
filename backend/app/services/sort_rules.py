@@ -7,18 +7,26 @@ Rules (order + pose, then NON-SMILING preference for the pano):
   1. Sort cluster images by capture_time ascending.
   2. Single-face images (face_count == 1) are candidates for team and pano.
   3. team = the last single-face image. No expression condition.
-  4. pano is chosen among the preceding single-face images that pass
-     is_acceptable_pose(), taken in "walk back from team" order (closest-to-
-     team first = the position prior for the pano pose). Among those
-     already-acceptable candidates a NON-smiling frame is PREFERRED (landmark
-     smile_score below threshold; see services/smile.py); the position prior
-     breaks ties. Non-smiling is a preference among acceptable poses only — it
-     never lets a badly-posed neutral shot beat a well-posed one. If EVERY
-     acceptable candidate is smiling, the best-positioned one is still picked
-     and 'pano_smiling_fallback' is flagged — pano is never left empty over
-     expression. If NO preceding single passes the pose check, pano stays None
-     with 'no_clean_pano_pose' (better to surface "pick one manually" than to
-     silently guess a bad pose).
+  4. pano candidates are single-face images captured BEFORE the FIRST
+     multi-face (group / "team photo") image in the cluster's capture
+     order, minus the team pick. Handles the alt shoot structure
+     (group shot first, individuals after: no pano candidate) and
+     the blink-reshoot case (group1, group2 reshoots: window ends at
+     group1). Fallback if the cluster has no multi-face image at all
+     (unusual): use the classic "before team pick" window. Among the
+     window's images, filter to is_acceptable_pose(), take latest-
+     first (closest-to-group / closest-to-team = the position prior
+     for the pano pose). Among those already-acceptable candidates a
+     NON-smiling frame is PREFERRED (landmark smile_score below
+     threshold; see services/smile.py); the position prior breaks
+     ties. Non-smiling is a preference among acceptable poses only —
+     it never lets a badly-posed neutral shot beat a well-posed one.
+     If EVERY acceptable candidate is smiling, the best-positioned
+     one is still picked and 'pano_smiling_fallback' is flagged —
+     pano is never left empty over expression. If NO preceding single
+     passes the pose check, pano stays None with 'no_clean_pano_pose'
+     (better to surface "pick one manually" than to silently guess a
+     bad pose).
   5. Multi-face images are always 'buddy'.
   6. Everything else in the cluster is 'individual'.
   7. If the cluster has no single-face images at all → review reason
@@ -136,16 +144,56 @@ def assign_roles(
         team_idx = None
 
     # ── Pano pick: acceptable pose + prefer non-smiling, position as tiebreak ─
+    #
+    # 2026-09-21 window refinement: pano candidates are single-face
+    # images captured strictly BEFORE the FIRST multi-face (group /
+    # "team photo") image in the cluster. Rationale:
+    #   - Alt shoot structure (group shot captured first, individual
+    #     poses after): under the old "walk back from team pick" window
+    #     a late-shot individual would be eligible as pano even though
+    #     it was captured AFTER the group shot. Now: no group-before
+    #     solos → no pano candidate, cluster flagged for manual pick.
+    #   - Blink-reshoot (individual poses → group1 → group2 reshoot):
+    #     the earliest group shot is the reference. Candidates =
+    #     individuals before group1 (same set as the classic behavior
+    #     for the standard shoot order, so no regression there).
+    #   - Late-reshoot solo AFTER the group is captured (operator
+    #     realises a solo was missed and reshoots it after the group):
+    #     the late solo is NOT eligible as pano. Under the old window,
+    #     it was — even though it's off-sequence for the pano-pose
+    #     capture.
+    # Fallback: cluster has zero multi-face images (unusual — a whole
+    # cluster of solos with no team-photo participation). Use the
+    # classic "before team pick" window so pano coverage doesn't
+    # regress on that shape.
     pano_idx: Optional[int] = None
     if manual_pano_idx is not None:
         pano_idx = manual_pano_idx
     elif team_idx is not None:
-        preceding_singles = [
-            i for i in auto_singles
-            if i < team_idx and i != manual_team_idx
-        ]
-        # Pose-acceptable candidates in "walk back from team" order
-        # (closest-to-team first) — this ordering IS the position prior.
+        first_group_idx = next(
+            (i for i, img in enumerate(ordered) if img.face_count >= 2),
+            None,
+        )
+        if first_group_idx is not None:
+            # Explicitly exclude both team_idx (auto team pick) and
+            # manual_team_idx — a solo before the group shot IS a
+            # pano candidate unless it's also the team pick.
+            preceding_singles = [
+                i for i in auto_singles
+                if i < first_group_idx
+                and i != team_idx
+                and i != manual_team_idx
+            ]
+        else:
+            # Classic window: no group shot exists in this cluster.
+            preceding_singles = [
+                i for i in auto_singles
+                if i < team_idx and i != manual_team_idx
+            ]
+        # Pose-acceptable candidates in "walk back" order (latest-first).
+        # For the group-window case the walk is "closest-to-first-group";
+        # for the fallback it's "closest-to-team" — same position prior
+        # semantic, different reference point.
         acceptable = [
             i for i in reversed(preceding_singles)
             if is_acceptable_pose(ordered[i].pose_metadata())

@@ -293,6 +293,133 @@ def test_unknown_expression_does_not_trigger_team_not_smiling_flag():
     assert "team_pick_not_smiling" not in r.review_reasons
 
 
+# ── 2026-09-21 pano window refinement: before FIRST group shot ────────────────
+#
+# Old rule: pano candidates were single-face images with index < team_idx.
+# New rule: candidates are single-face images before the FIRST multi-face
+# (group / "team photo") in capture order. Falls back to the old window
+# only when no multi-face image exists in the cluster.
+
+
+def test_pano_alt_structure_group_first_no_pano_candidate():
+    """Alt shoot structure: group photo captured FIRST, individual portraits
+    after. Old rule would have picked a "pano" from the late-shot
+    individuals (walking back from team_idx). New rule: no candidate
+    before the group shot → no_pano_candidate flagged.
+
+    Better to surface "pick manually" than silently guess a shot taken
+    AFTER the group photo when the operator's intent is "pano is the
+    neutral portrait BEFORE the group shot"."""
+    images = [
+        _rec(1, 1.0, 3, smile_score=_SMILING),   # group first (t=1)
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # solo after group
+        _rec(3, 3.0, 1, smile_score=_NEUTRAL),   # solo
+        _rec(4, 4.0, 1, smile_score=_SMILING),   # team pick (last solo)
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 4
+    assert r.panoramic_image_id is None, (
+        "New pano rule: no candidates BEFORE the first group shot → no pano. "
+        "Old rule wrongly picked from post-group solos."
+    )
+    assert "no_pano_candidate" in r.review_reasons
+
+
+def test_pano_blink_reshoot_group1_defines_the_window():
+    """Blink-reshoot: solos → group1 → group2 (reshoot). Pano candidates
+    are drawn from solos BEFORE group1 (not from between the reshoots
+    or after them). team_idx is still the last single-face image
+    (before either group shot); pano is the latest solo before group1."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=_SMILING),
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # neutral pano candidate
+        _rec(3, 3.0, 1, smile_score=_SMILING),   # team pick (last single-face)
+        _rec(4, 4.0, 2, smile_score=_SMILING),   # group1
+        _rec(5, 5.0, 2, smile_score=_SMILING),   # group2 reshoot
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 3
+    # Preceding-singles window (before first group at index 3, excluding
+    # team_idx=2): [0, 1]. Walk back: [1, 0]. Non-smiling: img2 (index 1).
+    assert r.panoramic_image_id == 2
+    assert "pano_smiling_fallback" not in r.review_reasons
+
+
+def test_pano_late_reshoot_solo_after_group_excluded():
+    """Mixed structure: solos → group → LATE reshoot solo. Old rule made
+    the late solo eligible as pano (i < team_idx). New rule excludes it
+    (i >= first_group_idx). Pano must come from solos BEFORE the group.
+
+    This is the load-bearing case for the "handles alt shoot structure"
+    part of the spec — a solo captured AFTER a group shot doesn't fit
+    the pano-pose position prior (it's not immediately-before-team;
+    it's a late-catchup shot)."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=_NEUTRAL),   # solo A
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # solo B — should win pano
+        _rec(3, 3.0, 2, smile_score=_SMILING),   # group at t=3
+        _rec(4, 4.0, 1, smile_score=_NEUTRAL),   # late-reshoot solo
+        _rec(5, 5.0, 1, smile_score=_SMILING),   # ANOTHER late solo (team pick)
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 5     # still last single-face
+    # Window: singles with i < first_group_idx (2), i != team_idx (4).
+    # That's [0, 1]. Walk back: [1, 0]. img2 (index 1) is neutral → pano.
+    assert r.panoramic_image_id == 2
+    # img4 (the late-reshoot solo) is 'individual', NOT pano.
+    assert r.roles[4] == "individual"
+
+
+def test_pano_fallback_window_when_no_group_shot():
+    """Regression: cluster of pure solos (no multi-face image anywhere)
+    falls back to the classic "before team pick" window. Same as
+    test_pano_prefers_nonsmiling_over_closer_smiling structure."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=_SMILING),
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),   # neutral pano
+        _rec(3, 3.0, 1, smile_score=_SMILING),
+        _rec(4, 4.0, 1, smile_score=_SMILING),   # team (last single-face)
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 4
+    # No multi-face → fallback to old window: preceding_singles<4 excluding
+    # team = [0, 1, 2]. Non-smiling: img2. Same as before the refinement.
+    assert r.panoramic_image_id == 2
+    assert "pano_smiling_fallback" not in r.review_reasons
+
+
+def test_pano_pure_alt_no_solos_before_group_no_candidate():
+    """Even edgier alt structure: no solos before group at all — only
+    solos after. Confirms `no_pano_candidate` fires cleanly."""
+    images = [
+        _rec(1, 1.0, 2, smile_score=_SMILING),   # group at t=1 (index 0)
+        _rec(2, 2.0, 1, smile_score=_NEUTRAL),
+        _rec(3, 3.0, 1, smile_score=_SMILING),   # team
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 3
+    assert r.panoramic_image_id is None
+    assert "no_pano_candidate" in r.review_reasons
+
+
+def test_pano_group_after_team_pick_same_as_classic():
+    """Standard shoot: solos → team pick (last single-face) → group
+    shot. first_group_idx sits AFTER team_idx. The window excludes
+    team_idx and everything from first_group_idx onward, matching the
+    classic "before team pick" behavior exactly (both give [0..team_idx-1]).
+    This is a regression guard for the most common shoot shape."""
+    images = [
+        _rec(1, 1.0, 1, smile_score=_SMILING),
+        _rec(2, 2.0, 1, smile_score=_SMILING),
+        _rec(3, 3.0, 1, smile_score=_NEUTRAL),   # pano candidate
+        _rec(4, 4.0, 1, smile_score=_SMILING),   # team (last single-face)
+        _rec(5, 5.0, 2, smile_score=_SMILING),   # group at end
+    ]
+    r = assign_roles(images)
+    assert r.team_image_id == 4
+    assert r.panoramic_image_id == 3
+
+
 # ── Coach sort variant ────────────────────────────────────────────────────────
 
 
