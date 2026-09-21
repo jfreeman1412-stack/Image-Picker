@@ -1058,32 +1058,54 @@ _ROLE_PRIORITY = {
 def _best_role(db: DbSession, image_id: int) -> Optional[str]:
     """An image can have ImageRole rows in several clusters (buddy shots).
     rejected wins (so a manually-rejected buddy can't sneak in); team/pano
-    win next so they reach their dedicated dirs."""
+    win next so they reach their dedicated dirs.
+
+    2026-09-21 (pano-export bug): manual_override=1 wins tier. When an
+    image has BOTH a manual override in one cluster and an auto role in
+    another, the manual intent honors first. Pre-fix, a kid's manually-
+    pinned pano lost to another cluster's auto team pick on the same
+    image (buddy-shot cross-cluster case), and the file exported to the
+    Team folder instead of Pano. Now: if any manual_override=1 row
+    exists for the image, only those participate in priority selection.
+    """
     roles = db.query(ImageRole).filter_by(image_id=image_id).all()
     if not roles:
         return None
-    return min(roles, key=lambda r: _ROLE_PRIORITY.get(r.role, 99)).role
+    manuals = [r for r in roles if r.manual_override]
+    pool = manuals if manuals else roles
+    return min(pool, key=lambda r: _ROLE_PRIORITY.get(r.role, 99)).role
 
 
 def _best_role_map(db: DbSession, image_ids: list[int]) -> dict[int, str]:
     """Bulk version of _best_role: one SQL fetch for all ImageRole rows,
     then resolve the priority winner per image in Python. Replaces N+1
     queries during export — for ~2,000 images that's a ~4,000× cut in
-    serial DB latency."""
+    serial DB latency.
+
+    2026-09-21 (pano-export bug): honors manual_override at the same
+    tier logic as _best_role above — if any manual_override=1 row exists
+    for the image, only manual rows compete for priority. Otherwise the
+    full role set competes. Ensures manual pano/team pins survive the
+    priority collapse even when the same image has auto roles across
+    other clusters (a buddy shot the operator pinned in one cluster
+    remains pinned even though it's assigned auto roles elsewhere).
+    """
     if not image_ids:
         return {}
     rows = (
-        db.query(ImageRole.image_id, ImageRole.role)
+        db.query(ImageRole.image_id, ImageRole.role, ImageRole.manual_override)
         .filter(ImageRole.image_id.in_(image_ids))
         .all()
     )
-    by_image: dict[int, list[str]] = {}
-    for image_id, role in rows:
-        by_image.setdefault(image_id, []).append(role)
-    return {
-        image_id: min(roles, key=lambda r: _ROLE_PRIORITY.get(r, 99))
-        for image_id, roles in by_image.items()
-    }
+    by_image: dict[int, list[tuple[str, int]]] = {}
+    for image_id, role, manual in rows:
+        by_image.setdefault(image_id, []).append((role, manual or 0))
+    out: dict[int, str] = {}
+    for image_id, role_pairs in by_image.items():
+        manuals = [p for p in role_pairs if p[1]]
+        pool = manuals if manuals else role_pairs
+        out[image_id] = min(pool, key=lambda p: _ROLE_PRIORITY.get(p[0], 99))[0]
+    return out
 
 
 def _face_count_map(db: DbSession, image_ids: list[int]) -> dict[int, int]:
