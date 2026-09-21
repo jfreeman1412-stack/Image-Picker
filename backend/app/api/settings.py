@@ -55,6 +55,15 @@ KNOWN_FLAGS = [
     # rostered for a DIFFERENT team than this session. When *visible*, it also
     # blocks "Mark reviewed & next" (toggle off → informational-only).
     "match_team_mismatch",
+    # 2026-09-21 override-survival (b): written by
+    # face_pipeline._mark_session_with_override_loss_flag when a pipeline
+    # re-run couldn't re-anchor some manual overrides (cluster split too
+    # much, merged with another, image drifted to a different cluster).
+    # Backend log holds the audit detail; this flag is the UI signal.
+    # STORED on Cluster.review_reason (on the session's largest surviving
+    # cluster). Operator can toggle off after they've reconciled the
+    # session and don't want the badge anymore.
+    "manual_overrides_lost_on_rerun",
 ]
 
 _FLAG_VIS_KEY = "flag_visibility"

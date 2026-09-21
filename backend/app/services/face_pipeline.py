@@ -236,6 +236,55 @@ def _restore_manual_state(
     return losses
 
 
+def _mark_session_with_override_loss_flag(
+    db: DbSession, session_id: int, loss_count: int,
+) -> None:
+    """Signal manual-override re-anchor losses to the operator.
+
+    Appends 'manual_overrides_lost_on_rerun' to the largest surviving
+    cluster's review_reason and sets needs_review=1. The session's
+    review-flag badge lights up on the JobDetail list, and opening the
+    session shows the chip on that cluster. Backend log holds the
+    detailed loss dict for the deep dive.
+
+    Idempotent: calling twice on the same session doesn't duplicate
+    the flag. No-op if the session has no clusters (shouldn't happen
+    after a normal pipeline run, but defensive against an empty
+    re-cluster edge case).
+
+    Called from _run_pipeline_locked AFTER sorting + outlier flagging
+    so `_sort_cluster`'s and outlier's `review_reason = ...` writes
+    don't overwrite this flag.
+    """
+    FLAG = "manual_overrides_lost_on_rerun"
+    largest = (
+        db.query(Cluster)
+        .filter_by(session_id=session_id)
+        .order_by(Cluster.image_count.desc(), Cluster.id.asc())
+        .first()
+    )
+    if largest is None:
+        logger.warning(
+            "[pipeline] session %s: %d override loss(es) but no clusters "
+            "to attach the flag to — check the log dicts above.",
+            session_id, loss_count,
+        )
+        return
+    reasons = [
+        r for r in (largest.review_reason or "").split(",") if r
+    ]
+    if FLAG not in reasons:
+        reasons.append(FLAG)
+    largest.review_reason = ",".join(reasons) if reasons else None
+    largest.needs_review = 1
+    db.commit()
+    logger.warning(
+        "[pipeline] session %s: flagged cluster %s with '%s' "
+        "(%d override(s) failed to re-anchor)",
+        session_id, largest.id, FLAG, loss_count,
+    )
+
+
 def _set_progress(db: DbSession, session: Session, stage: str, current: int, total: int) -> None:
     """Stamp progress on the session row. Committed so a separate read DB
     session in the API path sees the update mid-pipeline. Resets the
@@ -433,8 +482,12 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
         # _sort_cluster sees restored manual ImageRoles and preserves
         # them via its manual_override=1 branch). Overlap-based
         # matching by image_id, which IS stable across re-runs (Image
-        # rows are not touched by _clear_prior_results).
-        _restore_manual_state(db, session_id, override_snapshots)
+        # rows are not touched by _clear_prior_results). Losses captured
+        # here so the after-outlier-flagging step below can mark the
+        # session for operator review.
+        restore_losses = _restore_manual_state(
+            db, session_id, override_snapshots,
+        )
 
         # ── Step 4b: coach detection ────────────────────────────────────────
         _set_progress(db, session, "coach_check", 0, 0)
@@ -558,6 +611,20 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
                 c.needs_review = 1
                 c.review_reason = f.reason
         db.commit()
+
+        # 2026-09-21 override-survival (b): surface any manual-override
+        # re-anchor losses to the operator via a review flag on the
+        # largest surviving cluster. Placed AFTER sorting + outlier
+        # flagging so those stages don't overwrite review_reason.
+        # The pipeline log still holds the detail dict (old_cluster_id,
+        # member_image_count, best_overlap, min_required, reason) for
+        # the audit trail; this UI flag is the "you must look" signal
+        # for the operator's session-list badge count.
+        if restore_losses:
+            _mark_session_with_override_loss_flag(
+                db, session_id, len(restore_losses),
+            )
+
         _log_stage(session.name, "flagging", stage_start)
 
         logger.warning(

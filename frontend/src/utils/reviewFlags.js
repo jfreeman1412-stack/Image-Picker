@@ -26,6 +26,11 @@ export const FLAG_LABELS = {
   match_label_conflict: 'Match / label conflict',
   low_confidence_match: 'Low-confidence match',
   match_team_mismatch: 'Matched to another team',
+  // 2026-09-21 override-survival (b): pipeline re-run couldn't preserve
+  // some of the operator's manual corrections (label/coach/pano pin)
+  // because clusters split or merged during re-clustering. Detail is
+  // in the backend log; this chip is the "look at this session" signal.
+  manual_overrides_lost_on_rerun: 'Manual corrections lost in re-run — recheck',
 };
 
 // Label for one flag code, falling back to the raw code.

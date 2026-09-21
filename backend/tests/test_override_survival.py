@@ -28,6 +28,7 @@ from app.models.db_models import (
 )
 from app.services.face_pipeline import (
     _snapshot_manual_state, _restore_manual_state,
+    _mark_session_with_override_loss_flag,
 )
 
 
@@ -337,6 +338,155 @@ def test_restore_no_snapshots_is_noop(db):
     assert new.manual_coach_override == 0
     assert new.accepted_cross_team == 0
     assert db.query(ImageRole).filter_by(cluster_id=new.id).count() == 0
+
+
+# ── (b) 2026-09-21: loss-visibility flag on the largest cluster ─────────
+#
+# When _restore_manual_state returns losses, _run_pipeline_locked calls
+# _mark_session_with_override_loss_flag AFTER outlier flagging to set a
+# review flag on the largest surviving cluster. The flag is
+# 'manual_overrides_lost_on_rerun' — a KNOWN_FLAGS entry that lights up
+# the JobDetail badge count so the operator knows to re-check that
+# session instead of trusting the re-run's output blindly.
+
+
+def test_loss_flag_marks_largest_cluster_needs_review(db):
+    """Session with 3 clusters of different sizes → the LARGEST gets
+    the flag, the others stay clean."""
+    s = _session(db)
+    imgs = _images(db, s, 9)
+    # Cluster sizes: 5, 3, 1.
+    _cluster(db, s, imgs[0:5])
+    small = _cluster(db, s, imgs[5:8])
+    tiny = _cluster(db, s, imgs[8:9])
+    # Set image_count so ORDER BY image_count DESC picks the biggest
+    # deterministically (the _cluster helper already does this).
+    _mark_session_with_override_loss_flag(db, s.id, loss_count=2)
+
+    clusters = db.query(Cluster).filter_by(session_id=s.id).all()
+    largest = max(clusters, key=lambda c: c.image_count)
+    assert largest.needs_review == 1
+    assert largest.review_reason == "manual_overrides_lost_on_rerun"
+    for c in clusters:
+        if c.id != largest.id:
+            assert c.needs_review == 0
+            assert c.review_reason is None
+
+
+def test_loss_flag_appended_to_existing_review_reason(db):
+    """Sorting/outlier stages might have written a review_reason on the
+    largest cluster before this helper runs (e.g. 'pano_smiling_fallback').
+    The helper APPENDS, never overwrites."""
+    s = _session(db)
+    imgs = _images(db, s, 5)
+    c = _cluster(db, s, imgs)
+    c.review_reason = "pano_smiling_fallback"
+    c.needs_review = 1
+    db.commit()
+
+    _mark_session_with_override_loss_flag(db, s.id, loss_count=1)
+
+    db.refresh(c)
+    reasons = c.review_reason.split(",")
+    assert "pano_smiling_fallback" in reasons
+    assert "manual_overrides_lost_on_rerun" in reasons
+
+
+def test_loss_flag_idempotent_no_duplicate_on_second_call(db):
+    """Calling twice (e.g., someone runs the pipeline again without
+    fixing losses) doesn't stack duplicates of the flag."""
+    s = _session(db)
+    imgs = _images(db, s, 4)
+    _cluster(db, s, imgs)
+
+    _mark_session_with_override_loss_flag(db, s.id, loss_count=1)
+    _mark_session_with_override_loss_flag(db, s.id, loss_count=1)
+
+    largest = db.query(Cluster).filter_by(session_id=s.id).first()
+    assert largest.review_reason.count("manual_overrides_lost_on_rerun") == 1
+
+
+def test_loss_flag_noop_when_session_has_no_clusters(db):
+    """A session with zero clusters (unusual — the pipeline shouldn't
+    reach this helper on an empty session) is a silent no-op, not a
+    crash. Logs a warning instead."""
+    s = _session(db)
+    # No _cluster() call — zero clusters in the session.
+    _mark_session_with_override_loss_flag(db, s.id, loss_count=2)
+    # No crash, and no cluster to check.
+    assert db.query(Cluster).filter_by(session_id=s.id).count() == 0
+
+
+def test_lossy_restore_when_wired_to_flag_helper_lights_up(db):
+    """End-to-end for the (b) surface: seed manual state that will be
+    dropped by re-clustering (low-overlap scatter — the reproducible
+    loss scenario), run snapshot → wipe/re-cluster → restore → call
+    the flag helper with the losses count exactly the way
+    _run_pipeline_locked does. Assert the largest cluster is flagged."""
+    s = _session(db)
+    imgs = _images(db, s, 6)
+    _cluster(db, s, imgs, manual_label="Eleanor")
+    snaps = _snapshot_manual_state(db, s.id)
+
+    # Scatter the 6 old images into 3 tiny new clusters of 2 each →
+    # no single new cluster has 3+ overlap with the 6-member snapshot
+    # (threshold = max(1, 6//2) = 3). One overlap of 2 falls below it.
+    routing = {img.id: f"tiny_{i // 2}" for i, img in enumerate(imgs)}
+    _reroute_faces(db, s.id, routing)
+    losses = _restore_manual_state(db, s.id, snaps)
+    assert len(losses) == 1, "test harness didn't produce a loss"
+
+    # Simulate the run_pipeline hook exactly.
+    _mark_session_with_override_loss_flag(db, s.id, len(losses))
+
+    # The largest of the 3 new clusters (all size 2 — any of them by
+    # id-asc tiebreak) has the flag.
+    clusters = db.query(Cluster).filter_by(session_id=s.id).all()
+    flagged = [c for c in clusters
+               if c.review_reason
+               and "manual_overrides_lost_on_rerun" in c.review_reason]
+    assert len(flagged) == 1
+    assert flagged[0].needs_review == 1
+
+
+def test_clean_restore_does_not_flag_anything(db):
+    """The negative — clean re-run with no losses must NOT light any
+    review flag. Snapshot has perfect overlap with the new cluster →
+    losses list is empty → helper is not called (pipeline check
+    guards this) → no flag anywhere in the session."""
+    s = _session(db)
+    imgs = _images(db, s, 4)
+    _cluster(db, s, imgs, manual_label="Alice")
+    snaps = _snapshot_manual_state(db, s.id)
+
+    # Perfect match — all 4 images land in one new cluster.
+    _reroute_faces(db, s.id, {img.id: "A_prime" for img in imgs})
+    losses = _restore_manual_state(db, s.id, snaps)
+    assert losses == []
+
+    # Simulate the run_pipeline guard: only call flag helper on losses.
+    if losses:
+        _mark_session_with_override_loss_flag(db, s.id, len(losses))
+
+    clusters = db.query(Cluster).filter_by(session_id=s.id).all()
+    for c in clusters:
+        assert c.needs_review == 0, (
+            "clean re-run wrongly set needs_review — helper must be "
+            "gated on losses being non-empty"
+        )
+        assert (c.review_reason or "").find(
+            "manual_overrides_lost_on_rerun"
+        ) == -1
+
+
+def test_loss_flag_in_known_flags_registry(db):
+    """The flag code must appear in settings.KNOWN_FLAGS so the
+    visibility map, filter_visible_reasons, and the frontend chip
+    all know about it. Without this registration, the flag STORES
+    on Cluster.review_reason but hides from the UI — the failure mode
+    (b) is meant to prevent."""
+    from app.api.settings import KNOWN_FLAGS
+    assert "manual_overrides_lost_on_rerun" in KNOWN_FLAGS
 
 
 def test_restore_drifted_image_does_not_carry_role(db):
