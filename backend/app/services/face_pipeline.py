@@ -68,6 +68,174 @@ _CLUSTERING_BATCH = 25   # commit every 25 faces processed
 _SORTING_BATCH = 5       # commit every 5 clusters sorted
 
 
+# 2026-09-21 override-survival (Option 1) helpers. See _run_pipeline_locked
+# for how these bracket the destructive re-cluster; they are the load-
+# bearing preservation of manual_label / manual_coach_override /
+# accepted_cross_team / manual-override ImageRole rows across a full
+# pipeline re-run. Design decisions:
+#   - Match by IMAGE-SET OVERLAP (Image.id is stable across re-runs;
+#     Cluster.id and Face.id are not — _clear_prior_results deletes
+#     those rows).
+#   - Greedy assignment, largest snapshot first: when two old clusters
+#     would want the same new cluster (merge), the one with more images
+#     wins. The runner-up's overrides are LOST — logged for the audit
+#     trail. This is a documented trade-off; Option 2 (a durable
+#     operator-intent table) would eliminate it if we build it later.
+#   - Overlap threshold: at least max(1, len(members)//2). Chosen so a
+#     small snapshot (5 images) needs 3+ overlap and a large one (20)
+#     needs 10+. Prevents accidental attribution when re-clustering
+#     radically reshapes membership (e.g. a cluster explodes into 6
+#     new tiny clusters — no single one has enough of the old set).
+#   - Manual ImageRoles: re-created on the winning new cluster ONLY for
+#     images that actually landed there. Images that drifted to a
+#     DIFFERENT new cluster don't carry their manual role — they get
+#     an auto role from _sort_cluster in the drifted cluster. This is
+#     the correct fallback: keying a manual role to (image_id, role) is
+#     meaningful only in the context of a specific player-cluster; if
+#     the image is now on a different player, the operator's original
+#     "role = pano on Alice" doesn't translate to "role = pano on Bob."
+def _snapshot_manual_state(db: DbSession, session_id: int) -> list[dict]:
+    """Capture every manual override on the session's clusters BEFORE
+    _clear_prior_results wipes them. Returns a list of dicts, one per
+    old cluster that had any manual state. Clusters with no manual
+    state at all are skipped (nothing to restore later).
+    """
+    snapshots: list[dict] = []
+    clusters = db.query(Cluster).filter_by(session_id=session_id).all()
+    for c in clusters:
+        manual_roles = (
+            db.query(ImageRole)
+            .filter_by(cluster_id=c.id, manual_override=1)
+            .all()
+        )
+        has_cluster_state = (
+            c.manual_label is not None
+            or (c.manual_coach_override or 0) != 0
+            or (c.accepted_cross_team or 0) != 0
+        )
+        if not has_cluster_state and not manual_roles:
+            continue
+        member_image_ids = {
+            f.image_id
+            for f in db.query(Face).filter_by(cluster_id=c.id).all()
+        }
+        snapshots.append({
+            "old_cluster_id": c.id,
+            "member_image_ids": member_image_ids,
+            "manual_label": c.manual_label,
+            "manual_coach_override": c.manual_coach_override or 0,
+            "accepted_cross_team": c.accepted_cross_team or 0,
+            "manual_role_picks": [
+                (r.image_id, r.role) for r in manual_roles
+            ],
+        })
+    if snapshots:
+        logger.info(
+            "[pipeline] session %s: snapshotted %d cluster(s) with manual state",
+            session_id, len(snapshots),
+        )
+    return snapshots
+
+
+def _restore_manual_state(
+    db: DbSession, session_id: int, snapshots: list[dict],
+) -> list[dict]:
+    """After re-clustering, re-attach each snapshot's manual state to
+    the new cluster with the largest image-set overlap. Returns a list
+    of loss reports (snapshots that couldn't find a good-enough match)
+    for logging. See module docstring above for threshold + tie-break
+    rationale.
+    """
+    if not snapshots:
+        return []
+
+    # Build new_cluster_id -> {image_ids} via Face rows. An image with
+    # faces in multiple new clusters appears in each set (accurate for
+    # buddy shots — overlap counts them once per membership).
+    face_rows = (
+        db.query(Face.image_id, Face.cluster_id)
+        .join(Image, Image.id == Face.image_id)
+        .filter(Image.session_id == session_id)
+        .all()
+    )
+    new_cluster_images: dict[int, set[int]] = {}
+    for image_id, cluster_id in face_rows:
+        if cluster_id is None:
+            continue
+        new_cluster_images.setdefault(cluster_id, set()).add(image_id)
+
+    used_new_cluster_ids: set[int] = set()
+    losses: list[dict] = []
+    # Larger snapshots pick first — if two old clusters contend for the
+    # same new one (merge case), the bigger one keeps its state.
+    for snap in sorted(
+        snapshots, key=lambda s: -len(s["member_image_ids"]),
+    ):
+        member_ids: set[int] = snap["member_image_ids"]
+        if not member_ids:
+            losses.append({
+                "old_cluster_id": snap["old_cluster_id"],
+                "reason": "empty_snapshot",
+            })
+            continue
+        best_cid, best_overlap = None, 0
+        for new_cid, new_images in new_cluster_images.items():
+            if new_cid in used_new_cluster_ids:
+                continue
+            overlap = len(member_ids & new_images)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_cid = new_cid
+        min_overlap = max(1, len(member_ids) // 2)
+        if best_cid is None or best_overlap < min_overlap:
+            losses.append({
+                "old_cluster_id": snap["old_cluster_id"],
+                "member_image_count": len(member_ids),
+                "best_overlap": best_overlap,
+                "min_required": min_overlap,
+                "reason": "no_matching_new_cluster",
+            })
+            continue
+        used_new_cluster_ids.add(best_cid)
+        new_cluster = db.query(Cluster).get(best_cid)
+        if snap["manual_label"] is not None:
+            new_cluster.manual_label = snap["manual_label"]
+        if snap["manual_coach_override"] != 0:
+            new_cluster.manual_coach_override = snap["manual_coach_override"]
+        if snap["accepted_cross_team"] != 0:
+            new_cluster.accepted_cross_team = snap["accepted_cross_team"]
+        # Manual ImageRoles are re-created ONLY for images that actually
+        # landed in this new cluster. Drifted images get auto roles from
+        # their new cluster's _sort_cluster pass — this preserves the
+        # ImageRole PK invariant (image_id, cluster_id) while honoring
+        # the operator's intent for majority-carry-over images.
+        new_member_images = new_cluster_images.get(best_cid, set())
+        for image_id, role in snap["manual_role_picks"]:
+            if image_id in new_member_images:
+                db.add(ImageRole(
+                    image_id=image_id,
+                    cluster_id=best_cid,
+                    role=role,
+                    manual_override=1,
+                ))
+    db.commit()
+
+    if losses:
+        logger.warning(
+            "[pipeline] session %s: %d manual override(s) could not be "
+            "re-anchored after re-clustering — see conversation trail: %s",
+            session_id, len(losses), losses,
+        )
+    else:
+        # Emit even the happy-path count so restore activity is visible
+        # in the pipeline log without spelunking through DB state.
+        logger.info(
+            "[pipeline] session %s: re-anchored %d snapshot(s) to new clusters",
+            session_id, len(snapshots),
+        )
+    return losses
+
+
 def _set_progress(db: DbSession, session: Session, stage: str, current: int, total: int) -> None:
     """Stamp progress on the session row. Committed so a separate read DB
     session in the API path sees the update mid-pipeline. Resets the
@@ -130,6 +298,20 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
     pipeline_start = time.monotonic()
 
     try:
+        # 2026-09-21 override-survival (Option 1): snapshot manual state
+        # BEFORE the wipe so we can re-anchor it to the new clusters
+        # after re-clustering. Closes the "manual coach override wiped
+        # by force run-all" bug (operator hand-fixes labels, someone
+        # force-reruns, corrections gone) and the sibling "pano pick
+        # lost on re-run" symptom. Image-set-overlap re-anchor trades
+        # absolute fidelity (cluster splits/merges lose some overrides
+        # by design — logged as losses) for zero schema change and
+        # containment to the pipeline function. See face_pipeline
+        # override-survival investigation for the alternative Option 2
+        # (durable operator-intent table) as a possible follow-up if
+        # this heuristic loses too much state in practice.
+        override_snapshots = _snapshot_manual_state(db, session_id)
+
         _clear_prior_results(db, session_id)
 
         # ── Step 1–2: detect faces, persist Face rows ────────────────────────
@@ -244,6 +426,15 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
                     db.commit()
             db.commit()
         stage_start = _log_stage(session.name, "clustering", stage_start)
+
+        # 2026-09-21 override-survival: re-anchor manual state to the
+        # new clusters BEFORE coach detection (so is_coach_for_sort
+        # sees restored manual_coach_override) and BEFORE sorting (so
+        # _sort_cluster sees restored manual ImageRoles and preserves
+        # them via its manual_override=1 branch). Overlap-based
+        # matching by image_id, which IS stable across re-runs (Image
+        # rows are not touched by _clear_prior_results).
+        _restore_manual_state(db, session_id, override_snapshots)
 
         # ── Step 4b: coach detection ────────────────────────────────────────
         _set_progress(db, session, "coach_check", 0, 0)
