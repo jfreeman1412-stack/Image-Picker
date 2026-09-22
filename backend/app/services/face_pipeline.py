@@ -29,7 +29,9 @@ from app.models.db_models import Session, Image, Face, Cluster, ImageRole
 from app.services import face_detector, cluster as clustering, expression
 from app.services.sort_rules import ImageRecord, assign_roles, assign_roles_coach
 from app.services.outliers import flag_outliers
-from app.services.coach_detection import detect_coaches
+from app.services.coach_detection import (
+    detect_coaches, detect_coaches_evidence,
+)
 from app.services.labeling import derive_cluster_label
 from app.services.cluster_matching import match_session_clusters
 
@@ -234,6 +236,123 @@ def _restore_manual_state(
             session_id, len(snapshots),
         )
     return losses
+
+
+def _apply_rule_b_partner_veto(
+    db: DbSession,
+    session_id: int,
+    coach_evidence: dict[int, frozenset[str]],
+) -> None:
+    """Bug 1 fix (2026-09-21): un-flag Rule-B-only coach clusters when
+    100% of their buddy-shot partners are already-classified PLAYER
+    clusters (either auto is_likely_coach=0 or manual_coach_override=-1).
+
+    Rationale: Rule B (single_face_count<=3 AND multi_face_count>=2) is
+    the composition heuristic — "few solos, appears in buddy shots =
+    coach". It correctly catches real coaches whose main presence is in
+    group photos, but it can't distinguish that from "kid who only got
+    captured in buddy shots" — both look identical in composition alone.
+
+    Signal: for every buddy shot the flagged cluster participates in,
+    check who ELSE is in the shot. If EVERY partner face belongs to a
+    known player cluster (no coaches, no orphans, no unknowns), this
+    cluster is almost certainly a buddy-only kid, not a coach.
+
+    Only applies to Rule-B-ONLY clusters. If Rule A (age) or Rule C
+    (singleton) also fires, we keep the flag — those rules carry an
+    independent signal (adult age estimate, or the workflow-rule
+    singleton). Rule B alone with all-player partners is the false-
+    positive pattern; anything else is genuine or ambiguous.
+
+    Session 1174 cluster 15312 verification: 4 buddy shots, all paired
+    with cluster 15311 (a player: 7 imgs, 5 solo). Rules_fired={B}
+    (age median 21 < 25 so A doesn't fire; count=4 so C doesn't fire).
+    All partners are players → veto → un-flag.
+
+    Snapshot is-coach state before iterating so vetos don't cascade
+    (if A vetos B, B's still counted as coach for A's veto check).
+    Single-pass by design — cascading vetos would open a can of worms
+    about ordering + convergence guarantees; the observed bug is a
+    single-level pattern.
+    """
+    session_clusters = db.query(Cluster).filter_by(session_id=session_id).all()
+    if not session_clusters:
+        return
+
+    def _pre_is_coach(c: Cluster) -> bool:
+        if c.manual_coach_override == 1: return True
+        if c.manual_coach_override == -1: return False
+        return bool(c.is_likely_coach)
+
+    pre_is_coach = {c.id: _pre_is_coach(c) for c in session_clusters}
+
+    # Bulk-load faces once — avoids O(clusters × faces_per_cluster) queries.
+    all_faces = (
+        db.query(Face)
+        .join(Image, Image.id == Face.image_id)
+        .filter(Image.session_id == session_id)
+        .all()
+    )
+    faces_by_image: dict[int, list] = {}
+    faces_by_cluster: dict[int, list] = {}
+    for f in all_faces:
+        faces_by_image.setdefault(f.image_id, []).append(f)
+        if f.cluster_id is not None:
+            faces_by_cluster.setdefault(f.cluster_id, []).append(f)
+
+    vetoed: list[dict] = []
+    only_b = frozenset({"B"})
+    for c in session_clusters:
+        if coach_evidence.get(c.id, frozenset()) != only_b:
+            continue
+        # Cluster's is_likely_coach must currently be 1 (safety — Rule
+        # B alone should have set it, but defensively skip if manual
+        # override already resolved to non-coach).
+        if not _pre_is_coach(c):
+            continue
+
+        partner_cluster_ids: set[int] = set()
+        buddy_shot_count = 0
+        for f in faces_by_cluster.get(c.id, []):
+            image_faces = faces_by_image.get(f.image_id, [])
+            if len(image_faces) < 2:
+                continue     # solo shot — not a buddy
+            buddy_shot_count += 1
+            for other in image_faces:
+                if other.cluster_id is not None and other.cluster_id != c.id:
+                    partner_cluster_ids.add(other.cluster_id)
+
+        if not partner_cluster_ids:
+            # No known partners (all partner faces are orphans, or the
+            # cluster has zero multi-face images somehow). Don't veto.
+            continue
+
+        # ALL partners must be known players (pre_is_coach = False).
+        # A partner missing from pre_is_coach (unknown cluster from a
+        # different session — shouldn't happen but defensive) counts as
+        # NOT-known-player, blocking the veto.
+        all_partners_are_players = all(
+            (pid in pre_is_coach) and (pre_is_coach[pid] is False)
+            for pid in partner_cluster_ids
+        )
+        if not all_partners_are_players:
+            continue
+
+        c.is_likely_coach = 0
+        vetoed.append({
+            "cluster_id": c.id,
+            "buddy_shot_count": buddy_shot_count,
+            "partner_cluster_ids": sorted(partner_cluster_ids),
+        })
+
+    if vetoed:
+        db.commit()
+        logger.info(
+            "[pipeline] session %s: Bug-1 partner-veto un-flagged %d "
+            "Rule-B-only coach cluster(s) (all buddy partners are known "
+            "players): %s",
+            session_id, len(vetoed), vetoed,
+        )
 
 
 def _mark_session_with_override_loss_flag(
@@ -517,9 +636,22 @@ def _run_pipeline_locked(db: DbSession, session_id: int) -> None:
         cluster_sizes = [d["image_count"] for d in clusters_data]
         session_median = int(statistics.median(cluster_sizes)) if cluster_sizes else 0
         coach_flags = detect_coaches(clusters_data, session_median)
+        coach_evidence = detect_coaches_evidence(clusters_data, session_median)
         for c in session.clusters:
             c.is_likely_coach = 1 if coach_flags.get(c.id, False) else 0
         db.commit()
+
+        # 2026-09-21 Bug 1 partner-veto pass: un-flag Rule-B-only coach
+        # clusters whose 100% of buddy-shot partners are already-classified
+        # PLAYER clusters. Catches the "buddy-only kid" false-positive
+        # (session 1174 cluster 15312: 4 buddy shots, all with cluster
+        # 15311 who has 5 solos → clearly a player → 15312 is likely also
+        # a kid). Preserves Rule A/C flagged coaches unchanged, and
+        # preserves any Rule-B firing where at least one partner is a
+        # coach or unknown/orphan (real coaches don't exclusively buddy
+        # with one confirmed player).
+        _apply_rule_b_partner_veto(db, session_id, coach_evidence)
+
         stage_start = _log_stage(session.name, "coach_check", stage_start)
 
         # ── Step 4c: copyright auto-labeling ────────────────────────────────

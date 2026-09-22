@@ -128,3 +128,57 @@ def detect_coaches(
 
         out[cid] = bool(rule_a or rule_b or rule_c)
     return out
+
+
+def detect_coaches_evidence(
+    clusters_data: List[dict],
+    session_median_count: int,
+) -> dict[int, frozenset[str]]:
+    """2026-09-21 Bug 1 support: same rule evaluation as detect_coaches,
+    but returns the SET of rule names that fired for each cluster (a
+    subset of {"A", "B", "C"}). An empty frozenset means no rule fired
+    (cluster is not a coach).
+
+    Kept as a separate function so `detect_coaches` retains its
+    {cluster_id: bool} back-compat return shape — no churn to the
+    existing 26-test coach_detection suite. The two share
+    implementation via the internal `_evaluate_rules` helper below.
+
+    face_pipeline's Bug-1 partner-veto pass reads this to distinguish
+    "Rule B alone fired" (candidate for veto) from "Rule A or C fired
+    too" (real coach signal — leave alone).
+    """
+    count_threshold = max(MIN_COUNT_FLOOR, session_median_count * COUNT_FRACTION_OF_MEDIAN)
+    out: dict[int, frozenset[str]] = {}
+    for c in clusters_data:
+        out[c["cluster_id"]] = _evaluate_rules(c, count_threshold)
+    return out
+
+
+def _evaluate_rules(cluster: dict, count_threshold: float) -> frozenset[str]:
+    """Return the frozenset of rule names ({"A", "B", "C"} subset) that
+    fire on the given cluster. Same logic as the loop body of
+    detect_coaches — kept separate so both entrypoints stay in lockstep."""
+    count = cluster["image_count"]
+    ages = [a for a in cluster.get("ages", []) if a is not None]
+    multi = cluster.get("multi_face_count")
+    single = cluster.get("single_face_count")
+
+    rule_a = (
+        bool(ages)
+        and statistics.median(ages) >= AGE_THRESHOLD
+        and count <= count_threshold
+        and multi is not None and multi >= 1
+    )
+    rule_b = (
+        single is not None and multi is not None
+        and single <= MAX_SINGLE_FACE_FOR_COACH
+        and multi >= MIN_MULTI_FACE_FOR_COACH
+    )
+    rule_c = count == 1
+
+    fired: set[str] = set()
+    if rule_a: fired.add("A")
+    if rule_b: fired.add("B")
+    if rule_c: fired.add("C")
+    return frozenset(fired)
