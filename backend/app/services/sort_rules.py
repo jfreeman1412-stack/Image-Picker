@@ -267,14 +267,23 @@ def assign_roles_coach(
     Coach clusters often contain only buddy/team-pose shots after the
     coach-exclusion filter has removed images that belong to players' clusters.
     Rules:
-      - team = last image in capture order, regardless of face_count or expression
-      - panoramic = None (coaches don't get a panoramic)
-      - everything else = individual
-      - if cluster is empty after coach-exclusion filter, needs_review with
-        reason='coach_no_solo_image'
+      - team = last SINGLE-FACE image in capture order (2026-09-21 Bug 2
+        export fix: must be a solo, not a buddy shot — a group photo
+        wrongly tagged 'team' leaks into the Team Images folder for
+        team-composite production, and the compositor doesn't expect
+        buddy shots there. Was: last image regardless of face_count).
+      - Multi-face images stay 'buddy' (same as assign_roles), never
+        'individual' — a buddy shot is a buddy shot in either variant.
+      - panoramic = None (coaches don't get a panoramic).
+      - Single-face non-team images = 'individual'.
+      - If cluster is empty after coach-exclusion filter, OR has ONLY
+        buddy shots left (no single-face for a team pick), needs_review
+        with reason='coach_no_solo_image'. Operator resolves via manual
+        team pin.
 
     Manual overrides win the same way as in assign_roles: a manually 'team'
-    image stays team, and overridden images are excluded from the auto pool.
+    image stays team (even if it's a buddy shot — operator's explicit
+    choice), and overridden images are excluded from the auto pool.
     """
     if not images:
         return SortResult(
@@ -292,13 +301,32 @@ def assign_roles_coach(
     if manual_team_id is not None:
         team_image_id = manual_team_id
     else:
-        auto_pool = [img for img in ordered if img.image_id not in manual_roles]
+        # 2026-09-21 Bug 2 export fix: filter to single-face candidates so
+        # a multi-face buddy shot at the end of the coach's capture
+        # sequence never becomes the team pick. Pre-fix produced 327
+        # wrong-role rows across 135 sessions (buddy shots in coach
+        # clusters exported to Team Images folder via role priority).
+        auto_pool = [
+            img for img in ordered
+            if img.image_id not in manual_roles and img.face_count == 1
+        ]
         team_image_id = auto_pool[-1].image_id if auto_pool else None
+
+    review_reasons: list[str] = []
+    if team_image_id is None:
+        # After the single-face filter this fires whenever a coach cluster
+        # has ONLY buddy shots (no solo). Operator picks manually via
+        # set-role — same UX as `no_pano_pick` / `no_team_pick`.
+        review_reasons.append("coach_no_solo_image")
 
     roles: dict = {}
     for img in ordered:
         if img.image_id in manual_roles:
             roles[img.image_id] = manual_roles[img.image_id]
+        elif img.face_count > 1:
+            # Multi-face stays buddy in the coach variant too. Prevents
+            # the wrong-role export leak (Bug 2, 2026-09-21).
+            roles[img.image_id] = "buddy"
         elif img.image_id == team_image_id:
             roles[img.image_id] = "team"
         else:
@@ -308,6 +336,6 @@ def assign_roles_coach(
         roles=roles,
         team_image_id=team_image_id,
         panoramic_image_id=None,
-        needs_review=False,
-        review_reasons=[],
+        needs_review=bool(review_reasons),
+        review_reasons=review_reasons,
     )

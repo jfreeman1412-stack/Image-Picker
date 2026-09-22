@@ -423,19 +423,51 @@ def test_pano_group_after_team_pick_same_as_classic():
 # ── Coach sort variant ────────────────────────────────────────────────────────
 
 
-def test_coach_last_image_is_team_even_buddy():
-    """Coach's last image is team, regardless of face_count or expression."""
+def test_coach_last_single_face_is_team_buddy_at_end_stays_buddy():
+    """2026-09-21 Bug 2 export fix: a buddy shot at the end of a coach
+    cluster's capture sequence is NOT picked as team anymore — team is
+    the last SINGLE-FACE image. The buddy shot stays 'buddy'.
+
+    Pre-fix, image 3 (face_count=2) was tagged 'team', which leaked
+    into the Team Images export folder for team-composite production.
+    Post-fix, image 2 (last single-face) is team; image 3 is buddy.
+    """
     images = [
         _rec(1, 1.0, 1, "smiling"),
-        _rec(2, 2.0, 1, "serious"),
-        _rec(3, 3.0, 2, "smiling"),   # buddy at end — still team for coach
+        _rec(2, 2.0, 1, "serious"),   # last single-face → team
+        _rec(3, 3.0, 2, "smiling"),   # buddy at end → stays buddy, NOT team
     ]
     r = assign_roles_coach(images)
-    assert r.team_image_id == 3
-    assert r.panoramic_image_id is None
-    assert r.roles[3] == "team"
+    assert r.team_image_id == 2, "team pick should be the last single-face, not the buddy"
+    assert r.roles[3] == "buddy", (
+        "buddy shot in coach cluster stayed 'individual' (or worse, 'team') — "
+        "the export leak into Team Images is back"
+    )
+    assert r.roles[2] == "team"
     assert r.roles[1] == "individual"
+    assert r.panoramic_image_id is None
     assert not r.needs_review
+
+
+def test_coach_buddy_only_cluster_flags_no_solo():
+    """Coach cluster with ONLY buddy shots (no single-face after coach-
+    exclusion filter): no team pick, needs_review with coach_no_solo_image.
+    Operator resolves via manual set-role. Was previously
+    'last-buddy-becomes-team', which polluted Team Images."""
+    images = [
+        _rec(1, 1.0, 2, "smiling"),   # buddy
+        _rec(2, 2.0, 3, "smiling"),   # buddy
+        _rec(3, 3.0, 2, "smiling"),   # buddy at end — NO LONGER auto-tagged team
+    ]
+    r = assign_roles_coach(images)
+    assert r.team_image_id is None, (
+        "buddy-only coach cluster wrongly auto-picked a team — export "
+        "will leak this buddy shot into Team Images"
+    )
+    for i in (1, 2, 3):
+        assert r.roles[i] == "buddy"
+    assert r.needs_review
+    assert "coach_no_solo_image" in r.review_reasons
 
 
 def test_coach_no_images_needs_review():
@@ -447,14 +479,50 @@ def test_coach_no_images_needs_review():
 
 
 def test_coach_picks_in_capture_order_not_input_order():
-    """Coach team-pick is last by capture_time, not last in list."""
+    """Coach team-pick is last SINGLE-FACE by capture_time, not last in
+    input list."""
     images = [
-        _rec(99, 5.0, 1, "smiling"),
+        _rec(99, 5.0, 1, "smiling"),   # latest single-face → team
         _rec(1, 1.0, 1, "smiling"),
         _rec(50, 3.0, 1, "serious"),
     ]
     r = assign_roles_coach(images)
     assert r.team_image_id == 99
+
+
+def test_coach_manual_team_on_buddy_shot_still_wins():
+    """Operator's explicit choice: manually pinning a buddy shot as
+    'team' still applies (operator's intent > auto-safety heuristic).
+    The auto-picker's face_count==1 filter doesn't apply to manual
+    picks — that's a set-role decision the operator owns."""
+    images = [
+        _rec(1, 1.0, 1, "smiling"),
+        _rec(2, 2.0, 2, "smiling"),   # buddy manually pinned as team
+        _rec(3, 3.0, 1, "smiling"),
+    ]
+    r = assign_roles_coach(images, manual_roles={2: "team"})
+    assert r.team_image_id == 2
+    assert r.roles[2] == "team"
+
+
+def test_coach_mixed_buddies_between_solos_solos_still_win_team():
+    """Coach cluster: solo, buddy, solo, buddy, solo. Team = last solo
+    (index 4). Both buddies stay 'buddy'. Regression guard for the
+    common shape where buddy shots interleave with solos."""
+    images = [
+        _rec(1, 1.0, 1, "smiling"),
+        _rec(2, 2.0, 2, "smiling"),   # buddy
+        _rec(3, 3.0, 1, "smiling"),
+        _rec(4, 4.0, 2, "smiling"),   # buddy
+        _rec(5, 5.0, 1, "smiling"),   # last single-face → team
+    ]
+    r = assign_roles_coach(images)
+    assert r.team_image_id == 5
+    assert r.roles[5] == "team"
+    assert r.roles[2] == "buddy"
+    assert r.roles[4] == "buddy"
+    assert r.roles[1] == "individual"
+    assert r.roles[3] == "individual"
 
 
 # ── Manual role override ──────────────────────────────────────────────────────
@@ -505,13 +573,17 @@ def test_manual_panoramic_pins_pano_pick():
 
 
 def test_manual_override_in_coach_cluster():
-    """Coach team default is last shot; manual override repins to a different image."""
+    """Coach team default is last single-face shot; manual override
+    repins to a different image. 2026-09-21 Bug 2 fix: the buddy at
+    index 3 stays 'buddy' (was 'individual' pre-fix — old assertion
+    codified the bug where multi-face images were miscategorised as
+    individual in the coach variant)."""
     images = [
         _rec(1, 1.0, 1, "smiling"),
         _rec(2, 2.0, 1, "serious"),
-        _rec(3, 3.0, 2, "smiling"),   # last by capture, default coach team
+        _rec(3, 3.0, 2, "smiling"),   # buddy — post-fix stays 'buddy'
     ]
     r = assign_roles_coach(images, manual_roles={1: "team"})
     assert r.team_image_id == 1
     assert r.roles[1] == "team"
-    assert r.roles[3] == "individual"
+    assert r.roles[3] == "buddy"
