@@ -471,6 +471,130 @@ def test_stage_capture_excludes_archived(client):
     assert jid not in {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
 
 
+# ── 2026-10-01: /api/jobs N+1 fix — bulk GROUP BY replaces lazy loads ───────
+
+
+def test_list_jobs_reports_correct_counts_across_jobs_and_sessions(client, tmp_path):
+    """Load-bearing invariant for the N+1 fix: image_count,
+    reviewed_count, needs_review_count, any_unprocessed, session_count
+    must match what the (pre-fix) lazy-loaded code would have returned.
+
+    Fixture spans two jobs, each with multiple sessions, to exercise
+    the bulk GROUP BY path end-to-end (not just a single-job happy
+    path). Also catches a cross-contamination regression where one
+    job's counts leak into another.
+    """
+    from app.models.db_models import Cluster, Session as SessModel
+
+    # Job A: 2 teams, 2 images each. Create parent dir first since
+    # _make_job_tree assumes its parent exists (it just mkdir's a child).
+    (tmp_path / "A").mkdir()
+    (tmp_path / "B").mkdir()
+    root_a = _make_job_tree(tmp_path / "A", ["TeamA1", "TeamA2"])
+    jid_a = client.post("/api/jobs", json={
+        "name": "JobA", "root_path": str(root_a), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    # Job B: 1 team, 2 images.
+    root_b = _make_job_tree(tmp_path / "B", ["TeamB1"])
+    jid_b = client.post("/api/jobs", json={
+        "name": "JobB", "root_path": str(root_b), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+
+    # Craft cluster state so needs_review_count has something to report
+    # (ingest doesn't create clusters — that's the pipeline).
+    engine = jobs_module.SessionLocal.kw["bind"]
+    SF = sessionmaker(bind=engine)
+    db = SF()
+    sessions_a = db.query(SessModel).filter_by(job_id=jid_a).all()
+    sessions_b = db.query(SessModel).filter_by(job_id=jid_b).all()
+    sessions_a[0].reviewed = 1
+    sessions_a[0].status = "done"
+    sessions_a[1].status = "running"
+    for s in sessions_a:
+        db.add(Cluster(session_id=s.id, needs_review=1, image_count=0))
+    sessions_b[0].reviewed = 1
+    sessions_b[0].status = "done"
+    db.add(Cluster(session_id=sessions_b[0].id, needs_review=1, image_count=0))
+    db.add(Cluster(session_id=sessions_b[0].id, needs_review=0, image_count=0))
+    db.commit()
+    db.close()
+
+    listing = {j["id"]: j for j in client.get("/api/jobs").json()}
+    a = listing[jid_a]
+    assert a["session_count"] == 2
+    assert a["image_count"] == 4
+    assert a["reviewed_count"] == 1
+    assert a["needs_review_count"] == 2
+    assert a["any_unprocessed"] is True
+
+    b = listing[jid_b]
+    assert b["session_count"] == 1
+    assert b["image_count"] == 2
+    assert b["reviewed_count"] == 1
+    assert b["needs_review_count"] == 1
+    assert b["any_unprocessed"] is False
+
+
+def test_list_jobs_archived_sessions_excluded_from_counts(client, tmp_path):
+    """Archived sessions must not inflate counts in the main stats
+    loop. Bulk refactor preloads ALL sessions (archived + non-archived)
+    for the capture-filter branch; the main stats loop filters to
+    non-archived in Python. This test guards against a regression that
+    skips the filter."""
+    root = _make_job_tree(tmp_path, ["A", "B"])
+    jid = client.post("/api/jobs", json={
+        "name": "J", "root_path": str(root), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    }).json()["job_id"]
+    detail = client.get(f"/api/jobs/{jid}").json()
+    sid_to_archive = detail["sessions"][0]["id"]
+    client.post(f"/api/sessions/{sid_to_archive}/archive")
+
+    row = next(j for j in client.get("/api/jobs").json() if j["id"] == jid)
+    assert row["session_count"] == 1
+    assert row["image_count"] == 2
+
+
+def test_list_jobs_handles_jobs_with_no_sessions(client):
+    """Shoot jobs (image-less) have no sessions yet.
+    sessions_by_job.get(j.id) returns None in the bulk refactor — the
+    main loop must handle that without crashing."""
+    jid = client.post("/api/jobs/shoot", json={"name": "No sessions yet"}).json()["job_id"]
+    row = next(j for j in client.get("/api/jobs").json() if j["id"] == jid)
+    assert row["session_count"] == 0
+    assert row["image_count"] == 0
+    assert row["reviewed_count"] == 0
+    assert row["needs_review_count"] == 0
+    assert row["any_unprocessed"] is False
+
+
+def test_list_jobs_capture_filter_excludes_jobs_with_only_archived_sessions(client, tmp_path):
+    """Pre-fix `len(j.sessions) == 0` INCLUDED archived rows via the
+    relationship — a job whose only sessions are archived was excluded
+    from stage=capture. The bulk refactor's sessions_by_job must do
+    the same (fails if the preload is narrowed to non-archived only)."""
+    jid = client.post("/api/jobs/shoot", json={"name": "C"}).json()["job_id"]
+    _add_roster(client, jid)
+    cap = {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
+    assert jid in cap
+
+    root = _make_job_tree(tmp_path, ["T"])
+    client.post(f"/api/jobs/{jid}/import-images", json={
+        "root_path": str(root), "has_lines": False,
+        "image_subfolder_name": None, "auto_run": False,
+    })
+    detail = client.get(f"/api/jobs/{jid}").json()
+    for s in detail["sessions"]:
+        client.post(f"/api/sessions/{s['id']}/archive")
+
+    cap = {j["id"] for j in client.get("/api/jobs", params={"stage": "capture"}).json()}
+    assert jid not in cap, (
+        "job with only archived sessions wrongly resurfaced in capture stage"
+    )
+
+
 # ── 2026-09-10: ingest-walker guard + flat-folder auto-fallback ───────────
 
 

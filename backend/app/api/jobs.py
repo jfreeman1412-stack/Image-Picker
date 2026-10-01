@@ -628,6 +628,40 @@ def list_jobs(
         q = q.filter((Job.archived == 0) | (Job.archived.is_(None)))
     jobs = q.order_by(Job.created_at.desc()).all()
 
+    # 2026-10-01 N+1 fix: the per-session loop below used to lazy-load
+    # `j.sessions`, `s.images`, and `s.clusters` for every job — on a DB
+    # that's grown past ~100 jobs with ~20 sessions each, that was
+    # thousands of queries and 20+ seconds (the whole frontend home
+    # page froze while waiting). Mirrors the sessions-list fix in
+    # commit 6c0bd13 ("sessions list: bulk GROUP BY image_count"):
+    # three bulk queries up front, then dict lookups in the loop.
+    #
+    # Correctness invariants vs. the lazy-load version:
+    #   - sessions_by_job INCLUDES archived sessions, same as the
+    #     original `j.sessions` relationship — the capture branch
+    #     below filters on "any sessions at all", which must behave
+    #     identically on a job whose only sessions are archived (such
+    #     a job is NOT capture-ready, same as pre-fix).
+    #   - image_counts via GROUP BY matches `len(s.images)`.
+    #   - nr_counts via SUM(needs_review) matches
+    #     `sum(1 for c in s.clusters if c.needs_review)` because
+    #     needs_review is 0/1/NULL; SUM ignores NULL and adds the 1s.
+    #   - Unfiltered scans (not `WHERE session_id IN (...)`) — same
+    #     tradeoff as sessions-list fix: SQLite's ~999-param cap on
+    #     `.in_()` would clip a large session_ids list, and scanning
+    #     each table once is O(n) anyway.
+    sessions_by_job: dict[int, list] = {}
+    for s in db.query(Session).all():
+        sessions_by_job.setdefault(s.job_id, []).append(s)
+    image_counts = dict(
+        db.query(Image.session_id, func.count(Image.id))
+        .group_by(Image.session_id).all()
+    )
+    nr_counts = dict(
+        db.query(Cluster.session_id, func.sum(Cluster.needs_review))
+        .group_by(Cluster.session_id).all()
+    )
+
     if stage == "capture":
         job_ids = [j.id for j in jobs]
         rostered: set[int] = set()
@@ -637,25 +671,27 @@ def list_jobs(
                 .filter(PlayerMembership.job_id.in_(job_ids))
                 .distinct().all()
             }
-        # has a roster AND no images imported yet (no sessions at all)
-        jobs = [j for j in jobs if j.id in rostered and len(j.sessions) == 0]
+        # has a roster AND no images imported yet (no sessions at all).
+        # Checks sessions_by_job which includes archived sessions so a
+        # job whose only sessions are archived still counts as "already
+        # past the capture window" — identical to the pre-fix
+        # `len(j.sessions) == 0` behavior.
+        jobs = [
+            j for j in jobs
+            if j.id in rostered and not sessions_by_job.get(j.id)
+        ]
 
     out = []
     for j in jobs:
         # Stats reflect non-archived sessions only — an archived team
         # shouldn't inflate counts or block the "ready" banner.
-        active = [s for s in j.sessions if not s.archived]
-        image_count = 0
-        reviewed_count = 0
-        needs_review_count = 0
-        any_unprocessed = False
-        for s in active:
-            image_count += len(s.images)
-            if s.reviewed:
-                reviewed_count += 1
-            needs_review_count += sum(1 for c in s.clusters if c.needs_review)
-            if s.status != "done":
-                any_unprocessed = True
+        active = [s for s in sessions_by_job.get(j.id, []) if not s.archived]
+        image_count = sum(image_counts.get(s.id, 0) for s in active)
+        reviewed_count = sum(1 for s in active if s.reviewed)
+        needs_review_count = sum(
+            (nr_counts.get(s.id) or 0) for s in active
+        )
+        any_unprocessed = any(s.status != "done" for s in active)
         out.append({
             "id": j.id,
             "name": j.name,
