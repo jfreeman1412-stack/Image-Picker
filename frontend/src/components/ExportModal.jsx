@@ -27,7 +27,8 @@ export default function ExportModal({ job, onClose }) {
   // extension the photos will have when uploaded (cropping may make PNGs).
   const [sytistPasscodes, setSytistPasscodes] = useState(!!job.sytist_passcodes);
   const [sytistSaving, setSytistSaving] = useState(false);
-  const [uploadExt, setUploadExt] = useState('');
+  // Most shoots' cropped photos are uploaded as PNGs (same name).
+  const [uploadExt, setUploadExt] = useState('.png');
   const [phase, setPhase] = useState('form'); // form | running | done | error
   const [status, setStatus] = useState(null); // /export-status payload
   const [error, setError] = useState(null);
