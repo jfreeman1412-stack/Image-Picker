@@ -17,6 +17,16 @@ import { useEffect, useRef, useState } from 'react';
  * Every fetch checks `res.ok`; no error body ever lands in state (the Phase 5
  * lesson the rest of the app follows).
  */
+// Optional roster columns for Sytist passcode jobs: [mapping field, label].
+// A mapped passcode column wins; otherwise Player Sort makes the codes.
+const OPTIONAL_FIELDS = [
+  ['parent_first_name', 'Parent first name'],
+  ['parent_last_name', 'Parent last name'],
+  ['parent_email', 'Parent email'],
+  ['parent_phone', 'Parent phone'],
+  ['passcode', 'Passcode'],
+];
+
 export default function PlayerRosterModal({ job, onClose }) {
   const fileRef = useRef(null);
   const [file, setFile] = useState(null);
@@ -33,6 +43,11 @@ export default function PlayerRosterModal({ job, onClose }) {
   const [firstNameColumn, setFirstNameColumn] = useState('');
   const [lastNameColumn, setLastNameColumn] = useState('');
   const [teamColumn, setTeamColumn] = useState('');
+  // Optional columns for Sytist passcode jobs (parent contact + an existing
+  // passcode). Keys match the backend's `<field>_column` mapping keys.
+  const [optionalColumns, setOptionalColumns] = useState({});
+  const setOptional = (field) => (value) =>
+    setOptionalColumns((prev) => ({ ...prev, [field]: value }));
   // Validation (dry-run).
   const [validating, setValidating] = useState(false);
   const [report, setReport] = useState(null);          // dry-run response body
@@ -84,7 +99,7 @@ export default function PlayerRosterModal({ job, onClose }) {
   // flips (header names ↔ "Column N"), so stale selections must clear.
   useEffect(() => {
     setNameColumn(''); setFirstNameColumn(''); setLastNameColumn('');
-    setTeamColumn('');
+    setTeamColumn(''); setOptionalColumns({});
   }, [columns, hasHeader]);
 
   // Any change to the mapping invalidates a prior validation result, so the
@@ -93,7 +108,7 @@ export default function PlayerRosterModal({ job, onClose }) {
     setReport(null); setValidateError(null);
     setCommitResult(null); setCommitError(null); setReplaceConfirm(null);
   }, [nameMode, nameColumn, firstNameColumn, lastNameColumn, teamColumn,
-      hasHeader, columns]);
+      optionalColumns, hasHeader, columns]);
 
   // ── Derived: column labels + preview reconcile with the header toggle ─────
   // With a header, row 1 is column names. Without, the first row is data and
@@ -130,6 +145,9 @@ export default function PlayerRosterModal({ job, onClose }) {
     first_name_column: nameMode === 'split' ? (firstNameColumn || null) : null,
     last_name_column: nameMode === 'split' ? (lastNameColumn || null) : null,
     team_column: teamColumn || null,
+    ...Object.fromEntries(OPTIONAL_FIELDS.map(([field]) => (
+      [`${field}_column`, optionalColumns[field] || null]
+    ))),
   };
 
   // ── Validate (dry-run) ────────────────────────────────────────────────────
@@ -302,8 +320,9 @@ export default function PlayerRosterModal({ job, onClose }) {
           <section style={{ marginBottom: 16 }}>
             <h3 style={{ marginBottom: 8 }}>Map columns</h3>
             <p className="muted" style={{ marginTop: 0 }}>
-              <b>Name</b> and <b>team</b> are required. Other columns (parent
-              contact, etc.) are ignored.
+              <b>Name</b> and <b>team</b> are required. Parent contact and
+              passcode columns are optional (used by Sytist passcode jobs);
+              anything else is ignored.
             </p>
 
             <div className="wizard-choices" style={{ marginBottom: 10 }}>
@@ -341,6 +360,16 @@ export default function PlayerRosterModal({ job, onClose }) {
                 Map at least one — a last-name-only roster is valid.
               </p>
             )}
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
+              {OPTIONAL_FIELDS.map(([field, label]) => (
+                <span key={field}>
+                  {ColumnSelect({ label: `${label} (optional)`,
+                                  value: optionalColumns[field] || '',
+                                  onChange: setOptional(field) })}
+                </span>
+              ))}
+            </div>
 
             {/* Live assembled preview */}
             {mappingComplete && (

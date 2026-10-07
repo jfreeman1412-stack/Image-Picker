@@ -1,0 +1,259 @@
+"""Per-job Sytist passcodes (2026-10-07).
+
+When a job has `Job.sytist_passcodes` on, every roster player gets a passcode
+for the shoot and the export writes a CSV for Sytist's "import passcodes"
+screen in a Preset Passcode Photos gallery. That import (verified against
+Sytist 5.8.7, sl-admin/qr/import-non-qr-passcodes.php) works one row per
+photo:
+
+  - FILENAME is matched exactly against the stored photo name in the gallery
+    and the photo's title becomes the row's PASSCODE. The photos must already
+    be uploaded when the CSV is imported.
+  - A row with IS_GROUP set makes that photo a group photo whose code is its
+    own file name.
+  - GROUPS on a kid's row lists the group photos ("; "-separated) the kid also
+    sees, e.g. the team composite and panoramic.
+
+Sytist stores uploaded names with spaces turned into underscores, so every
+file name written here gets the same treatment. Team composites are built
+outside Player Sort and always named `<Team>.jpg` / `<Team>-PANO.jpg` after
+the roster's team name, so their rows are written from the roster alone.
+"""
+from __future__ import annotations
+
+import csv
+import secrets
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from sqlalchemy.orm import Session as DbSession
+
+from app.models.db_models import Cluster, PlayerMembership, Session
+from app.services.roster import normalize_name
+
+# Sytist-style codes: 7 characters, uppercase, no look-alikes (0/O, 1/I/L).
+PASSCODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+PASSCODE_LENGTH = 7
+
+CSV_FILENAME = "sytist_passcode_import.csv"
+CSV_HEADER = [
+    "FILENAME", "PASSCODE", "SUBJECT_FIRST_NAME", "SUBJECT_LAST_NAME",
+    "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE", "LEADER", "GROUPS", "IS_GROUP",
+]
+TEAM_PHOTO_EXT = ".jpg"
+
+
+def generate_passcode(taken: set[str]) -> str:
+    while True:
+        code = "".join(secrets.choice(PASSCODE_ALPHABET) for _ in range(PASSCODE_LENGTH))
+        if code not in taken:
+            return code
+
+
+def ensure_job_passcodes(db: DbSession, job_id: int) -> int:
+    """Give every membership of this job a passcode. A player on several
+    teams in the same shoot shares one code (one code per family per kid).
+    Existing codes never change. Returns how many memberships got a new code.
+    Caller commits."""
+    memberships = (
+        db.query(PlayerMembership).filter_by(job_id=job_id)
+        .order_by(PlayerMembership.id.asc()).all()
+    )
+    taken = {m.passcode for m in memberships if m.passcode}
+    by_player: dict[int, str] = {}
+    for m in memberships:
+        if m.passcode:
+            by_player.setdefault(m.player_id, m.passcode)
+    assigned = 0
+    for m in memberships:
+        if m.passcode:
+            continue
+        code = by_player.get(m.player_id)
+        if code is None:
+            code = generate_passcode(taken)
+            taken.add(code)
+            by_player[m.player_id] = code
+        m.passcode = code
+        assigned += 1
+    db.flush()
+    return assigned
+
+
+def sytist_name(name: str) -> str:
+    """The file name as Sytist stores it after upload."""
+    return name.replace(" ", "_")
+
+
+def team_photo_names(team_name: str) -> list[str]:
+    base = sytist_name(team_name.strip())
+    return [f"{base}{TEAM_PHOTO_EXT}", f"{base}-PANO{TEAM_PHOTO_EXT}"]
+
+
+def _split_name(display_name: str) -> tuple[str, str]:
+    """Best-effort first/last from a roster name like 'Eleanor Pederson' or
+    the copyright style 'Eleanor-Pederson'."""
+    name = display_name.strip()
+    if " " in name:
+        first, _, last = name.rpartition(" ")
+        return first.strip(), last.strip()
+    if "-" in name:
+        first, _, last = name.partition("-")
+        return first.strip(), last.strip()
+    return name, ""
+
+
+class MembershipResolver:
+    """Map a cluster to the roster membership whose passcode its photos get.
+
+    The cluster's current label decides (so renaming or moving a player in the
+    review UI changes the passcode on the next export); a reference-photo
+    match is the fallback when the label isn't a roster name. When the same
+    name is on several teams, the membership for the cluster's own team wins.
+    """
+
+    def __init__(self, db: DbSession, job_id: int):
+        self.memberships = (
+            db.query(PlayerMembership).filter_by(job_id=job_id)
+            .order_by(PlayerMembership.id.asc()).all()
+        )
+        self.by_norm_name: dict[str, list[PlayerMembership]] = {}
+        self.by_player: dict[int, list[PlayerMembership]] = {}
+        for m in self.memberships:
+            self.by_norm_name.setdefault(m.player.norm_name, []).append(m)
+            self.by_player.setdefault(m.player_id, []).append(m)
+
+    @staticmethod
+    def _pick(candidates: list[PlayerMembership], session: Session):
+        team_key = normalize_name(session.roster_team_alias or session.name or "")
+        for m in candidates:
+            if m.norm_team == team_key:
+                return m
+        return candidates[0]
+
+    def resolve(self, cluster: Cluster, session: Session) -> PlayerMembership | None:
+        label = (cluster.manual_label or cluster.auto_label or "").strip()
+        if label:
+            hits = self.by_norm_name.get(normalize_name(label))
+            if hits:
+                return self._pick(hits, session)
+        if cluster.matched_player_id and not cluster.manual_label:
+            hits = self.by_player.get(cluster.matched_player_id)
+            if hits:
+                return self._pick(hits, session)
+        return None
+
+
+@dataclass
+class SytistCsvBuilder:
+    """Collects exported files during an export and writes the import CSV.
+
+    `add_file(name, memberships)`: one exported file and the roster players
+    shown in it. One player → a row with their passcode. Two or more (a buddy
+    shot exported once) → a group photo listed in each player's GROUPS. None →
+    counted as unassigned and left out of the CSV.
+    """
+    db: DbSession
+    job_id: int
+    upload_ext: str | None = None
+    _photo_rows: list[tuple[str, PlayerMembership]] = field(default_factory=list)
+    _buddy_groups: dict[int, list[str]] = field(default_factory=dict)
+    _group_files: list[str] = field(default_factory=list)
+    unassigned: list[str] = field(default_factory=list)
+
+    def upload_name(self, exported_name: str) -> str:
+        if self.upload_ext:
+            exported_name = Path(exported_name).stem + self.upload_ext
+        return sytist_name(exported_name)
+
+    def add_file(self, exported_name: str, memberships) -> None:
+        name = self.upload_name(exported_name)
+        by_player: dict[int, PlayerMembership] = {}
+        for m in memberships:
+            if m is not None:
+                by_player.setdefault(m.player_id, m)
+        if not by_player:
+            self.unassigned.append(name)
+        elif len(by_player) == 1:
+            self._photo_rows.append((name, next(iter(by_player.values()))))
+        else:
+            if name not in self._group_files:
+                self._group_files.append(name)
+            for pid in by_player:
+                self._buddy_groups.setdefault(pid, []).append(name)
+
+    def write(self, out_dir: Path) -> dict:
+        memberships = (
+            self.db.query(PlayerMembership).filter_by(job_id=self.job_id)
+            .order_by(PlayerMembership.id.asc()).all()
+        )
+        teams_by_player: dict[int, list[str]] = {}
+        team_names: list[str] = []
+        first_membership: dict[int, PlayerMembership] = {}
+        for m in memberships:
+            first_membership.setdefault(m.player_id, m)
+            teams_by_player.setdefault(m.player_id, [])
+            if m.team_name not in teams_by_player[m.player_id]:
+                teams_by_player[m.player_id].append(m.team_name)
+            if m.team_name not in team_names:
+                team_names.append(m.team_name)
+
+        def groups_for(player_id: int) -> str:
+            names: list[str] = []
+            for team in teams_by_player.get(player_id, []):
+                names.extend(team_photo_names(team))
+            names.extend(self._buddy_groups.get(player_id, []))
+            return "; ".join(dict.fromkeys(names))
+
+        def person_row(filename: str, m: PlayerMembership) -> list[str]:
+            # Contact goes on every row: Sytist builds the roster entry from
+            # whichever row of a passcode it reads first.
+            first = m.subject_first_name or ""
+            last = m.subject_last_name or ""
+            if not first and not last:
+                first, last = _split_name(m.player.display_name)
+            return [
+                filename, m.passcode or "", first, last,
+                m.parent_first_name or "", m.parent_last_name or "",
+                m.parent_email or "", m.parent_phone or "",
+                "; ".join(teams_by_player.get(m.player_id, [])),
+                groups_for(m.player_id), "",
+            ]
+
+        rows: list[list[str]] = []
+        players_with_photos: set[int] = set()
+        for filename, m in self._photo_rows:
+            canonical = first_membership.get(m.player_id, m)
+            rows.append(person_row(filename, canonical))
+            players_with_photos.add(m.player_id)
+        # Players with no exported photo still get a roster entry so their
+        # family receives a code (and sees team photos).
+        no_photo_players = 0
+        for pid, m in first_membership.items():
+            if pid not in players_with_photos:
+                rows.append(person_row("", m))
+                no_photo_players += 1
+        group_rows = 0
+        for team in team_names:
+            for name in team_photo_names(team):
+                rows.append([name] + [""] * 9 + ["1"])
+                group_rows += 1
+        for name in self._group_files:
+            rows.append([name] + [""] * 9 + ["1"])
+            group_rows += 1
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / CSV_FILENAME
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh, lineterminator="\n")
+            writer.writerow(CSV_HEADER)
+            writer.writerows(rows)
+        return {
+            "path": str(path),
+            "players": len(first_membership),
+            "photo_rows": len(self._photo_rows),
+            "players_without_photos": no_photo_players,
+            "group_photos": group_rows,
+            "buddy_group_photos": len(self._group_files),
+            "unassigned_files": len(self.unassigned),
+            "unassigned_examples": self.unassigned[:20],
+        }

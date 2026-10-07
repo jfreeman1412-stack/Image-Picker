@@ -33,6 +33,10 @@ class Job(Base):
     export_started_at = Column(DateTime, nullable=True)     # for ETA
     export_error = Column(String, nullable=True)
     export_result = Column(String, nullable=True)           # JSON: final stats
+    # 2026-10-07: per-job "Sytist passcodes" option. When 1, each roster
+    # player gets a passcode and export also writes the Sytist Preset
+    # Passcode Photos import CSV. 0 = today's behavior, nothing written.
+    sytist_passcodes = Column(Integer, default=0)
 
     sessions = relationship("Session", back_populates="job", cascade="all, delete-orphan")
     roster_entries = relationship(
@@ -260,6 +264,16 @@ class PlayerMembership(Base):
     norm_team = Column(String, nullable=False)   # matches normalize_name(Session.name)
     is_coach = Column(Integer, default=0)        # 0 | 1, from "Coach-" name prefix
     created_at = Column(DateTime, default=datetime.utcnow)
+    # 2026-10-07 Sytist passcodes: the player's passcode for this shoot plus
+    # the parent contact the Sytist import carries. All optional; carried
+    # over across roster re-uploads by replace_shoot_memberships.
+    passcode = Column(String, nullable=True)
+    subject_first_name = Column(String, nullable=True)
+    subject_last_name = Column(String, nullable=True)
+    parent_first_name = Column(String, nullable=True)
+    parent_last_name = Column(String, nullable=True)
+    parent_email = Column(String, nullable=True)
+    parent_phone = Column(String, nullable=True)
 
     player = relationship("Player", back_populates="memberships")
     job = relationship("Job", back_populates="player_memberships")

@@ -13,6 +13,7 @@ POST   /api/jobs/{id}/export           kick off async export (archived sessions 
 GET    /api/jobs/{id}/export-status    poll export progress + ETA
 POST   /api/jobs/{id}/archive          soft-hide a job
 POST   /api/jobs/{id}/unarchive        restore an archived job
+POST   /api/jobs/{id}/sytist-passcodes turn the per-job Sytist passcodes option on/off
 DELETE /api/jobs/{id}                  hard-delete job + cascade (incl. thumbs)
 """
 import errno
@@ -41,6 +42,9 @@ from app.services.eta import eta_seconds
 from app.services.face_pipeline import run_pipeline
 from app.services.ingest import RAW_EXTS, SUPPORTED_EXTS, ingest_folder
 from app.services import pipeline_locks
+from app.services.sytist_passcodes import (
+    MembershipResolver, SytistCsvBuilder, ensure_job_passcodes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -778,6 +782,7 @@ def get_job(
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "archived": bool(job.archived),
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
+        "sytist_passcodes": bool(job.sytist_passcodes),
         "sessions": sessions_out,
     }
 
@@ -804,6 +809,27 @@ def _purge_session_rows(db: DbSession, session) -> None:
 
 
 # ── Move-card Phase 2 (2026-06-08): move-targets dropdown source ────────────
+
+
+class SytistPasscodesRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/{job_id}/sytist-passcodes")
+def set_sytist_passcodes(
+    job_id: int, payload: SytistPasscodesRequest, db: DbSession = Depends(get_db),
+):
+    """Turn the per-job Sytist passcodes option on or off. Turning it on
+    gives every roster player a passcode right away; turning it off keeps
+    stored codes (so turning it back on doesn't change any family's code)."""
+    job = db.query(Job).get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    job.sytist_passcodes = 1 if payload.enabled else 0
+    assigned = ensure_job_passcodes(db, job.id) if payload.enabled else 0
+    db.commit()
+    return {"sytist_passcodes": bool(job.sytist_passcodes),
+            "passcodes_assigned": assigned}
 
 
 @router.get("/{job_id}/move-targets")
@@ -1084,6 +1110,14 @@ class ExportJobRequest(BaseModel):
     # so a rejected buddy never leaks into the Buddies tree. Applies to
     # both legacy and rename-by-player modes.
     split_buddies: bool = False
+    # 2026-10-07: extension the photos will have when uploaded to Sytist,
+    # for the passcode CSV's file names (e.g. ".png" when cropping turns the
+    # exported JPGs into PNGs). None / "" = same as exported. Only used when
+    # the job's Sytist passcodes option is on.
+    sytist_upload_ext: str | None = None
+
+
+_SYTIST_UPLOAD_EXTS = {None, "", ".png", ".jpg", ".jpeg"}
 
 
 _ROLE_PRIORITY = {
@@ -1398,6 +1432,7 @@ def _derive_export_basename(
 
 def _build_rename_plan_for_session(
     db: DbSession, session: Session, role_map: dict[int, str],
+    cluster_ids_out: list | None = None,
 ) -> list[tuple[Path, str, str | None, int]]:
     """Produce (src_path, basename, secondary_subdir, image_id) entries for ONE
     session under rename mode. secondary_subdir is 'Team Images' or 'Pano
@@ -1413,6 +1448,10 @@ def _build_rename_plan_for_session(
     pano roles in the same cluster are an error condition — log + keep
     the first, drop the rest. Images in session.images with no ImageRole
     fall through to the camera-filename orphan path.
+
+    `cluster_ids_out`, when given, receives the claiming cluster's id for each
+    returned entry (None for orphans), in the same order — the Sytist
+    passcode CSV needs to know whose photo each renamed copy is.
     """
     image_by_id = {img.id: img for img in session.images}
     seen_in_rename: set[int] = set()    # image ids that got at least one
@@ -1481,11 +1520,15 @@ def _build_rename_plan_for_session(
             img = image_by_id.get(team_image_id) or db.query(Image).get(team_image_id)
             basename = _derive_export_basename(cluster, "team", 0, img.filename)
             out.append((Path(img.path), basename, "Team Images", team_image_id))
+            if cluster_ids_out is not None:
+                cluster_ids_out.append(cluster.id)
             seen_in_rename.add(team_image_id)
         if pano_image_id is not None:
             img = image_by_id.get(pano_image_id) or db.query(Image).get(pano_image_id)
             basename = _derive_export_basename(cluster, "panoramic", 0, img.filename)
             out.append((Path(img.path), basename, "Pano Images", pano_image_id))
+            if cluster_ids_out is not None:
+                cluster_ids_out.append(cluster.id)
             seen_in_rename.add(pano_image_id)
 
         # Individuals + buddy share a sequence; sort by capture_time.
@@ -1499,6 +1542,8 @@ def _build_rename_plan_for_session(
             img = image_by_id.get(image_id) or db.query(Image).get(image_id)
             basename = _derive_export_basename(cluster, role, seq, img.filename)
             out.append((Path(img.path), basename, None, image_id))
+            if cluster_ids_out is not None:
+                cluster_ids_out.append(cluster.id)
             seen_in_rename.add(image_id)
 
     # Orphan images: in session.images but never picked up by any cluster's
@@ -1509,7 +1554,28 @@ def _build_rename_plan_for_session(
         if role_map.get(img.id) == "rejected":
             continue
         out.append((Path(img.path), img.filename, None, img.id))
+        if cluster_ids_out is not None:
+            cluster_ids_out.append(None)
 
+    return out
+
+
+def _clusters_by_image(db: DbSession, image_ids: list[int]) -> dict[int, list[Cluster]]:
+    """Non-rejected claiming clusters per image (a buddy shot has several),
+    for the Sytist passcode CSV in legacy (camera-filename) export mode."""
+    out: dict[int, list[Cluster]] = {}
+    if not image_ids:
+        return out
+    for chunk_start in range(0, len(image_ids), 500):
+        chunk = image_ids[chunk_start:chunk_start + 500]
+        rows = (
+            db.query(ImageRole.image_id, Cluster)
+            .join(Cluster, Cluster.id == ImageRole.cluster_id)
+            .filter(ImageRole.image_id.in_(chunk), ImageRole.role != "rejected")
+            .all()
+        )
+        for image_id, cluster in rows:
+            out.setdefault(image_id, []).append(cluster)
     return out
 
 
@@ -1518,6 +1584,7 @@ def _run_export(
     destination_path: str | None = None,
     rename_by_player: bool = False,
     split_buddies: bool = False,
+    sytist_upload_ext: str | None = None,
 ) -> None:
     """Background task: the actual copy/move, updating Job.export_* as it
     goes so the modal can show a live bar + ETA."""
@@ -1564,6 +1631,21 @@ def _run_export(
             files_copied = 0
             files_skipped_rejected = 0
             failures: list[dict] = []   # per-file copy failures across the run
+
+            # 2026-10-07 Sytist passcodes: OFF (default) → none of this runs
+            # and no CSV is written. ON → every roster player has a passcode
+            # and each exported file is recorded against the player(s) its
+            # cluster(s) currently resolve to.
+            sytist = None
+            resolver = None
+            clusters_by_image: dict[int, list[Cluster]] = {}
+            if job.sytist_passcodes:
+                ensure_job_passcodes(db, job.id)
+                db.commit()
+                resolver = MembershipResolver(db, job.id)
+                sytist = SytistCsvBuilder(db, job.id, upload_ext=sytist_upload_ext)
+                if not rename_by_player:
+                    clusters_by_image = _clusters_by_image(db, all_image_ids)
 
             for session in to_export:
                 job.export_current_team = session.name
@@ -1616,14 +1698,22 @@ def _run_export(
                 # loop can look up the secondary destination after dests are
                 # allocated. Legacy mode still uses team_dsts / pano_dsts.
                 rename_secondary: dict[str, str] = {}
+                # Rename mode only: the claiming cluster per src (Sytist CSV).
+                src_cluster_ids: list[int | None] = []
 
                 if rename_by_player:
-                    plan = _build_rename_plan_for_session(db, session, role_map)
-                    for src, basename, secondary_subdir, image_id in plan:
+                    plan_cluster_ids: list[int | None] = []
+                    plan = _build_rename_plan_for_session(
+                        db, session, role_map, cluster_ids_out=plan_cluster_ids,
+                    )
+                    for (src, basename, secondary_subdir, image_id), cid in zip(
+                        plan, plan_cluster_ids,
+                    ):
                         if not src.exists():
                             logger.warning("Source missing for export: %s", src)
                             continue
                         srcs.append(src)
+                        src_cluster_ids.append(cid)
                         # The role tag here is only used for progress / failure
                         # bookkeeping AND (2026-09-08) the buddy-split decision;
                         # the actual destination subdir for secondaries is
@@ -1712,6 +1802,19 @@ def _run_export(
                     website_dsts = _allocate_dests(
                         srcs, website_team, basenames=rename_basenames,
                     )
+
+                if sytist is not None:
+                    clusters_by_id = {c.id: c for c in session.clusters}
+                    for i, (iid, wdst) in enumerate(zip(src_image_ids, website_dsts)):
+                        if rename_by_player:
+                            c = clusters_by_id.get(src_cluster_ids[i])
+                            claimed = [c] if c is not None else []
+                        else:
+                            claimed = clusters_by_image.get(iid, [])
+                        sytist.add_file(
+                            wdst.name,
+                            [resolver.resolve(c, c.session) for c in claimed],
+                        )
                 # Build secondary plans. Rename mode resolves via
                 # rename_secondary (per-source subdir choice); legacy mode
                 # picks via role tag like today.
@@ -1818,6 +1921,8 @@ def _run_export(
                 "sessions_skipped": sessions_skipped,
                 "failures": failures,
             }
+            if sytist is not None:
+                result["sytist_csv"] = sytist.write(out_root)
             job.export_result = json.dumps(result)
             if failures:
                 # Per-file failures DON'T abort the job (the run completed
@@ -1854,6 +1959,8 @@ def export_job(
     the modal polls /export-status."""
     if payload.mode not in VALID_MODES:
         raise HTTPException(400, f"Invalid mode: {payload.mode}")
+    if payload.sytist_upload_ext not in _SYTIST_UPLOAD_EXTS:
+        raise HTTPException(400, f"Invalid sytist_upload_ext: {payload.sytist_upload_ext}")
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
@@ -1881,7 +1988,7 @@ def export_job(
     background.add_task(
         _run_export, job.id, payload.mode, payload.overwrite,
         payload.destination_path, payload.rename_by_player,
-        payload.split_buddies,
+        payload.split_buddies, payload.sytist_upload_ext,
     )
     return {"job_id": job.id, "export_total": total}
 

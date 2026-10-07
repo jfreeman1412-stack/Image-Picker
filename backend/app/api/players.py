@@ -27,8 +27,10 @@ from app.db import get_db
 from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
 from app.services.players import (
     add_walkup_player, build_validation_report, inspect_roster_csv,
-    load_shoot_roster_from_text, parse_mapped_roster, replace_shoot_memberships,
+    load_shoot_roster_from_text, parse_mapped_contacts, parse_mapped_roster,
+    replace_shoot_memberships,
 )
+from app.services.sytist_passcodes import ensure_job_passcodes
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,16 @@ router = APIRouter()
 
 
 # ── per-shoot roster (the check-in roster) ───────────────────────────────
+
+
+def _ensure_passcodes_if_enabled(db: DbSession, job_id: int) -> None:
+    """Sytist passcodes jobs: give newly added roster players a code now so
+    the roster shows it before export. No-op for other jobs."""
+    job = db.query(Job).get(job_id)
+    if job is not None and job.sytist_passcodes:
+        ensure_job_passcodes(db, job_id)
+        db.commit()
+
 
 @router.post("/roster/{job_id}")
 async def upload_shoot_roster(
@@ -47,7 +59,9 @@ async def upload_shoot_roster(
     data = await file.read()
     text = decode_bytes(data)
     try:
-        return load_shoot_roster_from_text(db, job_id, text)
+        summary = load_shoot_roster_from_text(db, job_id, text)
+        _ensure_passcodes_if_enabled(db, job_id)
+        return summary
     except CsvParseError as exc:
         raise HTTPException(400, detail={
             "error": "csv_parse",
@@ -76,6 +90,11 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
                 "name": m.player.display_name,
                 "team": m.team_name,
                 "is_coach": bool(m.is_coach),
+                "passcode": m.passcode,
+                "parent_first_name": m.parent_first_name,
+                "parent_last_name": m.parent_last_name,
+                "parent_email": m.parent_email,
+                "parent_phone": m.parent_phone,
             }
             for m in memberships
         ],
@@ -200,8 +219,10 @@ async def upload_mapped_roster(
         })
 
     canonical, _ = parse_mapped_roster(text, mapping_obj)
-    summary = replace_shoot_memberships(db, job_id, canonical)
+    contacts = parse_mapped_contacts(text, mapping_obj)
+    summary = replace_shoot_memberships(db, job_id, canonical, contacts)
     db.commit()
+    _ensure_passcodes_if_enabled(db, job_id)
     return summary
 
 
@@ -235,7 +256,9 @@ def add_walkup(
         raise HTTPException(400, detail={
             "error": "missing_team", "message": "Team is required."})
     try:
-        return add_walkup_player(db, job_id, name, team)
+        result = add_walkup_player(db, job_id, name, team)
+        _ensure_passcodes_if_enabled(db, job_id)
+        return result
     except ValueError as exc:
         raise HTTPException(400, detail={
             "error": "invalid_name", "message": str(exc)})

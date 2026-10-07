@@ -22,6 +22,12 @@ export default function ExportModal({ job, onClose }) {
   // To_be_Cropped/ into a sibling Buddies/ tree that mirrors the same
   // team subfolder structure. Team/pano roles stay put.
   const [splitBuddies, setSplitBuddies] = useState(false);
+  // 2026-10-07: per-JOB Sytist passcodes option (saved on the job, not per
+  // export). ON → export also writes the Sytist import CSV. uploadExt is the
+  // extension the photos will have when uploaded (cropping may make PNGs).
+  const [sytistPasscodes, setSytistPasscodes] = useState(!!job.sytist_passcodes);
+  const [sytistSaving, setSytistSaving] = useState(false);
+  const [uploadExt, setUploadExt] = useState('');
   const [phase, setPhase] = useState('form'); // form | running | done | error
   const [status, setStatus] = useState(null); // /export-status payload
   const [error, setError] = useState(null);
@@ -49,6 +55,26 @@ export default function ExportModal({ job, onClose }) {
     }, 1000);
   };
 
+  const toggleSytist = async (enabled) => {
+    setSytistSaving(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/sytist-passcodes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) throw new Error(`Couldn't save the passcode setting (HTTP ${res.status}).`);
+      const body = await res.json();
+      setSytistPasscodes(body.sytist_passcodes);
+      job.sytist_passcodes = body.sytist_passcodes;  // keep the cached job in sync for the next open
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSytistSaving(false);
+    }
+  };
+
   const submit = async () => {
     setError(null);
     // Only send destination_path when the user actually customized it.
@@ -56,6 +82,7 @@ export default function ExportModal({ job, onClose }) {
     const body = { mode, overwrite };
     if (renameByPlayer) body.rename_by_player = true;
     if (splitBuddies) body.split_buddies = true;
+    if (sytistPasscodes && uploadExt) body.sytist_upload_ext = uploadExt;
     const trimmed = (destination || '').trim();
     if (trimmed && trimmed !== legacyDefault) body.destination_path = trimmed;
     const res = await fetch(`/api/jobs/${job.id}/export`, {
@@ -140,6 +167,26 @@ export default function ExportModal({ job, onClose }) {
                 cropped in two clean passes; team/pano photos are unaffected)
               </label>
             </div>
+            <div className="form-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+              <label>
+                <input type="checkbox" checked={sytistPasscodes} disabled={sytistSaving}
+                       onChange={e => toggleSytist(e.target.checked)} />
+                Sytist passcodes for this job (saved with the job). Each roster
+                player gets a passcode, and the export also writes{' '}
+                <code>sytist_passcode_import.csv</code> to import into a Preset
+                Passcode Photos gallery after uploading the photos.
+              </label>
+              {sytistPasscodes && (
+                <label style={{ marginTop: 6, marginLeft: 24 }}>
+                  Photos will be uploaded to Sytist as{' '}
+                  <select value={uploadExt} onChange={e => setUploadExt(e.target.value)}>
+                    <option value="">the same file type as exported</option>
+                    <option value=".png">.png</option>
+                    <option value=".jpg">.jpg</option>
+                  </select>
+                </label>
+              )}
+            </div>
             {error && <p className="error">{error}</p>}
             <div className="actions">
               <button className="ghost" onClick={onClose}>Cancel</button>
@@ -180,6 +227,21 @@ export default function ExportModal({ job, onClose }) {
               {status.result.team_count} teams.{' '}
               {status.result.files_skipped_rejected} rejected images skipped.
             </p>
+            {status.result.sytist_csv && (
+              <p>
+                Sytist passcode CSV: <code>{status.result.sytist_csv.path}</code>{' '}
+                ({status.result.sytist_csv.players} players,{' '}
+                {status.result.sytist_csv.photo_rows} photos,{' '}
+                {status.result.sytist_csv.group_photos} group photos).
+                {status.result.sytist_csv.unassigned_files > 0 && (
+                  <span className="warn">
+                    {' '}{status.result.sytist_csv.unassigned_files} photo(s) aren't
+                    matched to a roster player and got no passcode (e.g.{' '}
+                    {status.result.sytist_csv.unassigned_examples.slice(0, 3).join(', ')}).
+                  </span>
+                )}
+              </p>
+            )}
             {status.result.sessions_skipped?.length > 0 && (
               <p className="warn">
                 Skipped: {status.result.sessions_skipped
