@@ -11,11 +11,15 @@ dist/
 dev-dist/
 .vite/
 
-# App data
+# App data (all runtime DB state — nothing under backend/data/ is tracked)
 backend/data/*.db
+backend/data/*.db-shm
+backend/data/*.db-wal
+backend/data/*.db.bak*
 backend/data/thumbs/
 backend/data/uploads/
 backend/data/references/
+backend/data/smile_calibration/
 
 # OS / editor
 .DS_Store
