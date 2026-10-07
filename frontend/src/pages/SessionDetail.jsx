@@ -5,6 +5,11 @@ import ImageModal from '../components/ImageModal.jsx';
 import ReviewActionBar from '../components/ReviewActionBar.jsx';
 import PipelineProgress from '../components/PipelineProgress.jsx';
 import ConnectivityBanner from '../components/ConnectivityBanner.jsx';
+import { sortClusters, DEFAULT_CLUSTER_SORT, isClusterSortMode } from '../utils/clusterSort.js';
+
+// Per-device sticky preference for the player-card sort. Defaults to A–Z by
+// label; 'photographed' orders by the shoot/file sequence.
+const CLUSTER_SORT_KEY = 'player-sort:cluster-sort';
 
 export default function SessionDetail() {
   const { id } = useParams();
@@ -12,6 +17,15 @@ export default function SessionDetail() {
   const [session, setSession] = useState(null);
   const [clusters, setClusters] = useState([]);
   const [filter, setFilter] = useState('all'); // all | review
+  const [sortMode, setSortMode] = useState(() => {
+    try {
+      const v = localStorage.getItem(CLUSTER_SORT_KEY);
+      return isClusterSortMode(v) ? v : DEFAULT_CLUSTER_SORT;
+    } catch { return DEFAULT_CLUSTER_SORT; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(CLUSTER_SORT_KEY, sortMode); } catch { /* storage blocked */ }
+  }, [sortMode]);
   // Modal preview is tracked as { cluster_id, index }, NOT a snapshot image
   // list: the images shown are always re-derived from the freshly-loaded
   // `clusters` by cluster_id below, so a role change → load() refetch can't
@@ -360,11 +374,10 @@ export default function SessionDetail() {
   const visibleUnsorted = filter === 'review'
     ? clusters.filter(clusterNeedsAttention)
     : clusters;
-  // Phase 11: float confirmed cross-team guest clusters to the end — they're
-  // not this team's members, so they shouldn't sit among the real players.
-  const visible = [...visibleUnsorted].sort(
-    (a, b) => (a.guest_of ? 1 : 0) - (b.guest_of ? 1 : 0),
-  );
+  // Sort by the chosen mode (A–Z label / photographed order). sortClusters
+  // folds in the Phase 11 rule: confirmed cross-team guest clusters always
+  // float to the end — they're not this team's members.
+  const visible = sortClusters(visibleUnsorted, sortMode);
 
   // Move-card Phase 2 (2026-06-08): dropdown source is now the
   // /move-targets endpoint, which unions sessions + roster-only teams.
@@ -595,6 +608,28 @@ export default function SessionDetail() {
                  onChange={() => setFilter('review')} />
           Needs review only
         </label>
+
+        {clusters.length > 1 && (
+          <div className="sort-toggle" role="group" aria-label="Sort players by">
+            <span className="sort-toggle-label">Sort</span>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'name' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'name'}
+              onClick={() => setSortMode('name')}
+            >
+              Name A–Z
+            </button>
+            <button
+              type="button"
+              className={`seg ${sortMode === 'photographed' ? 'active' : ''}`}
+              aria-pressed={sortMode === 'photographed'}
+              onClick={() => setSortMode('photographed')}
+            >
+              Photographed
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="cluster-grid">

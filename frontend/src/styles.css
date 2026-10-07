@@ -167,12 +167,15 @@ label { color: var(--text); }
 /* ── Filter bar ─────────────────────────────────────────────────────────── */
 .filter-bar {
   display: flex;
+  align-items: center;
   gap: 18px;
   margin: 16px 0;
   font-size: 14px;
   color: var(--text-muted);
 }
 .filter-bar label { display: inline-flex; align-items: center; gap: 6px; }
+/* Sort toggle sits at the right end of the filter row. */
+.filter-bar .sort-toggle { margin-left: auto; }
 
 /* ── Cluster grid ───────────────────────────────────────────────────────── */
 .cluster-grid {
