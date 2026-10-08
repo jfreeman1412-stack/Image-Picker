@@ -37,6 +37,11 @@ class Job(Base):
     # player gets a passcode and export also writes the Sytist Preset
     # Passcode Photos import CSV. 0 = today's behavior, nothing written.
     sytist_passcodes = Column(Integer, default=0)
+    # 2026-10-08: where this job's families come from in Sytist, as JSON
+    # {"booking_event_ids": [...], "gallery_ids": [...]}, and the last
+    # export's file -> player list (JSON) used by "build CSV from final folder".
+    sytist_sync_sources = Column(String, nullable=True)
+    sytist_manifest = Column(String, nullable=True)
 
     sessions = relationship("Session", back_populates="job", cascade="all, delete-orphan")
     roster_entries = relationship(
@@ -312,6 +317,32 @@ class ReferenceFace(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     player = relationship("Player", back_populates="references")
+
+
+class SytistFamily(Base):
+    """One family pulled from Sytist for a job (2026-10-08): a booking or a
+    gallery pre-registration. (job, source, source_id) is unique, so a re-sync
+    updates rows instead of duplicating them. Families are matched to roster
+    players by name; the match fills the membership's parent contact."""
+    __tablename__ = "sytist_families"
+    __table_args__ = (
+        UniqueConstraint("job_id", "source", "source_id",
+                         name="uq_sytist_family_source"),
+        Index("ix_sytist_families_job", "job_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    source = Column(String, nullable=False)      # 'booking' | 'preregister'
+    source_id = Column(String, nullable=False)   # book_id / reg_id
+    subject_first_name = Column(String, nullable=True)
+    subject_last_name = Column(String, nullable=True)
+    norm_name = Column(String, nullable=False)   # normalize_name(first + last)
+    parent_first_name = Column(String, nullable=True)
+    parent_last_name = Column(String, nullable=True)
+    parent_email = Column(String, nullable=True)
+    parent_phone = Column(String, nullable=True)
+    synced_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Setting(Base):

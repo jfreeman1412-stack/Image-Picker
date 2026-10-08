@@ -31,6 +31,7 @@ from app.services.players import (
     replace_shoot_memberships,
 )
 from app.services.sytist_passcodes import ensure_job_passcodes
+from app.services.sytist_sync import apply_families
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -42,9 +43,11 @@ router = APIRouter()
 
 def _ensure_passcodes_if_enabled(db: DbSession, job_id: int) -> None:
     """Sytist passcodes jobs: give newly added roster players a code now so
-    the roster shows it before export. No-op for other jobs."""
+    the roster shows it before export, and fill their parent contact from
+    families already synced from Sytist. No-op for other jobs."""
     job = db.query(Job).get(job_id)
     if job is not None and job.sytist_passcodes:
+        apply_families(db, job_id)
         ensure_job_passcodes(db, job_id)
         db.commit()
 

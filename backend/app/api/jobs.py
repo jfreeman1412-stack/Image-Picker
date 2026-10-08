@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.db import DATA_DIR, SessionLocal, get_db
 from app.models.db_models import (
-    Cluster, Face, ImageRole, Image, Job, PlayerMembership, Session,
+    Cluster, Face, ImageRole, Image, Job, PlayerMembership, Session, SytistFamily,
 )
 from app.api.sessions import pipeline_progress_fields
 from app.services.eta import eta_seconds
@@ -45,6 +45,7 @@ from app.services import pipeline_locks
 from app.services.sytist_passcodes import (
     MembershipResolver, SytistCsvBuilder, ensure_job_passcodes,
 )
+from app.services.sytist_sync import has_sources, sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -889,6 +890,7 @@ def delete_job(job_id: int, db: DbSession = Depends(get_db)):
         raise HTTPException(404, "Job not found")
     for s in list(job.sessions):
         _purge_session_rows(db, s)
+    db.query(SytistFamily).filter_by(job_id=job_id).delete()
     db.delete(job)  # ORM cascade: sessions → images/faces, clusters
     db.commit()
     return {"status": "deleted"}
@@ -1639,7 +1641,18 @@ def _run_export(
             sytist = None
             resolver = None
             clusters_by_image: dict[int, list[Cluster]] = {}
+            sytist_sync = None
             if job.sytist_passcodes:
+                # Pick up families who signed up since the last sync. Sytist
+                # being unreachable never blocks an export.
+                if has_sources(job):
+                    try:
+                        sytist_sync = sync_job(db, job.id)
+                        sytist_sync["unmatched"] = len(sytist_sync["unmatched"])
+                        db.commit()
+                    except Exception as exc:
+                        db.rollback()
+                        sytist_sync = {"error": str(exc)}
                 ensure_job_passcodes(db, job.id)
                 db.commit()
                 resolver = MembershipResolver(db, job.id)
@@ -1923,6 +1936,9 @@ def _run_export(
             }
             if sytist is not None:
                 result["sytist_csv"] = sytist.write(out_root)
+                if sytist_sync is not None:
+                    result["sytist_csv"]["sync"] = sytist_sync
+                job.sytist_manifest = sytist.manifest_json()
             job.export_result = json.dumps(result)
             if failures:
                 # Per-file failures DON'T abort the job (the run completed

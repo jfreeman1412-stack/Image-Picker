@@ -17,6 +17,8 @@ fer==22.5.1
 
 # Storage
 SQLAlchemy==2.0.35
+# 2026-10-08: read-only Sytist MySQL access for the passcode family sync.
+PyMySQL==1.1.1
 
 # Dev
 pytest==8.3.3

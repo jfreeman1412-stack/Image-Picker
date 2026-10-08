@@ -22,6 +22,7 @@ the roster's team name, so their rows are written from the roster alone.
 from __future__ import annotations
 
 import csv
+import json
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -159,6 +160,7 @@ class SytistCsvBuilder:
     _buddy_groups: dict[int, list[str]] = field(default_factory=dict)
     _group_files: list[str] = field(default_factory=list)
     unassigned: list[str] = field(default_factory=list)
+    _manifest: list[list] = field(default_factory=list)
 
     def upload_name(self, exported_name: str) -> str:
         if self.upload_ext:
@@ -171,6 +173,7 @@ class SytistCsvBuilder:
         for m in memberships:
             if m is not None:
                 by_player.setdefault(m.player_id, m)
+        self._manifest.append([exported_name, sorted(by_player)])
         if not by_player:
             self.unassigned.append(name)
         elif len(by_player) == 1:
@@ -181,7 +184,15 @@ class SytistCsvBuilder:
             for pid in by_player:
                 self._buddy_groups.setdefault(pid, []).append(name)
 
+    def manifest_json(self) -> str:
+        """Which players each exported file shows, saved on the job so the
+        CSV can be rebuilt later from the final (cropped) folder."""
+        return json.dumps({"files": self._manifest})
+
     def write(self, out_dir: Path) -> dict:
+        return self.write_to(out_dir / CSV_FILENAME)
+
+    def write_to(self, path: Path) -> dict:
         memberships = (
             self.db.query(PlayerMembership).filter_by(job_id=self.job_id)
             .order_by(PlayerMembership.id.asc()).all()
@@ -241,8 +252,7 @@ class SytistCsvBuilder:
             rows.append([name] + [""] * 9 + ["1"])
             group_rows += 1
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / CSV_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh, lineterminator="\n")
             writer.writerow(CSV_HEADER)
@@ -257,3 +267,70 @@ class SytistCsvBuilder:
             "unassigned_files": len(self.unassigned),
             "unassigned_examples": self.unassigned[:20],
         }
+
+
+# ── Build the CSV from the final folder (2026-10-08) ─────────────────────
+# The export CSV names files as exported. After cropping, the files that go
+# to Sytist can differ in type (cropped shots become PNG) or be culled, so
+# this rebuilds the CSV from what's actually in the final folder: each file
+# is matched to the last export by base name, whatever its extension.
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def _stem_key(name: str) -> str:
+    return sytist_name(Path(name).stem).lower()
+
+
+def build_csv_from_folder(db: DbSession, job_id: int, folder: Path,
+                          manifest_json: str | None) -> dict:
+    if not manifest_json:
+        raise ValueError("Export this job with Sytist passcodes on first.")
+    try:
+        manifest = json.loads(manifest_json).get("files") or []
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("The saved export list is unreadable. Export again.")
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    by_stem: dict[str, list[int]] = {}
+    for exported_name, player_ids in manifest:
+        by_stem.setdefault(_stem_key(exported_name), list(player_ids))
+
+    first_membership: dict[int, PlayerMembership] = {}
+    team_files: set[str] = set()
+    for m in (db.query(PlayerMembership).filter_by(job_id=job_id)
+              .order_by(PlayerMembership.id.asc()).all()):
+        first_membership.setdefault(m.player_id, m)
+        team_files.update(n.lower() for n in team_photo_names(m.team_name))
+
+    builder = SytistCsvBuilder(db, job_id)
+    found_stems: set[str] = set()
+    team_found: set[str] = set()
+    not_in_export: list[str] = []
+    files = sorted(p for p in folder.rglob("*")
+                   if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    for p in files:
+        uploaded = sytist_name(p.name)
+        if uploaded.lower() in team_files:
+            team_found.add(uploaded.lower())
+            continue
+        key = _stem_key(p.name)
+        if key not in by_stem:
+            not_in_export.append(uploaded)
+            continue
+        found_stems.add(key)
+        members = [first_membership.get(pid) for pid in by_stem[key]]
+        builder.add_file(p.name, members)
+
+    stats = builder.write_to(folder / CSV_FILENAME)
+    stats.update({
+        "folder": str(folder),
+        "image_files": len(files),
+        "not_in_export": len(not_in_export),
+        "not_in_export_examples": not_in_export[:20],
+        "exported_not_in_folder": len(set(by_stem) - found_stems),
+        "team_photos_in_folder": len(team_found),
+        "team_photos_missing": sorted(team_files - team_found)[:40],
+    })
+    return stats

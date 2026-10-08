@@ -29,6 +29,12 @@ export default function ExportModal({ job, onClose }) {
   const [sytistSaving, setSytistSaving] = useState(false);
   // Most shoots' cropped photos are uploaded as PNGs (same name).
   const [uploadExt, setUploadExt] = useState('.png');
+  // 2026-10-08: rebuild the Sytist CSV from the final (cropped) folder.
+  const [finalFolder, setFinalFolder] = useState('');
+  const [showFinalPicker, setShowFinalPicker] = useState(false);
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [folderResult, setFolderResult] = useState(null);
+  const [folderError, setFolderError] = useState(null);
   const [phase, setPhase] = useState('form'); // form | running | done | error
   const [status, setStatus] = useState(null); // /export-status payload
   const [error, setError] = useState(null);
@@ -55,6 +61,75 @@ export default function ExportModal({ job, onClose }) {
       }
     }, 1000);
   };
+
+  const buildFromFolder = async () => {
+    setFolderBusy(true); setFolderError(null); setFolderResult(null);
+    try {
+      const res = await fetch(`/api/sytist/jobs/${job.id}/csv-from-folder`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder: finalFolder }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail?.message || `Failed (${res.status})`);
+      setFolderResult(body);
+    } catch (e) {
+      setFolderError(e.message);
+    } finally {
+      setFolderBusy(false);
+    }
+  };
+
+  const finalFolderSection = (
+    <div className="form-row" style={{ flexDirection: 'column', alignItems: 'stretch', marginTop: 8 }}>
+      <b>Build the passcode CSV from the final folder</b>
+      <span className="muted" style={{ fontSize: 13 }}>
+        After cropping, point this at the folder you upload to Sytist. Files are
+        matched to the last export by name (any file type), and the CSV is saved
+        in that folder.
+      </span>
+      <div className="actions" style={{ gap: 6, marginTop: 6 }}>
+        <input style={{ flex: 1 }} value={finalFolder} placeholder="Final folder"
+               onChange={e => setFinalFolder(e.target.value)} />
+        <button className="ghost" onClick={() => setShowFinalPicker(true)}>Browse…</button>
+        <button onClick={buildFromFolder} disabled={folderBusy || !finalFolder.trim()}>
+          {folderBusy ? 'Building…' : 'Build CSV'}
+        </button>
+      </div>
+      {folderError && <p className="error">{folderError}</p>}
+      {folderResult && (
+        <p>
+          Saved <code>{folderResult.path}</code> ({folderResult.photo_rows} photos,{' '}
+          {folderResult.players} players, {folderResult.group_photos} group photos).
+          {folderResult.not_in_export > 0 && (
+            <span className="warn">
+              {' '}{folderResult.not_in_export} file(s) weren't in the last export and got
+              no passcode (e.g. {folderResult.not_in_export_examples.slice(0, 3).join(', ')}).
+            </span>
+          )}
+          {folderResult.unassigned_files > 0 && (
+            <span className="warn">
+              {' '}{folderResult.unassigned_files} photo(s) aren't matched to a roster player.
+            </span>
+          )}
+          {folderResult.team_photos_missing.length > 0 && (
+            <span className="muted">
+              {' '}Team photos not in this folder (upload them too):{' '}
+              {folderResult.team_photos_missing.slice(0, 6).join(', ')}
+              {folderResult.team_photos_missing.length > 6 && '…'}
+            </span>
+          )}
+        </p>
+      )}
+      {showFinalPicker && (
+        <FolderBrowser
+          title="Choose the final folder"
+          initialPath={finalFolder || legacyDefault}
+          onPick={(p) => setFinalFolder(p)}
+          onClose={() => setShowFinalPicker(false)}
+        />
+      )}
+    </div>
+  );
 
   const toggleSytist = async (enabled) => {
     setSytistSaving(true);
@@ -187,6 +262,7 @@ export default function ExportModal({ job, onClose }) {
                   </select>
                 </label>
               )}
+              {sytistPasscodes && finalFolderSection}
             </div>
             {error && <p className="error">{error}</p>}
             <div className="actions">
@@ -241,8 +317,18 @@ export default function ExportModal({ job, onClose }) {
                     {status.result.sytist_csv.unassigned_examples.slice(0, 3).join(', ')}).
                   </span>
                 )}
+                {status.result.sytist_csv.sync && (
+                  status.result.sytist_csv.sync.error
+                    ? <span className="warn"> Couldn't sync families from Sytist: {status.result.sytist_csv.sync.error}</span>
+                    : <span className="muted">
+                        {' '}Synced Sytist families first ({status.result.sytist_csv.sync.matched_players} matched
+                        {status.result.sytist_csv.sync.unmatched > 0 &&
+                          `, ${status.result.sytist_csv.sync.unmatched} not on the roster`}).
+                      </span>
+                )}
               </p>
             )}
+            {status.result.sytist_csv && finalFolderSection}
             {status.result.sessions_skipped?.length > 0 && (
               <p className="warn">
                 Skipped: {status.result.sessions_skipped

@@ -7,6 +7,7 @@ import Toast from '../components/Toast.jsx';
 import ConfirmModal from '../components/ConfirmModal.jsx';
 import RosterModal from '../components/RosterModal.jsx';
 import PlayerRosterModal from '../components/PlayerRosterModal.jsx';
+import SytistFamiliesModal from '../components/SytistFamiliesModal.jsx';
 import ConnectivityBanner from '../components/ConnectivityBanner.jsx';
 
 export default function JobDetail() {
@@ -16,6 +17,7 @@ export default function JobDetail() {
   const [exporting, setExporting] = useState(false);
   const [showRoster, setShowRoster] = useState(false);
   const [showPlayerRoster, setShowPlayerRoster] = useState(false);
+  const [showSytist, setShowSytist] = useState(false);
   // {entries_loaded, mismatch_count, suggestions_count}
   //   entries_loaded     — Phase 6 RosterEntry row count (vestigial — see
   //                        memory: match-team-alias-issue)
@@ -231,6 +233,14 @@ export default function JobDetail() {
           >
             Player roster
           </button>
+          {!!job.sytist_passcodes && (
+            <button
+              onClick={() => setShowSytist(true)}
+              title="Pull parent contact from Sytist bookings and pre-registration"
+            >
+              Sytist families
+            </button>
+          )}
           <button onClick={() => setExporting(true)}>Export job</button>
           {job.archived
             ? <button className="ghost" onClick={unarchiveJob}>Unarchive job</button>
@@ -322,6 +332,10 @@ export default function JobDetail() {
           onClose={() => setShowRoster(false)}
           onChanged={() => { loadRosterSummary(); load(); }}
         />
+      )}
+
+      {showSytist && (
+        <SytistFamiliesModal job={job} onClose={() => setShowSytist(false)} />
       )}
 
       {showPlayerRoster && (
