@@ -31,7 +31,7 @@ from app.services.players import (
     replace_shoot_memberships,
 )
 from app.services.sytist_passcodes import ensure_job_passcodes
-from app.services.sytist_sync import apply_families
+from app.services.sytist_sync import apply_families, booked_at_by_name
 from app.services.roster import CsvParseError, decode_bytes, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,8 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
         .order_by(PlayerMembership.id.asc())
         .all()
     )
+    # Booking-calendar shoots: the tablet can sort by booking slot.
+    booked = booked_at_by_name(db, job_id)
     return {
         "memberships_loaded": len(memberships),
         "items": [
@@ -98,6 +100,7 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
                 "parent_last_name": m.parent_last_name,
                 "parent_email": m.parent_email,
                 "parent_phone": m.parent_phone,
+                "booked_at": booked.get(m.player.norm_name),
             }
             for m in memberships
         ],

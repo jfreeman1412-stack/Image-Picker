@@ -33,3 +33,14 @@ def test_no_name_answer():
 
 def test_windows_line_endings():
     assert subject_from_options("Gymnasts Name:|Ivy Park|0.00\r\nSport|Gym|0") == ("Ivy", "Park")
+
+
+def test_booked_at_formats():
+    from datetime import date, timedelta
+    from app.services.sytist_db import booked_at
+    assert booked_at({"book_date": date(2026, 10, 10), "book_time": timedelta(hours=9, minutes=5)}) \
+        == "2026-10-10 09:05"
+    assert booked_at({"book_date": "2026-10-10", "book_time": "1:30 PM"}) == "2026-10-10 13:30"
+    assert booked_at({"book_date": "2026-10-10", "book_start": "14:00:00"}) == "2026-10-10 14:00"
+    assert booked_at({"book_date": "2026-10-10", "book_time": ""}) == "2026-10-10"
+    assert booked_at({"book_date": None, "book_time": "9:00 AM"}) is None

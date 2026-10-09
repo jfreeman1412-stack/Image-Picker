@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session as DbSession
 
@@ -169,6 +170,44 @@ def subject_from_options(options) -> tuple[str | None, str | None]:
     return None, None
 
 
+# Which ms_bookings column holds the slot's time of day isn't pinned down
+# across Sytist versions, so the booking query reads every column and the
+# first of these that's present is used.
+_TIME_COLUMNS = ("book_time", "book_start_time", "book_start", "book_time_start")
+_TIME_FORMATS = ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p", "%I:%M:%S %p")
+
+
+def _clock(value) -> str | None:
+    """A time-of-day value as "HH:MM", or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, timedelta):            # pymysql returns TIME as timedelta
+        minutes = int(value.total_seconds()) // 60
+        return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
+    if isinstance(value, (time, datetime)):
+        return value.strftime("%H:%M")
+    if isinstance(value, (int, float)) and 0 <= value < 24 * 60:
+        return f"{int(value) // 60:02d}:{int(value) % 60:02d}"  # minutes after midnight
+    text = str(value).strip().upper()
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+def booked_at(row: dict) -> str | None:
+    """When the booking's slot is, as "YYYY-MM-DD HH:MM" (or just the date
+    when no time is stored), so it sorts as text. None without a date."""
+    day = row.get("book_date")
+    if not day:
+        return None
+    day = day.strftime("%Y-%m-%d") if isinstance(day, (date, datetime)) else str(day)[:10]
+    clock = next((c for c in (_clock(row.get(k)) for k in _TIME_COLUMNS) if c), None)
+    return f"{day} {clock}" if clock else day
+
+
 class SytistSource:
     """The queries Player Sort runs. Tests swap in a fake with the same
     methods (see sytist_sync.get_source)."""
@@ -260,9 +299,7 @@ class SytistSource:
         with connect(self.db) as conn:
             if where:
                 for r in _query(conn, f"""
-                    SELECT book_id, book_subject_first_name, book_subject_last_name,
-                           book_first_name, book_last_name, book_email, book_phone,
-                           book_options
+                    SELECT *
                     FROM ms_bookings
                     WHERE {" OR ".join(where)}
                 """, tuple(params)):
@@ -277,6 +314,7 @@ class SytistSource:
                         "parent_last_name": r["book_last_name"],
                         "parent_email": r["book_email"],
                         "parent_phone": r["book_phone"],
+                        "booked_at": booked_at(r),
                     })
             if gallery_ids:
                 for r in _query(conn, f"""

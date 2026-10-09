@@ -247,8 +247,10 @@ def test_booking_calendar_job_builds_roster_and_takes_team_from_folder(ctx, fake
     jid = job.id
     db.close()
     fake_source.families_out = [
-        _fam("booking", "1", "Ava Smith", "Jane Smith", "jane@example.com", "555-1"),
-        _fam("booking", "2", "Ben Jones", "Tom Jones", "tom@example.com"),
+        {**_fam("booking", "1", "Ava Smith", "Jane Smith", "jane@example.com", "555-1"),
+         "booked_at": "2026-10-11 13:30"},
+        {**_fam("booking", "2", "Ben Jones", "Tom Jones", "tom@example.com"),
+         "booked_at": "2026-10-11 09:00"},
         _fam("booking", "3", "", "No Kid", "nokid@example.com"),
     ]
     client.put(f"/api/sytist/jobs/{jid}/sources",
@@ -261,6 +263,9 @@ def test_booking_calendar_job_builds_roster_and_takes_team_from_folder(ctx, fake
     assert {(i["name"], i["team"]) for i in roster} == {("Ava Smith", ""), ("Ben Jones", "")}
     assert all(i["passcode"] for i in roster)            # passcodes on for this job
     assert {i["parent_email"] for i in roster} == {"jane@example.com", "tom@example.com"}
+    # The tablet sorts by booking slot.
+    assert {i["name"]: i["booked_at"] for i in roster} == {
+        "Ava Smith": "2026-10-11 13:30", "Ben Jones": "2026-10-11 09:00"}
     # Re-sync adds nobody twice.
     assert client.post(f"/api/sytist/jobs/{jid}/sync").json()["roster_added"] == 0
 

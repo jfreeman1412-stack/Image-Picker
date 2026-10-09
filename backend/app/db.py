@@ -132,6 +132,9 @@ _PHASE2_COLUMNS = {
         ("parent_email", "VARCHAR"),
         ("parent_phone", "VARCHAR"),
     ],
+    "sytist_families": [
+        ("booked_at", "VARCHAR"),
+    ],
 }
 
 
