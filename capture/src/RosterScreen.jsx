@@ -250,8 +250,9 @@ export default function RosterScreen({
 
         {ready && items.length === 0 && (
           <p className="muted roster-pad">
-            No roster loaded for this shoot. Upload one for this job (see README),
-            then retry.
+            {showSignups
+              ? 'No sign-ups on the roster yet. Tap “Get new sign-ups” to pull them from the booking calendar.'
+              : 'No roster loaded for this shoot. Upload one for this job (see README), then retry.'}
           </p>
         )}
 
