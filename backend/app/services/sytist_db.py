@@ -3,7 +3,9 @@
 Player Sort pulls families for a passcode job from two Sytist tables:
 
   - ms_bookings: booking-calendar sign-ups. book_special_event_id is the
-    photo day (ms_booking_special_dates.sd_date_id); book_first/last_name,
+    booking session (ms_booking_special_dates.sd_id); that session's
+    sd_date_id is the booking page (ms_calendar.date_id), whose date_title
+    is the name people see. book_first/last_name,
     book_email, book_phone are the parent; book_subject_first/last_name the
     player.
   - ms_pre_register: gallery pre-registrations. reg_date_id is the gallery
@@ -132,6 +134,16 @@ def _placeholders(values) -> str:
     return ", ".join(["%s"] * len(values))
 
 
+def _event_title(row: dict) -> str:
+    """Booking page name, plus the session name when it has one, e.g.
+    "Revolution Gymnastics Photo Day Sign Up-2026 · Tues AM Sessions"."""
+    page = (row.get("page_title") or "").strip()
+    session = (row.get("session_title") or "").strip()
+    if page and session:
+        return f"{page} · {session}"
+    return page or session or f"Event {row['id']}"
+
+
 class SytistSource:
     """The queries Player Sort runs. Tests swap in a fake with the same
     methods (see sytist_sync.get_source)."""
@@ -151,14 +163,16 @@ class SytistSource:
         per date). Newest first."""
         with connect(self.db) as conn:
             events = _query(conn, """
-                SELECT b.book_special_event_id AS id, sd.sd_title AS title,
+                SELECT b.book_special_event_id AS id, c.date_title AS page_title,
+                       sd.sd_title AS session_title,
                        MIN(b.book_date) AS first_date, MAX(b.book_date) AS last_date,
                        COUNT(*) AS bookings
                 FROM ms_bookings b
                 LEFT JOIN ms_booking_special_dates sd
-                       ON sd.sd_date_id = b.book_special_event_id
+                       ON sd.sd_id = b.book_special_event_id
+                LEFT JOIN ms_calendar c ON c.date_id = sd.sd_date_id
                 WHERE b.book_special_event_id > 0
-                GROUP BY b.book_special_event_id, sd.sd_title
+                GROUP BY b.book_special_event_id, c.date_title, sd.sd_title
                 ORDER BY MAX(b.book_date) DESC
                 LIMIT %s
             """, (int(limit),))
@@ -172,7 +186,7 @@ class SytistSource:
             """, (int(limit),))
         out = [{
             "kind": "event", "id": int(r["id"]),
-            "title": r["title"] or f"Event {r['id']}",
+            "title": _event_title(r),
             "first_date": str(r["first_date"] or ""), "last_date": str(r["last_date"] or ""),
             "bookings": int(r["bookings"] or 0),
         } for r in events]
