@@ -220,11 +220,12 @@ class SytistSource:
             _query(conn, "SELECT 1 AS ok")
         return {"ok": True}
 
-    def booking_events(self, limit: int = 100) -> list[dict]:
+    def booking_events(self, limit: int = 100, keep_days: int = 3) -> list[dict]:
         """Booking-calendar sign-ups grouped the way a shoot is picked:
         special events (book_special_event_id > 0, one row per event, which
         can span several dates) and regular calendar days (no event, one row
-        per date). Newest first."""
+        per date). Only events whose last booking is today, upcoming, or at
+        most `keep_days` days ago are listed, soonest first."""
         with connect(self.db) as conn:
             events = _query(conn, """
                 SELECT b.book_special_event_id AS id, c.date_title AS page_title,
@@ -237,17 +238,19 @@ class SytistSource:
                 LEFT JOIN ms_calendar c ON c.date_id = sd.sd_date_id
                 WHERE b.book_special_event_id > 0
                 GROUP BY b.book_special_event_id, c.date_title, sd.sd_title
-                ORDER BY MAX(b.book_date) DESC
+                HAVING MAX(b.book_date) >= CURDATE() - INTERVAL %s DAY
+                ORDER BY MIN(b.book_date) ASC
                 LIMIT %s
-            """, (int(limit),))
+            """, (int(keep_days), int(limit)))
             days = _query(conn, """
                 SELECT b.book_date AS day, COUNT(*) AS bookings
                 FROM ms_bookings b
-                WHERE b.book_special_event_id = 0 OR b.book_special_event_id IS NULL
+                WHERE (b.book_special_event_id = 0 OR b.book_special_event_id IS NULL)
+                  AND b.book_date >= CURDATE() - INTERVAL %s DAY
                 GROUP BY b.book_date
-                ORDER BY b.book_date DESC
+                ORDER BY b.book_date ASC
                 LIMIT %s
-            """, (int(limit),))
+            """, (int(keep_days), int(limit)))
         out = [{
             "kind": "event", "id": int(r["id"]),
             "title": _event_title(r),
@@ -259,7 +262,7 @@ class SytistSource:
             "first_date": str(r["day"]), "last_date": str(r["day"]),
             "bookings": int(r["bookings"] or 0),
         } for r in days if r["day"]]
-        out.sort(key=lambda e: e["last_date"], reverse=True)
+        out.sort(key=lambda e: (e["first_date"], e["title"]))
         return out[:limit]
 
     def galleries(self, q: str = "", limit: int = 50) -> list[dict]:
