@@ -61,6 +61,7 @@ def upsert_player(db: DbSession, raw_name: str) -> tuple[Player | None, bool]:
 MEMBERSHIP_CONTACT_FIELDS = (
     "passcode", "subject_first_name", "subject_last_name",
     "parent_first_name", "parent_last_name", "parent_email", "parent_phone",
+    "passcode_locked",
 )
 
 
@@ -339,6 +340,9 @@ def parse_mapped_contacts(text: str, mapping: dict) -> dict:
         slot = out.setdefault((normalize_name(name), normalize_name(team)), {})
         for f, v in values.items():
             slot.setdefault(f, v)
+        # A code from the roster is already in Sytist: never change it.
+        if slot.get("passcode"):
+            slot["passcode_locked"] = 1
     return out
 
 
