@@ -18,7 +18,7 @@ from app.models.db_models import (
 )
 from app.services.players import parse_mapped_contacts, replace_shoot_memberships
 from app.services.sytist_passcodes import (
-    CSV_FILENAME, PASSCODE_ALPHABET, PASSCODE_LENGTH, ensure_job_passcodes,
+    PASSCODE_ALPHABET, csv_filename, PASSCODE_LENGTH, ensure_job_passcodes,
     team_photo_names,
 )
 
@@ -243,7 +243,7 @@ def test_export_off_writes_no_csv(ctx):
     jid, root = _two_kid_job(SL, tmp_path, sytist=0)
     result = _export(client, jid)
     assert "sytist_csv" not in result
-    assert not (root.parent / "Shoot_sorted" / CSV_FILENAME).exists()
+    assert not (root.parent / "Shoot_sorted" / csv_filename("Shoot")).exists()
 
 
 def test_export_writes_import_csv_legacy_names(ctx):
@@ -335,3 +335,26 @@ def test_bad_upload_ext_rejected(ctx):
     r = client.post(f"/api/jobs/{jid}/export",
                     json={"mode": "copy", "sytist_upload_ext": ".exe"})
     assert r.status_code == 400
+
+
+def test_csv_named_after_job():
+    assert csv_filename("Spring Soccer 2026") == "Spring_Soccer_2026_sytist_passcodes.csv"
+    assert csv_filename("Lions/Tigers: U10") == "Lions_Tigers_U10_sytist_passcodes.csv"
+    assert csv_filename("") == "job_sytist_passcodes.csv"
+
+
+def test_export_flags_same_file_name_on_two_teams(ctx):
+    client, SL, tmp_path = ctx
+    db = SL()
+    job, root = _job(db, tmp_path)
+    _roster(db, job, [("Ava Smith", "Tigers"), ("Ben Jones", "Lions")])
+    for team, kid in (("Tigers", "Ava Smith"), ("Lions", "Ben Jones")):
+        sess, folder = _session(db, job, root, team)
+        _image(db, sess, folder, "IMG_0001.jpg", [(_cluster(db, sess, kid), "individual")])
+    _image(db, sess, folder, "IMG_0002.jpg", [(_cluster(db, sess, "Ben Jones"), "individual")])
+    jid = job.id
+    db.close()
+    info = _export(client, jid)["sytist_csv"]
+    assert info["path"].endswith("Shoot_sytist_passcodes.csv")
+    assert info["duplicate_names"] == 1
+    assert info["duplicate_examples"] == ["IMG_0001.jpg"]

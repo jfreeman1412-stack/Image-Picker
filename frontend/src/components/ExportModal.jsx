@@ -105,6 +105,13 @@ export default function ExportModal({ job, onClose }) {
               no passcode (e.g. {folderResult.not_in_export_examples.slice(0, 3).join(', ')}).
             </span>
           )}
+          {folderResult.duplicate_names > 0 && (
+            <span className="warn">
+              {' '}{folderResult.duplicate_names} file name(s) are used more than once (e.g.{' '}
+              {folderResult.duplicate_examples.slice(0, 3).join(', ')}). Sytist matches photos by
+              name across the whole gallery, so rename them before uploading.
+            </span>
+          )}
           {folderResult.unassigned_files > 0 && (
             <span className="warn">
               {' '}{folderResult.unassigned_files} photo(s) aren't matched to a roster player.
@@ -226,7 +233,7 @@ export default function ExportModal({ job, onClose }) {
               {sytistPasscodes ? (
                 <span>
                   <b>Sytist passcodes are on for this job.</b> The export also writes{' '}
-                  <code>sytist_passcode_import.csv</code> to import into a Preset
+                  <code>{'<job name>'}_sytist_passcodes.csv</code> to import into a Preset
                   Passcode Photos gallery after uploading the photos.
                 </span>
               ) : (
@@ -292,6 +299,13 @@ export default function ExportModal({ job, onClose }) {
                 ({status.result.sytist_csv.players} players,{' '}
                 {status.result.sytist_csv.photo_rows} photos,{' '}
                 {status.result.sytist_csv.group_photos} group photos).
+                {status.result.sytist_csv.duplicate_names > 0 && (
+                  <span className="warn">
+                    {' '}{status.result.sytist_csv.duplicate_names} file name(s) are used more than once (e.g.{' '}
+                    {status.result.sytist_csv.duplicate_examples.slice(0, 3).join(', ')}). Sytist matches photos by
+                    name across the whole gallery, so rename them before uploading.
+                  </span>
+                )}
                 {status.result.sytist_csv.unassigned_files > 0 && (
                   <span className="warn">
                     {' '}{status.result.sytist_csv.unassigned_files} photo(s) aren't
