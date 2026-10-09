@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { FLAG_LABELS } from '../utils/reviewFlags.js';
+import { ConnectionForm } from '../components/SytistSources.jsx';
 
 export default function Settings() {
   const [vis, setVis] = useState(null);
@@ -64,6 +65,15 @@ export default function Settings() {
           </button>
           {saved && <span className="muted" style={{ alignSelf: 'center' }}>Saved ✓</span>}
         </div>
+      </section>
+
+      <section className="card">
+        <h2>Sytist login</h2>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Used by passcode jobs to pull sign-ups from the booking calendar and
+          gallery pre-registration. Leave the password blank to keep the saved one.
+        </p>
+        <ConnectionForm onSaved={() => {}} />
       </section>
     </div>
   );
