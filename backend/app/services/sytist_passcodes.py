@@ -170,19 +170,28 @@ class SytistCsvBuilder:
     _group_files: list[str] = field(default_factory=list)
     unassigned: list[str] = field(default_factory=list)
     _manifest: list[list] = field(default_factory=list)
+    # Players with no roster team (booking-calendar sign-ups) take the team
+    # of the folder their photos were sorted into: player_id -> [teams].
+    _folder_teams: dict[int, list[str]] = field(default_factory=dict)
 
     def upload_name(self, exported_name: str) -> str:
         if self.upload_ext:
             exported_name = Path(exported_name).stem + self.upload_ext
         return sytist_name(exported_name)
 
-    def add_file(self, exported_name: str, memberships) -> None:
+    def add_file(self, exported_name: str, memberships, team: str | None = None) -> None:
         name = self.upload_name(exported_name)
         by_player: dict[int, PlayerMembership] = {}
         for m in memberships:
             if m is not None:
                 by_player.setdefault(m.player_id, m)
-        self._manifest.append([exported_name, sorted(by_player)])
+        self._manifest.append([exported_name, sorted(by_player), team])
+        if team and team.strip():
+            for pid, m in by_player.items():
+                if not (m.team_name or "").strip():
+                    teams = self._folder_teams.setdefault(pid, [])
+                    if team not in teams:
+                        teams.append(team)
         if not by_player:
             self.unassigned.append(name)
         elif len(by_player) == 1:
@@ -212,10 +221,15 @@ class SytistCsvBuilder:
         for m in memberships:
             first_membership.setdefault(m.player_id, m)
             teams_by_player.setdefault(m.player_id, [])
-            if m.team_name not in teams_by_player[m.player_id]:
-                teams_by_player[m.player_id].append(m.team_name)
-            if m.team_name not in team_names:
-                team_names.append(m.team_name)
+            # A blank roster team (no team on the sign-up) is filled from the
+            # photo folders below; it never makes a team photo of its own.
+            teams = [m.team_name] if (m.team_name or "").strip() \
+                else self._folder_teams.get(m.player_id, [])
+            for team in teams:
+                if team not in teams_by_player[m.player_id]:
+                    teams_by_player[m.player_id].append(team)
+                if team not in team_names:
+                    team_names.append(team)
 
         def groups_for(player_id: int) -> str:
             names: list[str] = []
@@ -311,16 +325,22 @@ def build_csv_from_folder(db: DbSession, job_id: int, folder: Path,
     if not folder.is_dir():
         raise FileNotFoundError(f"Folder not found: {folder}")
 
-    by_stem: dict[str, list[int]] = {}
-    for exported_name, player_ids in manifest:
-        by_stem.setdefault(_stem_key(exported_name), list(player_ids))
+    by_stem: dict[str, tuple[list[int], str | None]] = {}
+    for entry in manifest:
+        exported_name, player_ids = entry[0], entry[1]
+        team = entry[2] if len(entry) > 2 else None
+        by_stem.setdefault(_stem_key(exported_name), (list(player_ids), team))
 
     first_membership: dict[int, PlayerMembership] = {}
     team_files: set[str] = set()
     for m in (db.query(PlayerMembership).filter_by(job_id=job_id)
               .order_by(PlayerMembership.id.asc()).all()):
         first_membership.setdefault(m.player_id, m)
-        team_files.update(n.lower() for n in team_photo_names(m.team_name))
+        if (m.team_name or "").strip():
+            team_files.update(n.lower() for n in team_photo_names(m.team_name))
+    for _, (_, team) in by_stem.items():
+        if team and team.strip():
+            team_files.update(n.lower() for n in team_photo_names(team))
 
     builder = SytistCsvBuilder(db, job_id)
     found_stems: set[str] = set()
@@ -338,8 +358,8 @@ def build_csv_from_folder(db: DbSession, job_id: int, folder: Path,
             not_in_export.append(uploaded)
             continue
         found_stems.add(key)
-        members = [first_membership.get(pid) for pid in by_stem[key]]
-        builder.add_file(p.name, members)
+        player_ids, team = by_stem[key]
+        builder.add_file(p.name, [first_membership.get(pid) for pid in player_ids], team)
 
     job = db.query(Job).get(job_id)
     stats = builder.write_to(folder / csv_filename(job.name if job else ""))

@@ -69,10 +69,20 @@ async function fetchRoster(jobId) {
   return body.items || [];
 }
 
+async function postSignupSync(jobId) {
+  const res = await fetch(`/api/sytist/jobs/${jobId}/sync`, { method: 'POST' });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail?.message || `HTTP ${res.status}`);
+  return body;
+}
+
 export default function App() {
   const [view, setView] = useState('shoots');             // shoots|roster|capture|attention
   const [selectedJob, setSelectedJob] = useState(null);     // { id, name }
   const [selectedPlayer, setSelectedPlayer] = useState(null);
+  // 2026-10-09: "Get new sign-ups" pulls the Sytist booking calendar into the
+  // roster now; the reload (and the other tablets' 20s poll) shows them.
+  const [signupState, setSignupState] = useState(null);     // {busy}|{msg}|{error}
 
   // Roster state, lifted here so it persists across roster → capture → roster.
   const [roster, setRoster] = useState([]);                 // membership items
@@ -114,6 +124,19 @@ export default function App() {
   const refreshLocalPlayers = useCallback(async () => {
     const jobId = selectedJob?.id;
     setLocalPlayers(jobId != null ? await listLocalPlayersByJob(jobId) : []);
+  }, [selectedJob]);
+
+  const getSignups = useCallback(async () => {
+    if (!selectedJob) return;
+    setSignupState({ busy: true });
+    try {
+      const r = await postSignupSync(selectedJob.id);
+      const n = r.roster_added || 0;
+      setSignupState({ msg: n ? `${n} new sign-up${n === 1 ? '' : 's'} added` : 'No new sign-ups' });
+      setReloadKey((k) => k + 1);
+    } catch (e) {
+      setSignupState({ error: `Couldn’t reach Sytist: ${e.message}` });
+    }
   }, [selectedJob]);
 
   // Each item the drainer resolves: a SYNC flips ✓ green live (current shoot) and
@@ -326,6 +349,7 @@ export default function App() {
 
   const backToShoots = () => {
     setSelectedJob(null);
+    setSignupState(null);
     setSelectedPlayer(null);
     setRoster([]);
     setReferencedPlayerIds(new Set());
@@ -469,6 +493,9 @@ export default function App() {
         onOpenAttention={() => setView('attention')}
         onReload={() => setReloadKey((k) => k + 1)}
         onBack={backToShoots}
+        showSignups={!!selectedJob?.sytist_sync}
+        signupState={signupState}
+        onGetSignups={getSignups}
       />
     );
   }

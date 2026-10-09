@@ -45,13 +45,13 @@ export default function ShootPicker({ onPick }) {
       const res = await fetch('/api/jobs?stage=capture');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      const list = Array.isArray(data) ? data.map((j) => ({ id: j.id, name: j.name })) : [];
+      const list = Array.isArray(data) ? data.map((j) => ({ id: j.id, name: j.name, sytist_sync: !!j.sytist_sync })) : [];
       await putShoots(list);
       setJobs(list);
       setSource('network');
     } catch {
       if (cached.length) {
-        setJobs(cached.map((s) => ({ id: s.id, name: s.name })));
+        setJobs(cached.map((s) => ({ id: s.id, name: s.name, sytist_sync: !!s.sytist_sync })));
         setSource('cache');
       } else {
         setError('Couldn’t reach the server and no shoots are cached. Connect, then retry.');

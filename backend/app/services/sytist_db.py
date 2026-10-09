@@ -145,18 +145,44 @@ class SytistSource:
         return {"ok": True}
 
     def booking_events(self, limit: int = 100) -> list[dict]:
+        """Booking-calendar sign-ups grouped the way a shoot is picked:
+        special events (book_special_event_id > 0, one row per event, which
+        can span several dates) and regular calendar days (no event, one row
+        per date). Newest first."""
         with connect(self.db) as conn:
-            rows = _query(conn, """
-                SELECT sd.sd_date_id AS id, sd.sd_title AS title,
-                       sd.sd_date AS date, COUNT(b.book_id) AS bookings
-                FROM ms_booking_special_dates sd
-                LEFT JOIN ms_bookings b ON b.book_special_event_id = sd.sd_date_id
-                GROUP BY sd.sd_date_id, sd.sd_title, sd.sd_date
-                ORDER BY sd.sd_date DESC, sd.sd_date_id DESC
+            events = _query(conn, """
+                SELECT b.book_special_event_id AS id, sd.sd_title AS title,
+                       MIN(b.book_date) AS first_date, MAX(b.book_date) AS last_date,
+                       COUNT(*) AS bookings
+                FROM ms_bookings b
+                LEFT JOIN ms_booking_special_dates sd
+                       ON sd.sd_date_id = b.book_special_event_id
+                WHERE b.book_special_event_id > 0
+                GROUP BY b.book_special_event_id, sd.sd_title
+                ORDER BY MAX(b.book_date) DESC
                 LIMIT %s
             """, (int(limit),))
-        return [{"id": r["id"], "title": r["title"], "date": str(r["date"] or ""),
-                 "bookings": int(r["bookings"] or 0)} for r in rows]
+            days = _query(conn, """
+                SELECT b.book_date AS day, COUNT(*) AS bookings
+                FROM ms_bookings b
+                WHERE b.book_special_event_id = 0 OR b.book_special_event_id IS NULL
+                GROUP BY b.book_date
+                ORDER BY b.book_date DESC
+                LIMIT %s
+            """, (int(limit),))
+        out = [{
+            "kind": "event", "id": int(r["id"]),
+            "title": r["title"] or f"Event {r['id']}",
+            "first_date": str(r["first_date"] or ""), "last_date": str(r["last_date"] or ""),
+            "bookings": int(r["bookings"] or 0),
+        } for r in events]
+        out += [{
+            "kind": "day", "id": str(r["day"]), "title": "Booking calendar",
+            "first_date": str(r["day"]), "last_date": str(r["day"]),
+            "bookings": int(r["bookings"] or 0),
+        } for r in days if r["day"]]
+        out.sort(key=lambda e: e["last_date"], reverse=True)
+        return out[:limit]
 
     def galleries(self, q: str = "", limit: int = 50) -> list[dict]:
         sql = """
@@ -178,18 +204,28 @@ class SytistSource:
         return [{"id": r["id"], "title": r["title"],
                  "registrations": int(r["registrations"] or 0)} for r in rows]
 
-    def families(self, booking_event_ids, gallery_ids) -> list[dict]:
+    def families(self, booking_event_ids, gallery_ids, booking_dates=()) -> list[dict]:
         out: list[dict] = []
         booking_event_ids = [int(x) for x in booking_event_ids or []]
         gallery_ids = [int(x) for x in gallery_ids or []]
+        booking_dates = [str(x) for x in booking_dates or []]
+        where, params = [], []
+        if booking_event_ids:
+            where.append(f"book_special_event_id IN ({_placeholders(booking_event_ids)})")
+            params += booking_event_ids
+        if booking_dates:
+            where.append(
+                "((book_special_event_id = 0 OR book_special_event_id IS NULL)"
+                f" AND book_date IN ({_placeholders(booking_dates)}))")
+            params += booking_dates
         with connect(self.db) as conn:
-            if booking_event_ids:
+            if where:
                 for r in _query(conn, f"""
                     SELECT book_id, book_subject_first_name, book_subject_last_name,
                            book_first_name, book_last_name, book_email, book_phone
                     FROM ms_bookings
-                    WHERE book_special_event_id IN ({_placeholders(booking_event_ids)})
-                """, tuple(booking_event_ids)):
+                    WHERE {" OR ".join(where)}
+                """, tuple(params)):
                     out.append({
                         "source": "booking", "source_id": str(r["book_id"]),
                         "subject_first_name": r["book_subject_first_name"],

@@ -1,4 +1,7 @@
 import { useEffect, useState } from 'react';
+import {
+  ConnectionForm, SytistSourcePicker, api, emptySources, jsonOpts,
+} from './SytistSources.jsx';
 
 /**
  * 2026-10-08 — Sytist families for a passcode job.
@@ -10,84 +13,10 @@ import { useEffect, useState } from 'react';
  * here to be put on a team. Export also syncs first, so new sign-ups are
  * picked up without opening this.
  */
-async function api(url, opts) {
-  const res = await fetch(url, opts);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const d = body.detail;
-    throw new Error((d && (d.message || d)) || `Request failed (${res.status})`);
-  }
-  return body;
-}
-
-const jsonOpts = (method, body) => ({
-  method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-});
-
-function ConnectionForm({ onSaved }) {
-  const [cfg, setCfg] = useState({ host: '', port: 3306, user: '', password: '', database: 'sportsline' });
-  const [passwordSet, setPasswordSet] = useState(false);
-  const [msg, setMsg] = useState(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    api('/api/sytist/settings').then(c => {
-      setCfg({ host: c.host, port: c.port, user: c.user, password: '', database: c.database });
-      setPasswordSet(c.password_set);
-    }).catch(e => setMsg(e.message));
-  }, []);
-
-  const save = async () => {
-    setBusy(true); setMsg(null);
-    try {
-      await api('/api/sytist/settings', jsonOpts('PUT', { ...cfg, port: Number(cfg.port) || 3306 }));
-      await api('/api/sytist/test', { method: 'POST' });
-      setMsg('Connected.');
-      onSaved();
-    } catch (e) {
-      setMsg(e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const field = (key, label, type = 'text') => (
-    <label style={{ display: 'flex', flexDirection: 'column', fontSize: 13 }}>
-      {label}
-      <input type={type} value={cfg[key]} onChange={e => setCfg({ ...cfg, [key]: e.target.value })}
-             placeholder={key === 'password' && passwordSet ? '(saved)' : ''} />
-    </label>
-  );
-
-  return (
-    <section style={{ marginBottom: 16 }}>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Sytist database login (read-only). Same details as the production dashboard.
-      </p>
-      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 8 }}>
-        {field('host', 'Host')}
-        {field('port', 'Port')}
-        {field('user', 'User')}
-        {field('password', 'Password', 'password')}
-        {field('database', 'Database')}
-      </div>
-      <div className="actions" style={{ marginTop: 8 }}>
-        <button onClick={save} disabled={busy || !cfg.host || !cfg.user}>
-          {busy ? 'Connecting…' : 'Save and test'}
-        </button>
-        {msg && <span className={msg === 'Connected.' ? 'muted' : 'error'}>{msg}</span>}
-      </div>
-    </section>
-  );
-}
-
 export default function SytistFamiliesModal({ job, onClose }) {
-  const [configured, setConfigured] = useState(null);
   const [showConnection, setShowConnection] = useState(false);
-  const [events, setEvents] = useState([]);
-  const [galleryQuery, setGalleryQuery] = useState('');
-  const [galleries, setGalleries] = useState([]);
-  const [sources, setSources] = useState({ booking_event_ids: [], gallery_ids: [] });
+  const [sources, setSources] = useState(emptySources());
+  const [autoAdd, setAutoAdd] = useState(false);
   const [state, setState] = useState(null);       // GET /jobs/{id}
   const [syncResult, setSyncResult] = useState(null);
   const [teams, setTeams] = useState([]);
@@ -98,15 +27,11 @@ export default function SytistFamiliesModal({ job, onClose }) {
 
   const loadState = () => api(`/api/sytist/jobs/${job.id}`).then(s => {
     setState(s);
-    setSources(s.sources);
+    const { auto_add: aa, ...src } = s.sources;
+    setSources(src);
+    setAutoAdd(aa);
     return s;
   });
-
-  const loadSytistLists = () => {
-    api('/api/sytist/booking-events').then(r => setEvents(r.items)).catch(e => setError(e.message));
-    api(`/api/sytist/galleries?q=${encodeURIComponent(galleryQuery)}`)
-      .then(r => setGalleries(r.items)).catch(() => {});
-  };
 
   const sync = async () => {
     setBusy(true); setError(null);
@@ -130,28 +55,19 @@ export default function SytistFamiliesModal({ job, onClose }) {
     api(`/api/players/roster/${job.id}`).then(r => {
       setTeams([...new Set(r.items.map(i => i.team))].sort());
     }).catch(() => {});
-    api('/api/sytist/settings').then(c => {
-      setConfigured(c.configured);
-      setShowConnection(!c.configured);
-      if (c.configured) loadSytistLists();
-    }).catch(e => setError(e.message));
     // Opening this pulls new sign-ups when the job is already linked.
     loadState().then(s => {
-      if (s.sources.booking_event_ids.length || s.sources.gallery_ids.length) sync();
+      const src = s.sources;
+      if (src.booking_event_ids.length || src.booking_dates.length || src.gallery_ids.length) sync();
     }).catch(e => setError(e.message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job.id]);
 
-  const toggle = (key, id) => {
-    const cur = new Set(sources[key]);
-    cur.has(id) ? cur.delete(id) : cur.add(id);
-    setSources({ ...sources, [key]: [...cur] });
-  };
-
   const saveSourcesAndSync = async () => {
     setError(null);
     try {
-      await api(`/api/sytist/jobs/${job.id}/sources`, jsonOpts('PUT', sources));
+      await api(`/api/sytist/jobs/${job.id}/sources`,
+                jsonOpts('PUT', { ...sources, auto_add: autoAdd }));
       await sync();
     } catch (e) {
       setError(e.message);
@@ -170,12 +86,6 @@ export default function SytistFamiliesModal({ job, onClose }) {
     }
   };
 
-  // Linked galleries stay visible even when the search doesn't list them.
-  const galleryRows = [
-    ...sources.gallery_ids.filter(id => !galleries.some(g => g.id === id))
-      .map(id => ({ id, title: `Gallery ${id}`, registrations: null })),
-    ...galleries,
-  ];
   const unmatched = state?.unmatched || [];
 
   return (
@@ -193,60 +103,26 @@ export default function SytistFamiliesModal({ job, onClose }) {
           Export syncs again first, so later sign-ups are picked up.
         </p>
 
-        {configured !== null && (
-          <p style={{ marginTop: 0 }}>
-            <button className="ghost" onClick={() => setShowConnection(v => !v)}>
-              {showConnection ? 'Hide Sytist login' : 'Sytist login…'}
-            </button>
-          </p>
-        )}
-        {showConnection && (
-          <ConnectionForm onSaved={() => { setConfigured(true); setShowConnection(false); loadSytistLists(); }} />
-        )}
+        <p style={{ marginTop: 0 }}>
+          <button className="ghost" onClick={() => setShowConnection(v => !v)}>
+            {showConnection ? 'Hide Sytist login' : 'Sytist login…'}
+          </button>
+        </p>
+        {showConnection && <ConnectionForm onSaved={() => setShowConnection(false)} />}
 
-        {configured && (
-          <section style={{ marginBottom: 16 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-              <div>
-                <h3 style={{ margin: '0 0 6px' }}>Booking calendar</h3>
-                <div style={{ maxHeight: 220, overflowY: 'auto' }}>
-                  {events.map(ev => (
-                    <label key={ev.id} style={{ display: 'block', fontSize: 13 }}>
-                      <input type="checkbox" checked={sources.booking_event_ids.includes(ev.id)}
-                             onChange={() => toggle('booking_event_ids', ev.id)} />
-                      {' '}{ev.title} <span className="muted">{ev.date} · {ev.bookings} booked</span>
-                    </label>
-                  ))}
-                  {events.length === 0 && <p className="muted">No booking events found.</p>}
-                </div>
-              </div>
-              <div>
-                <h3 style={{ margin: '0 0 6px' }}>Gallery pre-registration</h3>
-                <div className="actions" style={{ gap: 6, marginBottom: 6 }}>
-                  <input value={galleryQuery} placeholder="Search galleries"
-                         onChange={e => setGalleryQuery(e.target.value)}
-                         onKeyDown={e => { if (e.key === 'Enter') loadSytistLists(); }} />
-                  <button className="ghost" onClick={loadSytistLists}>Search</button>
-                </div>
-                <div style={{ maxHeight: 190, overflowY: 'auto' }}>
-                  {galleryRows.map(g => (
-                    <label key={g.id} style={{ display: 'block', fontSize: 13 }}>
-                      <input type="checkbox" checked={sources.gallery_ids.includes(g.id)}
-                             onChange={() => toggle('gallery_ids', g.id)} />
-                      {' '}{g.title}
-                      {g.registrations != null && <span className="muted"> · {g.registrations} registered</span>}
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </div>
-            <div className="actions" style={{ marginTop: 10 }}>
-              <button onClick={saveSourcesAndSync} disabled={busy}>
-                {busy ? 'Syncing…' : 'Save and sync now'}
-              </button>
-            </div>
-          </section>
-        )}
+        <section style={{ marginBottom: 16 }}>
+          <SytistSourcePicker value={sources} onChange={setSources} />
+          <label style={{ display: 'block', marginTop: 10, fontSize: 13 }}>
+            <input type="checkbox" checked={autoAdd} onChange={e => setAutoAdd(e.target.checked)} />
+            {' '}Add sign-ups that aren't on the roster automatically (no team; the
+            team comes from the folder their photos are sorted into)
+          </label>
+          <div className="actions" style={{ marginTop: 10 }}>
+            <button onClick={saveSourcesAndSync} disabled={busy}>
+              {busy ? 'Syncing…' : 'Save and sync now'}
+            </button>
+          </div>
+        </section>
 
         {error && <p className="error">{error}</p>}
 
@@ -259,7 +135,8 @@ export default function SytistFamiliesModal({ job, onClose }) {
               {syncResult && (
                 <span className="muted">
                   {' '}This sync: {syncResult.added} new, {syncResult.updated} changed,
-                  {' '}{syncResult.removed} removed.
+                  {' '}{syncResult.removed} removed
+                  {syncResult.roster_added > 0 && `, ${syncResult.roster_added} added to the roster`}.
                 </span>
               )}
             </p>

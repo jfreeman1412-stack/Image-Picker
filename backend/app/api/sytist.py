@@ -102,13 +102,16 @@ def job_sync_state(job_id: int, db: DbSession = Depends(get_db)):
 
 class SourcesRequest(BaseModel):
     booking_event_ids: list[int] = []
+    booking_dates: list[str] = []
     gallery_ids: list[int] = []
+    auto_add: bool = False
 
 
 @router.put("/jobs/{job_id}/sources")
 def put_sources(job_id: int, payload: SourcesRequest, db: DbSession = Depends(get_db)):
     job = _job(db, job_id)
-    sources = sytist_sync.set_sources(job, payload.booking_event_ids, payload.gallery_ids)
+    sources = sytist_sync.set_sources(job, payload.booking_event_ids, payload.gallery_ids,
+                                      payload.booking_dates, payload.auto_add)
     db.commit()
     return {"sources": sources}
 

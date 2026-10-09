@@ -24,13 +24,15 @@ def _fam(source, sid, kid, parent, email="", phone=""):
 class FakeSource:
     families_out: list = []
     calls: list = []
+    dates: list = []
     fail = False
 
     def __init__(self, db):
         pass
 
-    def families(self, booking_event_ids, gallery_ids):
+    def families(self, booking_event_ids, gallery_ids, booking_dates=()):
         FakeSource.calls.append((booking_event_ids, gallery_ids))
+        FakeSource.dates.append(list(booking_dates))
         if FakeSource.fail:
             raise SytistDbError("Couldn't connect to Sytist: timed out")
         return list(FakeSource.families_out)
@@ -43,6 +45,7 @@ class FakeSource:
 def fake_source(monkeypatch):
     FakeSource.families_out = []
     FakeSource.calls = []
+    FakeSource.dates = []
     FakeSource.fail = False
     monkeypatch.setattr(sytist_sync, "source_factory", FakeSource)
     yield FakeSource
@@ -72,7 +75,8 @@ def test_sync_fills_roster_contact_without_duplicates(ctx, fake_source):
     ]
     r = client.put(f"/api/sytist/jobs/{jid}/sources",
                    json={"booking_event_ids": [7], "gallery_ids": [6666]})
-    assert r.json()["sources"] == {"booking_event_ids": [7], "gallery_ids": [6666]}
+    assert r.json()["sources"] == {"booking_event_ids": [7], "booking_dates": [],
+                                   "gallery_ids": [6666], "auto_add": False}
     out = client.post(f"/api/sytist/jobs/{jid}/sync").json()
     assert fake_source.calls == [([7], [6666])]
     assert out["added"] == 4 and out["matched_players"] == 2
@@ -234,3 +238,44 @@ def test_settings_keep_password(ctx):
     db.close()
     assert cfg["host"] == "db2.example" and cfg["password"] == "pw1"
     assert "password" not in client.get("/api/sytist/settings").json()
+
+
+def test_booking_calendar_job_builds_roster_and_takes_team_from_folder(ctx, fake_source):
+    client, SL, tmp_path = ctx
+    db = SL()
+    job, root = _job(db, tmp_path)          # no roster uploaded
+    jid = job.id
+    db.close()
+    fake_source.families_out = [
+        _fam("booking", "1", "Ava Smith", "Jane Smith", "jane@example.com", "555-1"),
+        _fam("booking", "2", "Ben Jones", "Tom Jones", "tom@example.com"),
+        _fam("booking", "3", "", "No Kid", "nokid@example.com"),
+    ]
+    client.put(f"/api/sytist/jobs/{jid}/sources",
+               json={"booking_dates": ["2026-10-11"], "auto_add": True})
+    out = client.post(f"/api/sytist/jobs/{jid}/sync").json()
+    assert fake_source.dates == [["2026-10-11"]]
+    assert out["roster_added"] == 2
+    assert [u["parent"] for u in out["unmatched"]] == ["No Kid"]
+    roster = client.get(f"/api/players/roster/{jid}").json()["items"]
+    assert {(i["name"], i["team"]) for i in roster} == {("Ava Smith", ""), ("Ben Jones", "")}
+    assert all(i["passcode"] for i in roster)            # passcodes on for this job
+    assert {i["parent_email"] for i in roster} == {"jane@example.com", "tom@example.com"}
+    # Re-sync adds nobody twice.
+    assert client.post(f"/api/sytist/jobs/{jid}/sync").json()["roster_added"] == 0
+
+    # Ava's photos sorted into "Saturday AM": her row lists that folder's
+    # team photos; Ben has no photos and gets no team photos.
+    db = SL()
+    sess, folder = _session(db, db.get(type(job), jid), root, "Saturday AM")
+    _image(db, sess, folder, "IMG_0001.jpg", [(_cluster(db, sess, "Ava Smith"), "individual")])
+    db.close()
+    info = _export(client, jid)["sytist_csv"]
+    rows = _read_csv(info["path"])
+    by_file = {r["FILENAME"]: r for r in rows}
+    assert by_file["IMG_0001.jpg"]["GROUPS"] == "Saturday_AM.jpg; Saturday_AM-PANO.jpg"
+    assert by_file["IMG_0001.jpg"]["EMAIL"] == "jane@example.com"
+    ben = [r for r in rows if r["SUBJECT_FIRST_NAME"] == "Ben"][0]
+    assert ben["FILENAME"] == "" and ben["GROUPS"] == ""
+    assert "_sytist" not in "".join(r["FILENAME"] for r in rows)
+    assert not any(r["FILENAME"] in (".jpg", "-PANO.jpg") for r in rows)

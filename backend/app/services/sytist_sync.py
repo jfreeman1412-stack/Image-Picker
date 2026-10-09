@@ -18,8 +18,10 @@ from datetime import datetime
 from sqlalchemy.orm import Session as DbSession
 
 from app.models.db_models import Job, PlayerMembership, SytistFamily
+from app.services.players import upsert_player
 from app.services.roster import normalize_name
 from app.services.sytist_db import SytistSource
+from app.services.sytist_passcodes import ensure_job_passcodes
 
 CONTACT_FIELDS = (
     "subject_first_name", "subject_last_name",
@@ -44,21 +46,28 @@ def get_sources(job: Job) -> dict:
             raw = {}
     return {
         "booking_event_ids": [int(x) for x in raw.get("booking_event_ids") or []],
+        "booking_dates": [str(x) for x in raw.get("booking_dates") or []],
         "gallery_ids": [int(x) for x in raw.get("gallery_ids") or []],
+        # The roster IS the sign-ups (a booking-calendar job): sign-ups not
+        # on the roster are added to it, with no team, on every sync.
+        "auto_add": bool(raw.get("auto_add")),
     }
 
 
-def set_sources(job: Job, booking_event_ids, gallery_ids) -> dict:
+def set_sources(job: Job, booking_event_ids, gallery_ids, booking_dates=(),
+                auto_add: bool = False) -> dict:
     job.sytist_sync_sources = json.dumps({
         "booking_event_ids": sorted({int(x) for x in booking_event_ids or []}),
+        "booking_dates": sorted({str(x) for x in booking_dates or []}),
         "gallery_ids": sorted({int(x) for x in gallery_ids or []}),
+        "auto_add": bool(auto_add),
     })
     return get_sources(job)
 
 
 def has_sources(job: Job) -> bool:
     s = get_sources(job)
-    return bool(s["booking_event_ids"] or s["gallery_ids"])
+    return bool(s["booking_event_ids"] or s["booking_dates"] or s["gallery_ids"])
 
 
 def _clean(v) -> str | None:
@@ -162,13 +171,44 @@ def family_dict(f: SytistFamily, also: int = 0) -> dict:
     }
 
 
+def add_unmatched_to_roster(db: DbSession, job_id: int) -> int:
+    """Booking-calendar jobs: put every named sign-up that isn't on the
+    roster yet onto it with no team (the forms don't ask for one; export
+    takes the team from the folder the kid's photos are sorted into).
+    Idempotent. Caller commits. Returns how many players were added."""
+    on_roster = {
+        m.player.norm_name
+        for m in db.query(PlayerMembership).filter_by(job_id=job_id).all()
+    }
+    families = db.query(SytistFamily).filter_by(job_id=job_id).all()
+    families.sort(key=lambda f: (SOURCE_ORDER.get(f.source, 9), f.id))
+    added = 0
+    for f in families:
+        if not f.norm_name or f.norm_name in on_roster:
+            continue
+        name = " ".join(x for x in (f.subject_first_name, f.subject_last_name) if x)
+        player, _ = upsert_player(db, name)
+        if player is None:
+            continue
+        db.add(PlayerMembership(player_id=player.id, job_id=job_id,
+                                team_name="", norm_team="", is_coach=0))
+        on_roster.add(f.norm_name)
+        added += 1
+    db.flush()
+    return added
+
+
 def sync_job(db: DbSession, job_id: int) -> dict:
     """Pull this job's families from Sytist and apply them. Caller commits.
     Raises SytistDbError when Sytist can't be reached."""
     job = db.query(Job).get(job_id)
     sources = get_sources(job)
     fetched = get_source(db).families(
-        sources["booking_event_ids"], sources["gallery_ids"])
+        sources["booking_event_ids"], sources["gallery_ids"], sources["booking_dates"])
     stored = store_families(db, job_id, fetched)
+    roster_added = add_unmatched_to_roster(db, job_id) if sources["auto_add"] else 0
     applied = apply_families(db, job_id)
-    return {**stored, **applied, "synced_at": datetime.utcnow().isoformat()}
+    if roster_added and job.sytist_passcodes:
+        ensure_job_passcodes(db, job_id)
+    return {**stored, **applied, "roster_added": roster_added,
+            "synced_at": datetime.utcnow().isoformat()}
