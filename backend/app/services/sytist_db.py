@@ -144,6 +144,31 @@ def _event_title(row: dict) -> str:
     return page or session or f"Event {row['id']}"
 
 
+# Booking forms usually ask for the kid's name as a custom question
+# ("Gymnast's Name:", "Skaters Name:", "Player Name", "Athlete Name"...)
+# instead of filling book_subject_first/last_name. book_options holds the
+# answers, one per line as "Question|Answer|price".
+_NOT_THE_KID = ("parent", "guardian", "coach", "team", "sponsor", "studio",
+                "association", "contact", "mother", "father")
+
+
+def subject_from_options(options) -> tuple[str | None, str | None]:
+    """The kid's (first, last) name from a booking's custom form answers,
+    or (None, None) when no name question was answered."""
+    for line in str(options or "").splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        question, answer = parts[0].strip().lower(), parts[1].strip()
+        if not answer or "name" not in question:
+            continue
+        if any(word in question for word in _NOT_THE_KID):
+            continue
+        first, _, last = " ".join(answer.split()).partition(" ")
+        return first, (last or None)
+    return None, None
+
+
 class SytistSource:
     """The queries Player Sort runs. Tests swap in a fake with the same
     methods (see sytist_sync.get_source)."""
@@ -236,14 +261,18 @@ class SytistSource:
             if where:
                 for r in _query(conn, f"""
                     SELECT book_id, book_subject_first_name, book_subject_last_name,
-                           book_first_name, book_last_name, book_email, book_phone
+                           book_first_name, book_last_name, book_email, book_phone,
+                           book_options
                     FROM ms_bookings
                     WHERE {" OR ".join(where)}
                 """, tuple(params)):
+                    first, last = r["book_subject_first_name"], r["book_subject_last_name"]
+                    if not (first or "").strip() and not (last or "").strip():
+                        first, last = subject_from_options(r.get("book_options"))
                     out.append({
                         "source": "booking", "source_id": str(r["book_id"]),
-                        "subject_first_name": r["book_subject_first_name"],
-                        "subject_last_name": r["book_subject_last_name"],
+                        "subject_first_name": first,
+                        "subject_last_name": last,
                         "parent_first_name": r["book_first_name"],
                         "parent_last_name": r["book_last_name"],
                         "parent_email": r["book_email"],
