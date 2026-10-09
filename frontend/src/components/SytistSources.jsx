@@ -106,6 +106,7 @@ export function SytistSourcePicker({ value, onChange, showGalleries = true }) {
   const [galleries, setGalleries] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
 
   const loadLists = () => {
     setLoading(true);
@@ -133,8 +134,8 @@ export function SytistSourcePicker({ value, onChange, showGalleries = true }) {
   };
 
   if (configured === null) return <p className="muted">Connecting to Sytist…</p>;
-  if (!configured) {
-    return <ConnectionForm onSaved={() => { setConfigured(true); loadLists(); }} />;
+  if (!configured || showLogin) {
+    return <ConnectionForm onSaved={() => { setConfigured(true); setShowLogin(false); loadLists(); }} />;
   }
 
   const galleryRows = [
@@ -184,7 +185,12 @@ export function SytistSourcePicker({ value, onChange, showGalleries = true }) {
           </div>
         </div>
       )}
-      {error && <p className="error" style={{ gridColumn: '1 / -1' }}>{error}</p>}
+      {error && (
+        <p className="error" style={{ gridColumn: '1 / -1' }}>
+          {error}{' '}
+          <button className="ghost" onClick={() => setShowLogin(true)}>Sytist login…</button>
+        </p>
+      )}
     </div>
   );
 }
