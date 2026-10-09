@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import FolderBrowser from './FolderBrowser.jsx';
+import {
+  SytistSourcePicker, emptySources, hasAnySource, startSytistRoster,
+} from './SytistSources.jsx';
 
 /**
  * Phase C.2 — create an image-less "shoot" job.
@@ -18,6 +21,9 @@ export default function NewShootModal({ onClose }) {
   const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // 2026-10-09: optionally pull the roster from the Sytist booking calendar.
+  const [fromSytist, setFromSytist] = useState(false);
+  const [sytistSources, setSytistSources] = useState(emptySources());
   const nameRef = useRef(null);
 
   useEffect(() => {
@@ -29,6 +35,7 @@ export default function NewShootModal({ onClose }) {
 
   const create = async () => {
     if (!name.trim()) { setError('Give the shoot a name.'); return; }
+    if (fromSytist && !hasAnySource(sytistSources)) { setError('Pick a booking day.'); return; }
     setBusy(true);
     setError(null);
     try {
@@ -39,6 +46,14 @@ export default function NewShootModal({ onClose }) {
       });
       if (!res.ok) throw new Error(`Couldn't create the shoot (HTTP ${res.status}).`);
       const { job_id } = await res.json();
+      if (fromSytist) {
+        try {
+          await startSytistRoster(job_id, sytistSources);
+        } catch (e) {
+          // The shoot exists; the pull can be retried from Sytist families.
+          alert(`The shoot was created, but the booking calendar pull failed: ${e.message}`);
+        }
+      }
       nav(`/job/${job_id}`);
     } catch (e) {
       setError(e.message || String(e));
@@ -51,7 +66,7 @@ export default function NewShootModal({ onClose }) {
       <div
         className="modal-panel"
         onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: 520, width: 'min(520px, 92vw)' }}
+        style={{ maxWidth: fromSytist ? 720 : 520, width: `min(${fromSytist ? 720 : 520}px, 92vw)` }}
       >
         <header className="row-between" style={{ marginBottom: 12 }}>
           <h2 style={{ margin: 0 }}>New shoot</h2>
@@ -88,11 +103,21 @@ export default function NewShootModal({ onClose }) {
           </label>
         </div>
 
+        <label style={{ display: 'block', marginTop: 12 }}>
+          <input type="checkbox" checked={fromSytist} onChange={(e) => setFromSytist(e.target.checked)} />
+          {' '}Pull the roster from the Sytist booking calendar (turns passcodes on)
+        </label>
+        {fromSytist && (
+          <div style={{ marginTop: 8 }}>
+            <SytistSourcePicker value={sytistSources} onChange={setSytistSources} showGalleries={false} />
+          </div>
+        )}
+
         {error && <p className="error" style={{ marginTop: 8 }}>{error}</p>}
 
         <div className="actions" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
           <button onClick={onClose}>Cancel</button>
-          <button className="primary" disabled={!name.trim() || busy} onClick={create}>
+          <button className="primary" disabled={!name.trim() || busy || (fromSytist && !hasAnySource(sytistSources))} onClick={create}>
             {busy ? 'Creating…' : 'Create shoot'}
           </button>
         </div>

@@ -709,6 +709,8 @@ def list_jobs(
             "any_unprocessed": any_unprocessed,
             "archived": bool(j.archived),
             "archived_at": j.archived_at.isoformat() if j.archived_at else None,
+            # 2026-10-09: linked to Sytist sign-ups (tablets show "Get new sign-ups").
+            "sytist_sync": has_sources(j),
         })
     return out
 
@@ -1827,6 +1829,7 @@ def _run_export(
                         sytist.add_file(
                             wdst.name,
                             [resolver.resolve(c, c.session) for c in claimed],
+                            team=session.roster_team_alias or session.name,
                         )
                 # Build secondary plans. Rename mode resolves via
                 # rename_secondary (per-source subdir choice); legacy mode

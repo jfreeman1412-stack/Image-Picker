@@ -194,7 +194,7 @@ export async function putShoots(shoots) {
   const tx = d.transaction('shoots', 'readwrite');
   await tx.store.clear();
   const cachedAt = Date.now();
-  for (const s of shoots) await tx.store.put({ id: s.id, name: s.name, cachedAt });
+  for (const s of shoots) await tx.store.put({ id: s.id, name: s.name, sytist_sync: !!s.sytist_sync, cachedAt });
   await tx.done;
 }
 

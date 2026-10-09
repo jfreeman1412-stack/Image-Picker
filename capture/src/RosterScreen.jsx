@@ -29,9 +29,11 @@ export default function RosterScreen({
   teamFilter, search, needsPhotoOnly,
   onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer, onAddWalkup,
   onSyncNow, onOpenAttention, onReload, onBack,
+  showSignups, signupState, onGetSignups,
 }) {
   const teams = useMemo(
-    () => Array.from(new Set(items.map((m) => m.team))).sort((a, b) => a.localeCompare(b)),
+    // Booking-calendar sign-ups have no team (blank) — not a filter option.
+    () => Array.from(new Set(items.map((m) => m.team).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
     [items],
   );
 
@@ -110,6 +112,18 @@ export default function RosterScreen({
             Synced {lastSummary.synced} photo{lastSummary.synced === 1 ? '' : 's'} ✓
           </p>
         ) : null}
+
+        {showSignups && (
+          <div className="sync-bar">
+            <span className={signupState?.error ? 'sync-line error' : 'sync-line'}>
+              {signupState?.busy ? 'Checking Sytist…'
+                : signupState?.error || signupState?.msg || 'Booking calendar sign-ups'}
+            </span>
+            <button className="link-sync" disabled={!!signupState?.busy} onClick={onGetSignups}>
+              Get new sign-ups
+            </button>
+          </div>
+        )}
 
         {attentionCount > 0 && (
           <button className="attention-line" onClick={onOpenAttention}>

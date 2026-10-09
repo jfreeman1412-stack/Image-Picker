@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import FolderBrowser from '../components/FolderBrowser.jsx';
+import {
+  SytistSourcePicker, emptySources, hasAnySource, startSytistRoster,
+} from '../components/SytistSources.jsx';
 import { pickRepresentativeTeam } from '../utils/pickRepresentativeTeam.js';
 
 // 2026-06-28 wizard-mixed-structure fix.
@@ -138,7 +141,9 @@ export default function JobWizard() {
 
   const [step, setStep] = useState(importMode ? 'folder' : 'name');
   const [name, setName] = useState('');
-  const [useRoster, setUseRoster] = useState(null);          // true | false | null
+  const [useRoster, setUseRoster] = useState(null);          // true | false | 'sytist' | null
+  // 2026-10-09: roster pulled from the Sytist booking calendar instead.
+  const [sytistSources, setSytistSources] = useState(emptySources());
   const [rosterFile, setRosterFile] = useState(null);        // File obj
   const [rootPath, setRootPath] = useState('');
   const [rootPeek, setRootPeek] = useState(null);
@@ -392,9 +397,20 @@ export default function JobWizard() {
       setIngest({ status: 'pending', progress: 0, total: data.ingest_total || 0 });
       setCreatingJobId(data.job_id);
 
+      // Booking-calendar roster: passcodes on, sign-ups pulled in now.
+      if (useRoster === 'sytist') {
+        try {
+          await startSytistRoster(data.job_id, sytistSources);
+        } catch (e) {
+          setRosterUploadWarning(
+            `Couldn't pull the booking calendar (${e.message}). Open Sytist families on the job page to retry.`,
+          );
+        }
+      }
+
       // Upload roster in the background. Don't block ingest polling; the
       // CSV upload is fast and the job page works either way.
-      if (rosterFile) {
+      if (rosterFile && useRoster === true) {
         const fd = new FormData();
         fd.append('file', rosterFile);
         try {
@@ -465,7 +481,7 @@ export default function JobWizard() {
       {/* Step 2: Roster Y/N + upload */}
       {step === 'roster' && (
         <section className="card">
-          <h2>Roster CSV</h2>
+          <h2>Roster</h2>
           <p className="muted">
             Optional. Two positional columns, no header: <code>player-name,team</code>.
             If you have one, the app will use it to flag wrong-team photos after the
@@ -477,6 +493,12 @@ export default function JobWizard() {
               onClick={() => setUseRoster(true)}
             >
               Yes — I have a roster CSV
+            </button>
+            <button
+              className={useRoster === 'sytist' ? 'primary' : ''}
+              onClick={() => { setUseRoster('sytist'); setRosterFile(null); }}
+            >
+              Pull from Sytist booking calendar
             </button>
             <button
               className={useRoster === false ? 'primary' : ''}
@@ -500,10 +522,22 @@ export default function JobWizard() {
               )}
             </div>
           )}
+          {useRoster === 'sytist' && (
+            <div style={{ marginTop: 12 }}>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Pick the photo day. Each sign-up's player name, parent name, email
+                and phone come in, and passcodes are turned on for this job. Sign-ups
+                have no team; each kid's team comes from the folder their photos
+                are sorted into.
+              </p>
+              <SytistSourcePicker value={sytistSources} onChange={setSytistSources} />
+            </div>
+          )}
           <div className="actions" style={{ marginTop: 14 }}>
             <button className="ghost" onClick={() => setStep('name')}>← Back</button>
             <button
-              disabled={useRoster === null || (useRoster === true && !rosterFile)}
+              disabled={useRoster === null || (useRoster === true && !rosterFile)
+                || (useRoster === 'sytist' && !hasAnySource(sytistSources))}
               onClick={goFolder}
             >
               Next →
@@ -804,7 +838,9 @@ export default function JobWizard() {
               <ul>
                 {!importMode && <li>Job: <b>{name}</b></li>}
                 {!importMode && (
-                  <li>Roster: {useRoster ? <b>{rosterFile?.name || 'will upload'}</b> : <span className="muted">(none)</span>}</li>
+                  <li>Roster: {useRoster === 'sytist'
+                    ? <b>Sytist booking calendar (passcodes on)</b>
+                    : useRoster ? <b>{rosterFile?.name || 'will upload'}</b> : <span className="muted">(none)</span>}</li>
                 )}
                 <li>Folder: <code>{rootPath}</code></li>
                 <li>Structure: {hasLines === true ? 'lines → teams' : hasLines === 'single' ? 'single team' : 'teams'}</li>
