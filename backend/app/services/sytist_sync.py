@@ -91,6 +91,7 @@ def store_families(db: DbSession, job_id: int, families: list[dict]) -> dict:
             continue
         seen.add(key)
         values = {f: _clean(fam.get(f)) for f in CONTACT_FIELDS}
+        values["booked_at"] = _clean(fam.get("booked_at"))
         norm = normalize_name(
             f"{values['subject_first_name'] or ''}{values['subject_last_name'] or ''}")
         row = existing.get(key)
@@ -159,6 +160,17 @@ def apply_families(db: DbSession, job_id: int) -> dict:
         "memberships_filled": filled,
         "unmatched": unmatched,
     }
+
+
+def booked_at_by_name(db: DbSession, job_id: int) -> dict[str, str]:
+    """Each synced kid's earliest booking slot, by normalized name."""
+    out: dict[str, str] = {}
+    rows = (db.query(SytistFamily.norm_name, SytistFamily.booked_at)
+            .filter(SytistFamily.job_id == job_id, SytistFamily.booked_at.isnot(None)).all())
+    for norm, when in rows:
+        if norm and (norm not in out or when < out[norm]):
+            out[norm] = when
+    return out
 
 
 def family_dict(f: SytistFamily, also: int = 0) -> dict:

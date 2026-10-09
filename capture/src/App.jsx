@@ -108,6 +108,7 @@ export default function App() {
   const [teamFilter, setTeamFilter] = useState('');
   const [search, setSearch] = useState('');
   const [needsPhotoOnly, setNeedsPhotoOnly] = useState(false);
+  const [sortMode, setSortMode] = useState('');   // '' = the shoot's default
 
   const refreshQueue = useCallback(async () => {
     const jobId = selectedJob?.id;
@@ -360,6 +361,7 @@ export default function App() {
     setTeamFilter('');           // fresh filters for the next shoot
     setSearch('');
     setNeedsPhotoOnly(false);
+    setSortMode('');
     setView('shoots');
   };
 
@@ -487,6 +489,8 @@ export default function App() {
         onTeamFilter={setTeamFilter}
         onSearch={setSearch}
         onNeedsPhotoOnly={setNeedsPhotoOnly}
+        sortMode={sortMode}
+        onSortMode={setSortMode}
         onPickPlayer={pickPlayer}
         onAddWalkup={addWalkup}
         onSyncNow={syncNow}

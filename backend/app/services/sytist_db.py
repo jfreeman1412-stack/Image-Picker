@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session as DbSession
 
@@ -144,6 +145,69 @@ def _event_title(row: dict) -> str:
     return page or session or f"Event {row['id']}"
 
 
+# Booking forms usually ask for the kid's name as a custom question
+# ("Gymnast's Name:", "Skaters Name:", "Player Name", "Athlete Name"...)
+# instead of filling book_subject_first/last_name. book_options holds the
+# answers, one per line as "Question|Answer|price".
+_NOT_THE_KID = ("parent", "guardian", "coach", "team", "sponsor", "studio",
+                "association", "contact", "mother", "father")
+
+
+def subject_from_options(options) -> tuple[str | None, str | None]:
+    """The kid's (first, last) name from a booking's custom form answers,
+    or (None, None) when no name question was answered."""
+    for line in str(options or "").splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        question, answer = parts[0].strip().lower(), parts[1].strip()
+        if not answer or "name" not in question:
+            continue
+        if any(word in question for word in _NOT_THE_KID):
+            continue
+        first, _, last = " ".join(answer.split()).partition(" ")
+        return first, (last or None)
+    return None, None
+
+
+# Which ms_bookings column holds the slot's time of day isn't pinned down
+# across Sytist versions, so the booking query reads every column and the
+# first of these that's present is used.
+_TIME_COLUMNS = ("book_time", "book_start_time", "book_start", "book_time_start")
+_TIME_FORMATS = ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p", "%I:%M:%S %p")
+
+
+def _clock(value) -> str | None:
+    """A time-of-day value as "HH:MM", or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, timedelta):            # pymysql returns TIME as timedelta
+        minutes = int(value.total_seconds()) // 60
+        return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
+    if isinstance(value, (time, datetime)):
+        return value.strftime("%H:%M")
+    if isinstance(value, (int, float)) and 0 <= value < 24 * 60:
+        return f"{int(value) // 60:02d}:{int(value) % 60:02d}"  # minutes after midnight
+    text = str(value).strip().upper()
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+def booked_at(row: dict) -> str | None:
+    """When the booking's slot is, as "YYYY-MM-DD HH:MM" (or just the date
+    when no time is stored), so it sorts as text. None without a date."""
+    day = row.get("book_date")
+    if not day:
+        return None
+    day = day.strftime("%Y-%m-%d") if isinstance(day, (date, datetime)) else str(day)[:10]
+    clock = next((c for c in (_clock(row.get(k)) for k in _TIME_COLUMNS) if c), None)
+    return f"{day} {clock}" if clock else day
+
+
 class SytistSource:
     """The queries Player Sort runs. Tests swap in a fake with the same
     methods (see sytist_sync.get_source)."""
@@ -235,19 +299,22 @@ class SytistSource:
         with connect(self.db) as conn:
             if where:
                 for r in _query(conn, f"""
-                    SELECT book_id, book_subject_first_name, book_subject_last_name,
-                           book_first_name, book_last_name, book_email, book_phone
+                    SELECT *
                     FROM ms_bookings
                     WHERE {" OR ".join(where)}
                 """, tuple(params)):
+                    first, last = r["book_subject_first_name"], r["book_subject_last_name"]
+                    if not (first or "").strip() and not (last or "").strip():
+                        first, last = subject_from_options(r.get("book_options"))
                     out.append({
                         "source": "booking", "source_id": str(r["book_id"]),
-                        "subject_first_name": r["book_subject_first_name"],
-                        "subject_last_name": r["book_subject_last_name"],
+                        "subject_first_name": first,
+                        "subject_last_name": last,
                         "parent_first_name": r["book_first_name"],
                         "parent_last_name": r["book_last_name"],
                         "parent_email": r["book_email"],
                         "parent_phone": r["book_phone"],
+                        "booked_at": booked_at(r),
                     })
             if gallery_ids:
                 for r in _query(conn, f"""

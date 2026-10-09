@@ -26,8 +26,8 @@ export default function RosterScreen({
   job, items, referencedPlayerIds, pendingPlayerIds, failedPlayerIds, pendingCount,
   attentionCount, fromCache, cachedAt, storageWarning,
   syncing, syncProgress, lastSummary, status, error,
-  teamFilter, search, needsPhotoOnly,
-  onTeamFilter, onSearch, onNeedsPhotoOnly, onPickPlayer, onAddWalkup,
+  teamFilter, search, needsPhotoOnly, sortMode,
+  onTeamFilter, onSearch, onNeedsPhotoOnly, onSortMode, onPickPlayer, onAddWalkup,
   onSyncNow, onOpenAttention, onReload, onBack,
   showSignups, signupState, onGetSignups,
 }) {
@@ -37,9 +37,14 @@ export default function RosterScreen({
     [items],
   );
 
+  // 2026-10-09: booking-calendar shoots sort by booking slot by default;
+  // any shoot can switch to A–Z.
+  const hasBookings = useMemo(() => items.some((m) => m.booked_at), [items]);
+  const sortBy = sortMode || (hasBookings ? 'booking' : 'roster');
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return items.filter((m) => {
+    const out = items.filter((m) => {
       if (teamFilter && m.team !== teamFilter) return false;
       if (q && !m.name.toLowerCase().includes(q)) return false;
       // "Needs photo" = no synced AND no pending capture (failed still needs one).
@@ -49,7 +54,15 @@ export default function RosterScreen({
       }
       return true;
     });
-  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds, pendingPlayerIds]);
+    const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    if (sortBy === 'name') return out.sort(byName);
+    if (sortBy === 'booking') {
+      // No booking time (walk-ups, roster players) goes last.
+      return out.sort((a, b) => (a.booked_at || '\uffff').localeCompare(b.booked_at || '\uffff')
+        || byName(a, b));
+    }
+    return out;
+  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds, pendingPlayerIds, sortBy]);
 
   const ready = status === 'ready';
   const hasRoster = ready && items.length > 0;
@@ -155,6 +168,17 @@ export default function RosterScreen({
                   placeholder="Search name…"
                   aria-label="Search by name"
                 />
+                <select
+                  className="filter-select"
+                  value={sortBy}
+                  onChange={(e) => onSortMode(e.target.value)}
+                  aria-label="Sort players"
+                >
+                  {hasBookings
+                    ? <option value="booking">Booking time</option>
+                    : <option value="roster">Roster order</option>}
+                  <option value="name">A–Z</option>
+                </select>
                 <button
                   type="button"
                   className={needsPhotoOnly ? 'pill active' : 'pill'}
@@ -226,8 +250,9 @@ export default function RosterScreen({
 
         {ready && items.length === 0 && (
           <p className="muted roster-pad">
-            No roster loaded for this shoot. Upload one for this job (see README),
-            then retry.
+            {showSignups
+              ? 'No sign-ups on the roster yet. Tap “Get new sign-ups” to pull them from the booking calendar.'
+              : 'No roster loaded for this shoot. Upload one for this job (see README), then retry.'}
           </p>
         )}
 
@@ -250,6 +275,9 @@ export default function RosterScreen({
                     </div>
                     <div className="roster-row-meta">
                       <span className="roster-team">{m.team}</span>
+                      {sortBy === 'booking' && m.booked_at && (
+                        <span className="roster-team">{formatSlot(m.booked_at)}</span>
+                      )}
                       {/* Independent badges: a synced player with a queued retake
                           shows ✓ AND ↑ (pending/failed are mutually exclusive per
                           item, so at most one of those two ever shows). */}
@@ -272,4 +300,15 @@ export default function RosterScreen({
       </div>
     </main>
   );
+}
+
+
+// "2026-10-10 13:30" -> "Sat 1:30 PM"; a date alone -> "Sat Oct 10".
+function formatSlot(slot) {
+  const [day, clock] = slot.split(' ');
+  const d = new Date(`${day}T${clock || '00:00'}`);
+  if (Number.isNaN(d.getTime())) return slot;
+  const weekday = d.toLocaleDateString(undefined, { weekday: 'short' });
+  if (!clock) return `${weekday} ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
+  return `${weekday} ${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
 }

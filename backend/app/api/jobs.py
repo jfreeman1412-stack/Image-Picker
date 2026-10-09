@@ -681,9 +681,11 @@ def list_jobs(
         # job whose only sessions are archived still counts as "already
         # past the capture window" — identical to the pre-fix
         # `len(j.sessions) == 0` behavior.
+        # 2026-10-09: a shoot linked to the Sytist booking calendar shows
+        # even with an empty roster, so the tablets can "Get new sign-ups".
         jobs = [
             j for j in jobs
-            if j.id in rostered and not sessions_by_job.get(j.id)
+            if (j.id in rostered or has_sources(j)) and not sessions_by_job.get(j.id)
         ]
 
     out = []
