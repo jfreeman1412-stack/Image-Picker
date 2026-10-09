@@ -22,11 +22,10 @@ export default function ExportModal({ job, onClose }) {
   // To_be_Cropped/ into a sibling Buddies/ tree that mirrors the same
   // team subfolder structure. Team/pano roles stay put.
   const [splitBuddies, setSplitBuddies] = useState(false);
-  // 2026-10-07: per-JOB Sytist passcodes option (saved on the job, not per
-  // export). ON → export also writes the Sytist import CSV. uploadExt is the
-  // extension the photos will have when uploaded (cropping may make PNGs).
-  const [sytistPasscodes, setSytistPasscodes] = useState(!!job.sytist_passcodes);
-  const [sytistSaving, setSytistSaving] = useState(false);
+  // 2026-10-07: per-JOB Sytist passcodes option, switched on in the Player
+  // roster screen. ON → export also writes the Sytist import CSV. uploadExt
+  // is the extension the photos will have when uploaded (cropping may make PNGs).
+  const sytistPasscodes = !!job.sytist_passcodes;
   // Most shoots' cropped photos are uploaded as PNGs (same name).
   const [uploadExt, setUploadExt] = useState('.png');
   // 2026-10-08: rebuild the Sytist CSV from the final (cropped) folder.
@@ -131,26 +130,6 @@ export default function ExportModal({ job, onClose }) {
     </div>
   );
 
-  const toggleSytist = async (enabled) => {
-    setSytistSaving(true);
-    setError(null);
-    try {
-      const res = await fetch(`/api/jobs/${job.id}/sytist-passcodes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      });
-      if (!res.ok) throw new Error(`Couldn't save the passcode setting (HTTP ${res.status}).`);
-      const body = await res.json();
-      setSytistPasscodes(body.sytist_passcodes);
-      job.sytist_passcodes = body.sytist_passcodes;  // keep the cached job in sync for the next open
-    } catch (e) {
-      setError(e.message || String(e));
-    } finally {
-      setSytistSaving(false);
-    }
-  };
-
   const submit = async () => {
     setError(null);
     // Only send destination_path when the user actually customized it.
@@ -244,16 +223,19 @@ export default function ExportModal({ job, onClose }) {
               </label>
             </div>
             <div className="form-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-              <label>
-                <input type="checkbox" checked={sytistPasscodes} disabled={sytistSaving}
-                       onChange={e => toggleSytist(e.target.checked)} />
-                Sytist passcodes for this job (saved with the job). Each roster
-                player gets a passcode, and the export also writes{' '}
-                <code>sytist_passcode_import.csv</code> to import into a Preset
-                Passcode Photos gallery after uploading the photos.
-              </label>
+              {sytistPasscodes ? (
+                <span>
+                  <b>Sytist passcodes are on for this job.</b> The export also writes{' '}
+                  <code>sytist_passcode_import.csv</code> to import into a Preset
+                  Passcode Photos gallery after uploading the photos.
+                </span>
+              ) : (
+                <span className="muted" style={{ fontSize: 13 }}>
+                  Sytist passcodes are off for this job. Turn them on in Player roster.
+                </span>
+              )}
               {sytistPasscodes && (
-                <label style={{ marginTop: 6, marginLeft: 24 }}>
+                <label style={{ marginTop: 6 }}>
                   Photos will be uploaded to Sytist as{' '}
                   <select value={uploadExt} onChange={e => setUploadExt(e.target.value)}>
                     <option value="">the same file type as exported</option>
