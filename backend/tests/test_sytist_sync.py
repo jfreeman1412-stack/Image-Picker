@@ -5,7 +5,7 @@ import pytest
 from app.models.db_models import PlayerMembership, SytistFamily
 from app.services import sytist_sync
 from app.services.sytist_db import SytistDbError, load_config, save_config
-from app.services.sytist_passcodes import CSV_FILENAME, ensure_job_passcodes
+from app.services.sytist_passcodes import csv_filename, ensure_job_passcodes
 
 from tests.test_sytist_passcodes import (  # noqa: F401  (ctx is a fixture)
     _cluster, _export, _image, _job, _read_csv, _roster, _session, ctx,
@@ -208,7 +208,7 @@ def test_csv_from_final_folder(ctx):
     codes = {m.player.display_name: m.passcode
              for m in db.query(PlayerMembership).filter_by(job_id=jid)}
     db.close()
-    by_file = {row["FILENAME"]: row for row in _read_csv(final / CSV_FILENAME)}
+    by_file = {row["FILENAME"]: row for row in _read_csv(final / csv_filename("Shoot"))}
     assert by_file["IMG_0001.png"]["PASSCODE"] == codes["Ava Smith"]
     assert by_file["IMG_0003.png"]["PASSCODE"] == codes["Ben Jones"]
     assert by_file["IMG_0004.png"]["IS_GROUP"] == "1"
@@ -218,6 +218,7 @@ def test_csv_from_final_folder(ctx):
     assert info["not_in_export_examples"] == ["Stray.png"]
     assert info["exported_not_in_folder"] == 1
     assert info["team_photos_missing"] == ["tigers_10u-pano.jpg"]
+    assert info["duplicate_names"] == 0
 
 
 def test_settings_keep_password(ctx):

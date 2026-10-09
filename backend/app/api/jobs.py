@@ -1935,7 +1935,7 @@ def _run_export(
                 "failures": failures,
             }
             if sytist is not None:
-                result["sytist_csv"] = sytist.write(out_root)
+                result["sytist_csv"] = sytist.write(out_root, job.name)
                 if sytist_sync is not None:
                     result["sytist_csv"]["sync"] = sytist_sync
                 job.sytist_manifest = sytist.manifest_json()

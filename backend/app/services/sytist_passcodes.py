@@ -23,20 +23,22 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import secrets
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy.orm import Session as DbSession
 
-from app.models.db_models import Cluster, PlayerMembership, Session
+from app.models.db_models import Cluster, Job, PlayerMembership, Session
 from app.services.roster import normalize_name
 
 # Sytist-style codes: 7 characters, uppercase, no look-alikes (0/O, 1/I/L).
 PASSCODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 PASSCODE_LENGTH = 7
 
-CSV_FILENAME = "sytist_passcode_import.csv"
+CSV_SUFFIX = "_sytist_passcodes.csv"
 CSV_HEADER = [
     "FILENAME", "PASSCODE", "SUBJECT_FIRST_NAME", "SUBJECT_LAST_NAME",
     "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE", "LEADER", "GROUPS", "IS_GROUP",
@@ -78,6 +80,13 @@ def ensure_job_passcodes(db: DbSession, job_id: int) -> int:
         assigned += 1
     db.flush()
     return assigned
+
+
+def csv_filename(job_name: str) -> str:
+    """The import CSV is named after the job so several jobs' CSVs never get
+    mixed up, e.g. 'Spring Soccer' -> 'Spring_Soccer_sytist_passcodes.csv'."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", job_name or "").strip("._")
+    return f"{safe or 'job'}{CSV_SUFFIX}"
 
 
 def sytist_name(name: str) -> str:
@@ -189,8 +198,8 @@ class SytistCsvBuilder:
         CSV can be rebuilt later from the final (cropped) folder."""
         return json.dumps({"files": self._manifest})
 
-    def write(self, out_dir: Path) -> dict:
-        return self.write_to(out_dir / CSV_FILENAME)
+    def write(self, out_dir: Path, job_name: str) -> dict:
+        return self.write_to(out_dir / csv_filename(job_name))
 
     def write_to(self, path: Path) -> dict:
         memberships = (
@@ -257,8 +266,17 @@ class SytistCsvBuilder:
             writer = csv.writer(fh, lineterminator="\n")
             writer.writerow(CSV_HEADER)
             writer.writerows(rows)
+        # Sytist matches FILENAME across the whole gallery (sub-galleries
+        # included), so two uploaded files with one name would get mixed up.
+        uploaded = [n for n, _ in self._photo_rows] + self._group_files + self.unassigned
+        for team in team_names:
+            uploaded.extend(team_photo_names(team))
+        counts = Counter(n.lower() for n in uploaded)
+        duplicates = sorted({n for n in uploaded if counts[n.lower()] > 1}, key=str.lower)
         return {
             "path": str(path),
+            "duplicate_names": len({n.lower() for n in duplicates}),
+            "duplicate_examples": duplicates[:20],
             "players": len(first_membership),
             "photo_rows": len(self._photo_rows),
             "players_without_photos": no_photo_players,
@@ -323,7 +341,8 @@ def build_csv_from_folder(db: DbSession, job_id: int, folder: Path,
         members = [first_membership.get(pid) for pid in by_stem[key]]
         builder.add_file(p.name, members)
 
-    stats = builder.write_to(folder / CSV_FILENAME)
+    job = db.query(Job).get(job_id)
+    stats = builder.write_to(folder / csv_filename(job.name if job else ""))
     stats.update({
         "folder": str(folder),
         "image_files": len(files),
