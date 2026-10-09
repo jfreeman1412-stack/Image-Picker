@@ -92,7 +92,13 @@ export async function startSytistRoster(jobId, sources) {
   return api(`/api/sytist/jobs/${jobId}/sync`, { method: 'POST' });
 }
 
-const fmtRange = (a, b) => (a && b && a !== b ? `${a} – ${b}` : a || '');
+// "2026-10-18" → "Sun, Oct 18" (dates only, no time-zone shift).
+const fmtDay = (iso) => {
+  const [y, m, d] = String(iso || '').split('-').map(Number);
+  if (!y || !m || !d) return iso || '';
+  return new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+};
+const fmtRange = (a, b) => (a && b && a !== b ? `${fmtDay(a)} – ${fmtDay(b)}` : fmtDay(a));
 
 /**
  * Pick booking-calendar events / days and galleries. `value` is
@@ -138,6 +144,16 @@ export function SytistSourcePicker({ value, onChange, showGalleries = true }) {
     return <ConnectionForm onSaved={() => { setConfigured(true); setShowLogin(false); loadLists(); }} />;
   }
 
+  // A job's already-linked sessions stay visible even after they age out of
+  // the recent list (the server only lists the last few days onward).
+  const eventRows = [
+    ...value.booking_event_ids.filter(id => !events.some(e => e.kind === 'event' && e.id === id))
+      .map(id => ({ kind: 'event', id, title: `Booking session ${id}`, first_date: '', last_date: '', bookings: null })),
+    ...value.booking_dates.filter(d => !events.some(e => e.kind === 'day' && e.id === d))
+      .map(d => ({ kind: 'day', id: d, title: 'Booking calendar', first_date: d, last_date: d, bookings: null })),
+    ...events,
+  ];
+
   const galleryRows = [
     ...value.gallery_ids.filter(id => !galleries.some(g => g.id === id))
       .map(id => ({ id, title: `Gallery ${id}`, registrations: null })),
@@ -148,19 +164,29 @@ export function SytistSourcePicker({ value, onChange, showGalleries = true }) {
     <div style={{ display: 'grid', gridTemplateColumns: showGalleries ? '1fr 1fr' : '1fr', gap: 16 }}>
       <div>
         <h3 style={{ margin: '0 0 6px' }}>Booking calendar</h3>
-        <div style={{ maxHeight: 240, overflowY: 'auto' }}>
-          {events.map(ev => {
+        <p className="muted" style={{ margin: '0 0 6px', fontSize: 12 }}>
+          Upcoming and the last 3 days, soonest first.
+        </p>
+        <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+          {eventRows.map(ev => {
             const key = ev.kind === 'event' ? 'booking_event_ids' : 'booking_dates';
+            const when = fmtRange(ev.first_date, ev.last_date);
             return (
-              <label key={`${ev.kind}-${ev.id}`} style={{ display: 'block', fontSize: 13 }}>
+              <label key={`${ev.kind}-${ev.id}`}
+                     style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13,
+                              padding: '6px 2px', borderBottom: '1px solid rgba(127,127,127,0.25)' }}>
                 <input type="checkbox" checked={value[key].includes(ev.id)}
-                       onChange={() => toggle(key, ev.id)} />
-                {' '}{ev.title}{' '}
-                <span className="muted">{fmtRange(ev.first_date, ev.last_date)} · {ev.bookings} booked</span>
+                       onChange={() => toggle(key, ev.id)} style={{ marginTop: 3 }} />
+                <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                  <span>{ev.title}</span>
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    {[when, ev.bookings != null ? `${ev.bookings} booked` : null].filter(Boolean).join(' · ')}
+                  </span>
+                </span>
               </label>
             );
           })}
-          {!loading && events.length === 0 && !error && <p className="muted">No bookings found.</p>}
+          {!loading && eventRows.length === 0 && !error && <p className="muted">No upcoming or recent bookings.</p>}
           {loading && <p className="muted">Loading…</p>}
         </div>
       </div>
