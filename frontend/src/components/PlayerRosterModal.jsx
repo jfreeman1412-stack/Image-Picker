@@ -48,6 +48,31 @@ export default function PlayerRosterModal({ job, onClose }) {
   const [optionalColumns, setOptionalColumns] = useState({});
   const setOptional = (field) => (value) =>
     setOptionalColumns((prev) => ({ ...prev, [field]: value }));
+  // Per-JOB Sytist passcodes option (saved on the job right away). ON → every
+  // roster player gets a passcode and the parent columns below are offered.
+  const [sytistPasscodes, setSytistPasscodes] = useState(!!job.sytist_passcodes);
+  const [sytistSaving, setSytistSaving] = useState(false);
+  const [sytistError, setSytistError] = useState(null);
+  const toggleSytist = async (enabled) => {
+    setSytistSaving(true);
+    setSytistError(null);
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/sytist-passcodes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) throw new Error(`Couldn't save the passcode setting (HTTP ${res.status}).`);
+      const body = await res.json();
+      setSytistPasscodes(body.sytist_passcodes);
+      job.sytist_passcodes = body.sytist_passcodes;  // keep the cached job in sync
+      if (!body.sytist_passcodes) setOptionalColumns({});
+    } catch (e) {
+      setSytistError(e.message || String(e));
+    } finally {
+      setSytistSaving(false);
+    }
+  };
   // Validation (dry-run).
   const [validating, setValidating] = useState(false);
   const [report, setReport] = useState(null);          // dry-run response body
@@ -246,6 +271,19 @@ export default function PlayerRosterModal({ job, onClose }) {
           <b>team</b> next. Re-uploading replaces the roster for this shoot.
         </p>
 
+        <section style={{ marginBottom: 16 }}>
+          <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+            <input type="checkbox" checked={sytistPasscodes} disabled={sytistSaving}
+                   onChange={(e) => toggleSytist(e.target.checked)} />
+            <span>
+              <b>Sytist passcodes for this job.</b> Each player gets a passcode, you
+              can map parent name, email and phone columns below, and the export
+              writes the CSV to import into Sytist.
+            </span>
+          </label>
+          {sytistError && <p className="error" style={{ marginTop: 6 }}>{sytistError}</p>}
+        </section>
+
         {/* ── Pick a CSV ──────────────────────────────────────────────── */}
         <section style={{ marginBottom: 16 }}>
           <div className="actions" style={{ gap: 8 }}>
@@ -361,15 +399,17 @@ export default function PlayerRosterModal({ job, onClose }) {
               </p>
             )}
 
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
-              {OPTIONAL_FIELDS.map(([field, label]) => (
-                <span key={field}>
-                  {ColumnSelect({ label: `${label} (optional)`,
-                                  value: optionalColumns[field] || '',
-                                  onChange: setOptional(field) })}
-                </span>
-              ))}
-            </div>
+            {sytistPasscodes && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
+                {OPTIONAL_FIELDS.map(([field, label]) => (
+                  <span key={field}>
+                    {ColumnSelect({ label: `${label} (optional)`,
+                                    value: optionalColumns[field] || '',
+                                    onChange: setOptional(field) })}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {/* Live assembled preview */}
             {mappingComplete && (
