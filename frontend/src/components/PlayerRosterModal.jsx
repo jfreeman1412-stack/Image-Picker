@@ -51,21 +51,26 @@ export default function PlayerRosterModal({ job, onClose }) {
   // Per-JOB Sytist passcodes option (saved on the job right away). ON → every
   // roster player gets a passcode and the parent columns below are offered.
   const [sytistPasscodes, setSytistPasscodes] = useState(!!job.sytist_passcodes);
+  // Siblings sharing a parent email or phone get one family passcode (on by
+  // default; older jobs without the field count as on).
+  const [familyPasscodes, setFamilyPasscodes] = useState(job.sytist_family_passcodes !== false);
   const [sytistSaving, setSytistSaving] = useState(false);
   const [sytistError, setSytistError] = useState(null);
-  const toggleSytist = async (enabled) => {
+  const toggleSytist = async (enabled, family = familyPasscodes) => {
     setSytistSaving(true);
     setSytistError(null);
     try {
       const res = await fetch(`/api/jobs/${job.id}/sytist-passcodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
+        body: JSON.stringify({ enabled, family }),
       });
       if (!res.ok) throw new Error(`Couldn't save the passcode setting (HTTP ${res.status}).`);
       const body = await res.json();
       setSytistPasscodes(body.sytist_passcodes);
+      setFamilyPasscodes(body.sytist_family_passcodes);
       job.sytist_passcodes = body.sytist_passcodes;  // keep the cached job in sync
+      job.sytist_family_passcodes = body.sytist_family_passcodes;
       if (!body.sytist_passcodes) setOptionalColumns({});
     } catch (e) {
       setSytistError(e.message || String(e));
@@ -281,6 +286,17 @@ export default function PlayerRosterModal({ job, onClose }) {
               writes the CSV to import into Sytist.
             </span>
           </label>
+          {sytistPasscodes && (
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '8px 0 0 24px' }}>
+              <input type="checkbox" checked={familyPasscodes} disabled={sytistSaving}
+                     onChange={(e) => toggleSytist(true, e.target.checked)} />
+              <span>
+                <b>One passcode per family.</b> Siblings with the same parent email
+                or phone share one code that shows all their photos. Codes already
+                exported to Sytist never change.
+              </span>
+            </label>
+          )}
           {sytistError && <p className="error" style={{ marginTop: 6 }}>{sytistError}</p>}
         </section>
 

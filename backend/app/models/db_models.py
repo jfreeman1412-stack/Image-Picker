@@ -37,6 +37,9 @@ class Job(Base):
     # player gets a passcode and export also writes the Sytist Preset
     # Passcode Photos import CSV. 0 = today's behavior, nothing written.
     sytist_passcodes = Column(Integer, default=0)
+    # 2026-10-09: siblings sharing a parent email or phone share one passcode
+    # (one Sytist code shows the whole family). On by default.
+    sytist_family_passcodes = Column(Integer, default=1)
     # 2026-10-08: where this job's families come from in Sytist, as JSON
     # {"booking_event_ids": [...], "gallery_ids": [...]}, and the last
     # export's file -> player list (JSON) used by "build CSV from final folder".
@@ -279,6 +282,9 @@ class PlayerMembership(Base):
     parent_last_name = Column(String, nullable=True)
     parent_email = Column(String, nullable=True)
     parent_phone = Column(String, nullable=True)
+    # 1 once the code has gone to Sytist (written to an export CSV, or came
+    # in on the roster upload); a locked code is never changed.
+    passcode_locked = Column(Integer, default=0)
 
     player = relationship("Player", back_populates="memberships")
     job = relationship("Job", back_populates="player_memberships")

@@ -202,8 +202,13 @@ def test_toggle_endpoint(ctx):
     db.close()
     assert client.get(f"/api/jobs/{jid}").json()["sytist_passcodes"] is False
     r = client.post(f"/api/jobs/{jid}/sytist-passcodes", json={"enabled": True})
-    assert r.json() == {"sytist_passcodes": True, "passcodes_assigned": 1}
+    assert r.json() == {"sytist_passcodes": True, "sytist_family_passcodes": True,
+                        "passcodes_assigned": 1}
     assert client.get(f"/api/jobs/{jid}").json()["sytist_passcodes"] is True
+    r = client.post(f"/api/jobs/{jid}/sytist-passcodes",
+                    json={"enabled": True, "family": False})
+    assert r.json()["sytist_family_passcodes"] is False
+    assert client.get(f"/api/jobs/{jid}").json()["sytist_family_passcodes"] is False
 
 
 # ── export CSV ──────────────────────────────────────────────────────────────
@@ -358,3 +363,136 @@ def test_export_flags_same_file_name_on_two_teams(ctx):
     assert info["path"].endswith("Shoot_sytist_passcodes.csv")
     assert info["duplicate_names"] == 1
     assert info["duplicate_examples"] == ["IMG_0001.jpg"]
+
+
+# ── family passcodes (2026-10-09) ───────────────────────────────────────────
+
+
+def _by_name(db, job):
+    return {m.player.display_name: m
+            for m in db.query(PlayerMembership).filter_by(job_id=job.id)}
+
+
+def test_family_passcode_shared_by_email_or_phone(ctx):
+    _, SL, tmp_path = ctx
+    db = SL()
+    job, _ = _job(db, tmp_path)
+    _roster(db, job,
+            [("Ava Smith", "Tigers"), ("Max Smith", "Lions"), ("Zoe Smith", "Lions"),
+             ("Ben Jones", "Tigers"), ("Coach-Jane Smith", "Tigers")],
+            {("avasmith", "tigers"): {"parent_email": "Jane@Example.com"},
+             ("maxsmith", "lions"): {"parent_email": "jane@example.com ",
+                                     "parent_phone": "(763) 555-0101"},
+             ("zoesmith", "lions"): {"parent_phone": "1-763-555-0101"},
+             ("benjones", "tigers"): {"parent_email": "bob@example.com"},
+             ("coachjanesmith", "tigers"): {"parent_email": "jane@example.com"}})
+    ensure_job_passcodes(db, job.id); db.commit()
+    ms = _by_name(db, job)
+    family = ms["Ava Smith"].passcode
+    assert ms["Max Smith"].passcode == family      # same email, other team
+    assert ms["Zoe Smith"].passcode == family      # phone links her to Max
+    assert ms["Ben Jones"].passcode != family
+    assert ms["Coach-Jane Smith"].passcode != family  # coaches never merged
+    db.close()
+
+
+def test_family_option_off_keeps_one_code_per_kid(ctx):
+    _, SL, tmp_path = ctx
+    db = SL()
+    job, _ = _job(db, tmp_path)
+    job.sytist_family_passcodes = 0; db.commit()
+    _roster(db, job, [("Ava Smith", "Tigers"), ("Max Smith", "Lions")],
+            {("avasmith", "tigers"): {"parent_email": "jane@example.com"},
+             ("maxsmith", "lions"): {"parent_email": "jane@example.com"}})
+    ensure_job_passcodes(db, job.id); db.commit()
+    ms = _by_name(db, job)
+    assert ms["Ava Smith"].passcode != ms["Max Smith"].passcode
+    db.close()
+
+
+def test_late_contact_merges_unsent_codes_but_never_sent_ones(ctx):
+    _, SL, tmp_path = ctx
+    db = SL()
+    job, _ = _job(db, tmp_path)
+    _roster(db, job, [("Ava Smith", "Tigers"), ("Max Smith", "Lions"),
+                      ("Kim Lee", "Tigers"), ("Lou Lee", "Lions")])
+    ensure_job_passcodes(db, job.id); db.commit()
+    ms = _by_name(db, job)
+    assert ms["Ava Smith"].passcode != ms["Max Smith"].passcode
+    ava_code = ms["Ava Smith"].passcode
+    # Contact arrives later (e.g. a Sytist sync): not sent yet → merged.
+    ms["Ava Smith"].parent_email = ms["Max Smith"].parent_email = "jane@example.com"
+    db.commit()
+    assert ensure_job_passcodes(db, job.id) == 1
+    db.commit()
+    assert ms["Max Smith"].passcode == ava_code
+    # Once sent to Sytist, codes never change, even if contact now links them.
+    kim, lou = ms["Kim Lee"].passcode, ms["Lou Lee"].passcode
+    for m in ms.values():
+        m.passcode_locked = 1
+    ms["Kim Lee"].parent_phone = ms["Lou Lee"].parent_phone = "763-555-0199"
+    db.commit()
+    assert ensure_job_passcodes(db, job.id) == 0
+    assert (ms["Kim Lee"].passcode, ms["Lou Lee"].passcode) == (kim, lou)
+    db.close()
+
+
+def test_new_sibling_after_export_gets_family_code(ctx):
+    client, SL, tmp_path = ctx
+    jid, _ = _two_kid_job(SL, tmp_path)
+    _export(client, jid)
+    db = SL()
+    job = db.query(Job).get(jid)
+    ms = _by_name(db, job)
+    assert all(m.passcode_locked for m in ms.values())
+    ava_code = ms["Ava Smith"].passcode
+    replace_shoot_memberships(
+        db, jid, [("Ava Smith", "Tigers 10U"), ("Ben Jones", "Tigers 10U"),
+                  ("Sam Smith", "Lions")],
+        {("samsmith", "lions"): {"parent_email": "JANE@example.com"}})
+    db.commit()
+    ensure_job_passcodes(db, jid); db.commit()
+    ms = _by_name(db, job)
+    assert ms["Ava Smith"].passcode == ava_code    # kept across the re-upload
+    assert ms["Sam Smith"].passcode == ava_code
+    db.close()
+
+
+def test_roster_passcode_is_locked():
+    text = "Player,Team,Code\nAva Smith,Tigers,ABC1234\nBen Jones,Tigers,\n"
+    out = parse_mapped_contacts(text, {
+        "has_header": True, "name_mode": "full", "name_column": "Player",
+        "team_column": "Team", "passcode_column": "Code"})
+    assert out[("avasmith", "tigers")] == {"passcode": "ABC1234", "passcode_locked": 1}
+
+
+def test_family_csv_rows_carry_whole_family_groups(ctx):
+    client, SL, tmp_path = ctx
+    db = SL()
+    job, root = _job(db, tmp_path)
+    _roster(db, job, [("Ava Smith", "Tigers"), ("Max Smith", "Lions"),
+                      ("Ben Jones", "Lions")],
+            {("avasmith", "tigers"): {"parent_email": "jane@example.com"},
+             ("maxsmith", "lions"): {"parent_email": "jane@example.com"}})
+    s1, f1 = _session(db, job, root, "Tigers")
+    s2, f2 = _session(db, job, root, "Lions")
+    ava = _cluster(db, s1, "Ava Smith")
+    max_ = _cluster(db, s2, "Max Smith")
+    ben = _cluster(db, s2, "Ben Jones")
+    _image(db, s1, f1, "A1.jpg", [(ava, "individual")])
+    _image(db, s2, f2, "M1.jpg", [(max_, "individual")])
+    _image(db, s2, f2, "MB.jpg", [(max_, "buddy"), (ben, "buddy")])
+    jid = job.id
+    db.close()
+    rows = _read_csv(_export(client, jid)["sytist_csv"]["path"])
+    by_file = {r["FILENAME"]: r for r in rows}
+    family = by_file["A1.jpg"]["PASSCODE"]
+    assert by_file["M1.jpg"]["PASSCODE"] == family
+    expected = "Tigers.jpg; Tigers-PANO.jpg; Lions.jpg; Lions-PANO.jpg; MB.jpg"
+    assert by_file["A1.jpg"]["GROUPS"] == expected
+    assert by_file["M1.jpg"]["GROUPS"] == expected
+    assert by_file["A1.jpg"]["LEADER"] == "Tigers; Lions"
+    # Ben's own family is just Ben.
+    assert by_file["MB.jpg"]["IS_GROUP"] == "1"
+    ben_rows = [r for r in rows if r["SUBJECT_FIRST_NAME"] == "Ben"]
+    assert ben_rows and all(r["PASSCODE"] != family for r in ben_rows)

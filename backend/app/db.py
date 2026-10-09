@@ -121,6 +121,7 @@ _PHASE2_COLUMNS = {
         ("sytist_passcodes", "INTEGER DEFAULT 0"),
         ("sytist_sync_sources", "VARCHAR"),
         ("sytist_manifest", "VARCHAR"),
+        ("sytist_family_passcodes", "INTEGER DEFAULT 1"),
     ],
     # 2026-10-07 Sytist passcodes: per-shoot passcode + parent contact.
     "player_memberships": [
@@ -131,6 +132,7 @@ _PHASE2_COLUMNS = {
         ("parent_last_name", "VARCHAR"),
         ("parent_email", "VARCHAR"),
         ("parent_phone", "VARCHAR"),
+        ("passcode_locked", "INTEGER DEFAULT 0"),
     ],
     "sytist_families": [
         ("booked_at", "VARCHAR"),
@@ -153,6 +155,14 @@ def _migrate_phase2(bind) -> None:
                     f'ALTER TABLE {table} ADD COLUMN {col_name} {col_type}'
                 ))
                 logger.info("Migrated %s: added column %s", table, col_name)
+                if (table, col_name) == ("player_memberships", "passcode_locked"):
+                    # Codes from jobs already exported went to Sytist before
+                    # family passcodes existed: never regroup them.
+                    conn.execute(text(
+                        "UPDATE player_memberships SET passcode_locked = 1 "
+                        "WHERE passcode IS NOT NULL AND job_id IN "
+                        "(SELECT id FROM jobs WHERE sytist_manifest IS NOT NULL)"
+                    ))
 
 
 def init_db():

@@ -220,7 +220,9 @@ def sync_job(db: DbSession, job_id: int) -> dict:
     stored = store_families(db, job_id, fetched)
     roster_added = add_unmatched_to_roster(db, job_id) if sources["auto_add"] else 0
     applied = apply_families(db, job_id)
-    if roster_added and job.sytist_passcodes:
+    # New sign-ups need codes, and new contact can put siblings on one
+    # family code.
+    if job.sytist_passcodes:
         ensure_job_passcodes(db, job_id)
     return {**stored, **applied, "roster_added": roster_added,
             "synced_at": datetime.utcnow().isoformat()}

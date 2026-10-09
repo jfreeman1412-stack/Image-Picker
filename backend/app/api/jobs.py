@@ -788,6 +788,7 @@ def get_job(
         "archived": bool(job.archived),
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
         "sytist_passcodes": bool(job.sytist_passcodes),
+        "sytist_family_passcodes": job.sytist_family_passcodes != 0,
         "sessions": sessions_out,
     }
 
@@ -818,22 +819,29 @@ def _purge_session_rows(db: DbSession, session) -> None:
 
 class SytistPasscodesRequest(BaseModel):
     enabled: bool
+    # None leaves the family option as it is.
+    family: bool | None = None
 
 
 @router.post("/{job_id}/sytist-passcodes")
 def set_sytist_passcodes(
     job_id: int, payload: SytistPasscodesRequest, db: DbSession = Depends(get_db),
 ):
-    """Turn the per-job Sytist passcodes option on or off. Turning it on
-    gives every roster player a passcode right away; turning it off keeps
-    stored codes (so turning it back on doesn't change any family's code)."""
+    """Turn the per-job Sytist passcodes option on or off, and optionally the
+    family option (siblings share one code). Turning it on gives every roster
+    player a passcode right away; turning it off keeps stored codes (so
+    turning it back on doesn't change any family's code)."""
     job = db.query(Job).get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     job.sytist_passcodes = 1 if payload.enabled else 0
+    if payload.family is not None:
+        job.sytist_family_passcodes = 1 if payload.family else 0
+    db.flush()
     assigned = ensure_job_passcodes(db, job.id) if payload.enabled else 0
     db.commit()
     return {"sytist_passcodes": bool(job.sytist_passcodes),
+            "sytist_family_passcodes": job.sytist_family_passcodes != 0,
             "passcodes_assigned": assigned}
 
 

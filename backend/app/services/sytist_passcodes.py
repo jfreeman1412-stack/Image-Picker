@@ -53,33 +53,101 @@ def generate_passcode(taken: set[str]) -> str:
             return code
 
 
+def family_key_email(email: str | None) -> str | None:
+    e = (email or "").strip().lower()
+    return f"e:{e}" if "@" in e else None
+
+
+def family_key_phone(phone: str | None) -> str | None:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return f"p:{digits}" if len(digits) >= 7 else None
+
+
+def _family_groups(memberships: list[PlayerMembership]) -> list[list[PlayerMembership]]:
+    """Group memberships into families: the same player (on any team), or
+    kids sharing a parent email or phone. Groups keep roster order."""
+    parent: dict[int, int] = {}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    first_by_key: dict[str, int] = {}
+    for i, m in enumerate(memberships):
+        parent[i] = i
+        keys = [f"player:{m.player_id}"]
+        if not m.is_coach:
+            keys += [k for k in (family_key_email(m.parent_email),
+                                 family_key_phone(m.parent_phone)) if k]
+        for k in keys:
+            if k in first_by_key:
+                union(first_by_key[k], i)
+            else:
+                first_by_key[k] = i
+    groups: dict[int, list[PlayerMembership]] = {}
+    for i, m in enumerate(memberships):
+        groups.setdefault(find(i), []).append(m)
+    return list(groups.values())
+
+
 def ensure_job_passcodes(db: DbSession, job_id: int) -> int:
     """Give every membership of this job a passcode. A player on several
-    teams in the same shoot shares one code (one code per family per kid).
-    Existing codes never change. Returns how many memberships got a new code.
-    Caller commits."""
+    teams in the same shoot shares one code. With the job's family option on
+    (the default), siblings sharing a parent email or phone share one code
+    too. Codes already sent to Sytist (`passcode_locked`: in an exported CSV
+    or from the roster upload) never change; an unsent code can still move to
+    the family's code when contact arrives later (e.g. a Sytist sync).
+    Coaches are never merged by contact. Returns how many memberships got a
+    new or changed code. Caller commits."""
+    job = db.query(Job).get(job_id)
+    family = bool(job is None or job.sytist_family_passcodes is None
+                  or job.sytist_family_passcodes)
     memberships = (
         db.query(PlayerMembership).filter_by(job_id=job_id)
         .order_by(PlayerMembership.id.asc()).all()
     )
     taken = {m.passcode for m in memberships if m.passcode}
-    by_player: dict[int, str] = {}
-    for m in memberships:
-        if m.passcode:
-            by_player.setdefault(m.player_id, m.passcode)
+    if family:
+        groups = _family_groups(memberships)
+    else:
+        by_player: dict[int, list[PlayerMembership]] = {}
+        for m in memberships:
+            by_player.setdefault(m.player_id, []).append(m)
+        groups = list(by_player.values())
     assigned = 0
-    for m in memberships:
-        if m.passcode:
-            continue
-        code = by_player.get(m.player_id)
+    for group in groups:
+        locked = [m.passcode for m in group if m.passcode and m.passcode_locked]
+        existing = [m.passcode for m in group if m.passcode]
+        code = (locked or existing or [None])[0]
         if code is None:
             code = generate_passcode(taken)
             taken.add(code)
-            by_player[m.player_id] = code
-        m.passcode = code
-        assigned += 1
+        for m in group:
+            if m.passcode == code:
+                continue
+            if m.passcode and (m.passcode_locked or not family):
+                continue
+            m.passcode = code
+            assigned += 1
     db.flush()
     return assigned
+
+
+def lock_job_passcodes(db: DbSession, job_id: int) -> None:
+    """Mark this job's codes as sent to Sytist so they never change again."""
+    db.query(PlayerMembership).filter(
+        PlayerMembership.job_id == job_id,
+        PlayerMembership.passcode.isnot(None),
+    ).update({PlayerMembership.passcode_locked: 1}, synchronize_session=False)
 
 
 def csv_filename(job_name: str) -> str:
@@ -231,11 +299,30 @@ class SytistCsvBuilder:
                 if team not in team_names:
                     team_names.append(team)
 
-        def groups_for(player_id: int) -> str:
+        # Sytist builds one roster entry per passcode from the first row it
+        # reads, so every row of a code carries the whole family's teams and
+        # group photos (siblings sharing a family code, a kid on two teams).
+        players_by_code: dict[str, list[int]] = {}
+        for pid, m in first_membership.items():
+            if m.passcode:
+                players_by_code.setdefault(m.passcode, []).append(pid)
+
+        def family_of(m: PlayerMembership) -> list[int]:
+            return players_by_code.get(m.passcode, [m.player_id]) if m.passcode \
+                else [m.player_id]
+
+        def teams_for(m: PlayerMembership) -> list[str]:
+            teams: list[str] = []
+            for pid in family_of(m):
+                teams.extend(teams_by_player.get(pid, []))
+            return list(dict.fromkeys(teams))
+
+        def groups_for(m: PlayerMembership) -> str:
             names: list[str] = []
-            for team in teams_by_player.get(player_id, []):
+            for team in teams_for(m):
                 names.extend(team_photo_names(team))
-            names.extend(self._buddy_groups.get(player_id, []))
+            for pid in family_of(m):
+                names.extend(self._buddy_groups.get(pid, []))
             return "; ".join(dict.fromkeys(names))
 
         def person_row(filename: str, m: PlayerMembership) -> list[str]:
@@ -249,8 +336,8 @@ class SytistCsvBuilder:
                 filename, m.passcode or "", first, last,
                 m.parent_first_name or "", m.parent_last_name or "",
                 m.parent_email or "", m.parent_phone or "",
-                "; ".join(teams_by_player.get(m.player_id, [])),
-                groups_for(m.player_id), "",
+                "; ".join(teams_for(m)),
+                groups_for(m), "",
             ]
 
         rows: list[list[str]] = []
@@ -280,6 +367,7 @@ class SytistCsvBuilder:
             writer = csv.writer(fh, lineterminator="\n")
             writer.writerow(CSV_HEADER)
             writer.writerows(rows)
+        lock_job_passcodes(self.db, self.job_id)
         # Sytist matches FILENAME across the whole gallery (sub-galleries
         # included), so two uploaded files with one name would get mixed up.
         uploaded = [n for n, _ in self._photo_rows] + self._group_files + self.unassigned
