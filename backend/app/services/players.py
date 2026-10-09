@@ -54,12 +54,33 @@ def upsert_player(db: DbSession, raw_name: str) -> tuple[Player | None, bool]:
     return player, True
 
 
-def replace_shoot_memberships(db: DbSession, job_id: int, rows) -> dict:
+# Per-membership Sytist passcode + contact fields (2026-10-07). Kept across
+# roster re-uploads: the wipe-and-recreate below snapshots them first and
+# re-applies them to the same (player, team), so a passcode never changes
+# once families have it. Values from the new upload win when present.
+MEMBERSHIP_CONTACT_FIELDS = (
+    "passcode", "subject_first_name", "subject_last_name",
+    "parent_first_name", "parent_last_name", "parent_email", "parent_phone",
+)
+
+
+def replace_shoot_memberships(db: DbSession, job_id: int, rows,
+                              contacts: dict | None = None) -> dict:
     """Wipe this job's memberships, upsert Players, insert fresh memberships.
     Caller commits. Idempotent: re-running with the same rows yields the same
     membership count (not doubled) and does not duplicate Players. Does NOT
     touch other jobs' memberships or any Player's other memberships.
+
+    `contacts` (optional) maps (norm_name, norm_team) to passcode / contact
+    fields from the upload (see parse_mapped_contacts). Fields already stored
+    on this job's memberships survive the replace unless the upload supplies
+    a new value.
     """
+    previous: dict[tuple[int, str], dict] = {}
+    for m in db.query(PlayerMembership).filter_by(job_id=job_id).all():
+        kept = {f: getattr(m, f) for f in MEMBERSHIP_CONTACT_FIELDS if getattr(m, f)}
+        if kept:
+            previous[(m.player_id, m.norm_team)] = kept
     db.query(PlayerMembership).filter_by(job_id=job_id).delete(synchronize_session=False)
     players_created = players_existing = memberships_loaded = 0
     rows_skipped_blank_name = coaches = 0
@@ -86,10 +107,14 @@ def replace_shoot_memberships(db: DbSession, job_id: int, rows) -> dict:
         players_created += int(created)
         players_existing += int(not created)
         coach = is_coach_name(raw_name)
+        fields = dict(previous.get(key, {}))
+        if contacts:
+            fields.update(contacts.get((player.norm_name, norm_team), {}))
         db.add(PlayerMembership(
             player_id=player.id, job_id=job_id,
             team_name=team_name, norm_team=norm_team,
             is_coach=1 if coach else 0,
+            **fields,
         ))
         memberships_loaded += 1
         coaches += int(coach)
@@ -247,6 +272,74 @@ def parse_mapped_roster(text: str, mapping: dict):
         row_errors.append({"reason": "missing_name", "label": "missing a name",
                            "rows": missing_name})
     return canonical, row_errors
+
+
+# Optional roster columns for the Sytist passcode option (2026-10-07). Each
+# maps `<field>_column` in the mapping object to a membership field.
+OPTIONAL_CONTACT_COLUMNS = (
+    "passcode", "parent_first_name", "parent_last_name",
+    "parent_email", "parent_phone",
+)
+
+
+def parse_mapped_contacts(text: str, mapping: dict) -> dict:
+    """Read the optional passcode / parent-contact columns of a mapped roster.
+
+    Returns {(norm_name, norm_team): {field: value}} with blank cells left
+    out. In split-name mode the player's first / last name are recorded too
+    (Sytist's SUBJECT_FIRST_NAME / SUBJECT_LAST_NAME). When a player+team
+    repeats, the first non-blank value per field wins. Pure / no DB.
+    """
+    records = list(csv.reader(io.StringIO(text)))
+    if not records:
+        return {}
+    has_header = bool(mapping.get("has_header", True))
+    header, data = _resolve_header(records, has_header)
+    idx = {name: i for i, name in enumerate(header)}
+
+    def col(ref):
+        return idx.get(ref) if ref else None
+
+    def cell(cells, i):
+        return cells[i].strip() if (i is not None and i < len(cells)) else ""
+
+    name_mode = mapping.get("name_mode")
+    team_i = col(mapping.get("team_column"))
+    name_i = col(mapping.get("name_column")) if name_mode == "full" else None
+    first_i = col(mapping.get("first_name_column")) if name_mode == "split" else None
+    last_i = col(mapping.get("last_name_column")) if name_mode == "split" else None
+    field_cols = {
+        f: col(mapping.get(f"{f}_column")) for f in OPTIONAL_CONTACT_COLUMNS
+    }
+    field_cols = {f: i for f, i in field_cols.items() if i is not None}
+    if not field_cols and name_mode != "split":
+        return {}
+
+    out: dict[tuple[str, str], dict] = {}
+    for _row_no, cells in data:
+        if not any(c.strip() for c in cells):
+            continue
+        if name_mode == "full":
+            name = cell(cells, name_i)
+            values = {}
+        else:
+            first, last = cell(cells, first_i), cell(cells, last_i)
+            name = " ".join(p for p in (first, last) if p)
+            values = {k: v for k, v in (("subject_first_name", first),
+                                        ("subject_last_name", last)) if v}
+        team = cell(cells, team_i)
+        if not name or not team:
+            continue
+        for f, i in field_cols.items():
+            v = cell(cells, i)
+            if v:
+                values[f] = v
+        if not values:
+            continue
+        slot = out.setdefault((normalize_name(name), normalize_name(team)), {})
+        for f, v in values.items():
+            slot.setdefault(f, v)
+    return out
 
 
 def build_validation_report(text: str, mapping: dict, *, preview_size: int = 10) -> dict:

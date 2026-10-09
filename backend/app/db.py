@@ -117,6 +117,20 @@ _PHASE2_COLUMNS = {
         ("export_started_at", "DATETIME"),
         ("export_error", "VARCHAR"),
         ("export_result", "VARCHAR"),
+        # 2026-10-07: per-job Sytist passcodes option.
+        ("sytist_passcodes", "INTEGER DEFAULT 0"),
+        ("sytist_sync_sources", "VARCHAR"),
+        ("sytist_manifest", "VARCHAR"),
+    ],
+    # 2026-10-07 Sytist passcodes: per-shoot passcode + parent contact.
+    "player_memberships": [
+        ("passcode", "VARCHAR"),
+        ("subject_first_name", "VARCHAR"),
+        ("subject_last_name", "VARCHAR"),
+        ("parent_first_name", "VARCHAR"),
+        ("parent_last_name", "VARCHAR"),
+        ("parent_email", "VARCHAR"),
+        ("parent_phone", "VARCHAR"),
     ],
 }
 

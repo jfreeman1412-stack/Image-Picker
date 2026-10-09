@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
     browse, sessions, clusters, cluster_copy, cluster_move, images, jobs,
-    matching, players, references, roster, settings,
+    matching, players, references, roster, settings, sytist,
 )
 from app.db import init_db
 from app.services.pipeline_watchdog import start_watchdog
@@ -75,6 +75,7 @@ app.include_router(cluster_move.router, prefix="/api/clusters", tags=["cluster-m
 app.include_router(cluster_copy.router, prefix="/api/clusters", tags=["cluster-copy"])
 app.include_router(images.router, prefix="/api/images", tags=["images"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
+app.include_router(sytist.router, prefix="/api/sytist", tags=["sytist"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
 
 
