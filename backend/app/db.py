@@ -41,6 +41,10 @@ Base = declarative_base()
 # player_sort.db files keep working. If you'd rather start fresh, just delete
 # backend/data/player_sort.db.
 _PHASE2_COLUMNS = {
+    # 2026-10-09: booking slot for tablet "booking time" sort.
+    "sytist_families": [
+        ("booked_at", "VARCHAR"),
+    ],
     "faces": [
         ("age", "FLOAT"),
         ("yaw", "FLOAT"),

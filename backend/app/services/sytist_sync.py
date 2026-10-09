@@ -91,6 +91,7 @@ def store_families(db: DbSession, job_id: int, families: list[dict]) -> dict:
             continue
         seen.add(key)
         values = {f: _clean(fam.get(f)) for f in CONTACT_FIELDS}
+        values["booked_at"] = _clean(fam.get("booked_at"))
         norm = normalize_name(
             f"{values['subject_first_name'] or ''}{values['subject_last_name'] or ''}")
         row = existing.get(key)

@@ -144,6 +144,17 @@ def _event_title(row: dict) -> str:
     return page or session or f"Event {row['id']}"
 
 
+def _booked_at(day, time) -> str | None:
+    """'YYYY-MM-DD HH:MM:SS' for a booking slot, or None without a date."""
+    day = str(day or "").strip()
+    if not day or day.startswith("0000"):
+        return None
+    t = str(time or "").strip()
+    if len(t) == 7:          # timedelta str() of a 0-9 o'clock time: "9:30:00"
+        t = "0" + t
+    return f"{day} {t or '00:00:00'}"
+
+
 # Booking forms usually ask for the kid's name as a custom question
 # ("Gymnast's Name:", "Skaters Name:", "Player Name", "Athlete Name"...)
 # instead of filling book_subject_first/last_name. book_options holds the
@@ -262,7 +273,7 @@ class SytistSource:
                 for r in _query(conn, f"""
                     SELECT book_id, book_subject_first_name, book_subject_last_name,
                            book_first_name, book_last_name, book_email, book_phone,
-                           book_options
+                           book_options, book_date, book_time
                     FROM ms_bookings
                     WHERE {" OR ".join(where)}
                 """, tuple(params)):
@@ -277,6 +288,7 @@ class SytistSource:
                         "parent_last_name": r["book_last_name"],
                         "parent_email": r["book_email"],
                         "parent_phone": r["book_phone"],
+                        "booked_at": _booked_at(r.get("book_date"), r.get("book_time")),
                     })
             if gallery_ids:
                 for r in _query(conn, f"""

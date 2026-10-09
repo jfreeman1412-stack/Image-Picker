@@ -24,7 +24,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.db import get_db
-from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace
+from app.models.db_models import Job, Player, PlayerMembership, ReferenceFace, SytistFamily
 from app.services.players import (
     add_walkup_player, build_validation_report, inspect_roster_csv,
     load_shoot_roster_from_text, parse_mapped_contacts, parse_mapped_roster,
@@ -85,6 +85,14 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
         .order_by(PlayerMembership.id.asc())
         .all()
     )
+    # 2026-10-09: earliest booking slot per kid, for the tablets' "booking
+    # time" sort. Families are matched to roster players by name.
+    booked: dict[str, str] = {}
+    for norm, at in (db.query(SytistFamily.norm_name, SytistFamily.booked_at)
+                     .filter(SytistFamily.job_id == job_id,
+                             SytistFamily.booked_at.isnot(None)).all()):
+        if norm and (norm not in booked or at < booked[norm]):
+            booked[norm] = at
     return {
         "memberships_loaded": len(memberships),
         "items": [
@@ -98,6 +106,7 @@ def get_shoot_roster(job_id: int, db: DbSession = Depends(get_db)):
                 "parent_last_name": m.parent_last_name,
                 "parent_email": m.parent_email,
                 "parent_phone": m.parent_phone,
+                "booked_at": booked.get(m.player.norm_name),
             }
             for m in memberships
         ],

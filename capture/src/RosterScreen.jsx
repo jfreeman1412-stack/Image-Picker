@@ -9,7 +9,18 @@
 //
 // Presentational: membership items, the badge sets, and the filter state all live
 // in App (lifted) and arrive as props. See ../PHASE_B3_OFFLINE_CAPTURE.md.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+
+// 2026-10-09: per-device roster order. "booking" = booking-calendar slot
+// (sign-ups without one go last, A–Z); "az" = by name.
+const ROSTER_SORT_KEY = 'capture:roster-sort';
+
+function formatSlot(at) {
+  // "YYYY-MM-DD HH:MM:SS" → "Sat 9:30 AM"
+  const d = at ? new Date(at.replace(' ', 'T')) : null;
+  if (!d || Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+}
 
 function formatAgo(ts) {
   if (!ts) return '';
@@ -37,8 +48,21 @@ export default function RosterScreen({
     [items],
   );
 
+  const hasBookings = useMemo(() => items.some((m) => m.booked_at), [items]);
+  const [sortMode, setSortMode] = useState(() => {
+    try {
+      const v = localStorage.getItem(ROSTER_SORT_KEY);
+      return v === 'az' || v === 'booking' ? v : 'booking';
+    } catch { return 'booking'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(ROSTER_SORT_KEY, sortMode); } catch { /* storage blocked */ }
+  }, [sortMode]);
+  const byBooking = sortMode === 'booking' && hasBookings;
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const byName = (a, b) => a.name.localeCompare(b.name);
     return items.filter((m) => {
       if (teamFilter && m.team !== teamFilter) return false;
       if (q && !m.name.toLowerCase().includes(q)) return false;
@@ -48,8 +72,10 @@ export default function RosterScreen({
         return false;
       }
       return true;
-    });
-  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds, pendingPlayerIds]);
+    }).sort(byBooking
+      ? (a, b) => ((a.booked_at || '~').localeCompare(b.booked_at || '~')) || byName(a, b)
+      : byName);
+  }, [items, teamFilter, search, needsPhotoOnly, referencedPlayerIds, pendingPlayerIds, byBooking]);
 
   const ready = status === 'ready';
   const hasRoster = ready && items.length > 0;
@@ -155,6 +181,17 @@ export default function RosterScreen({
                   placeholder="Search name…"
                   aria-label="Search by name"
                 />
+                {hasBookings && (
+                  <select
+                    className="filter-select"
+                    value={sortMode}
+                    onChange={(e) => setSortMode(e.target.value)}
+                    aria-label="Sort players"
+                  >
+                    <option value="booking">Booking time</option>
+                    <option value="az">A–Z</option>
+                  </select>
+                )}
                 <button
                   type="button"
                   className={needsPhotoOnly ? 'pill active' : 'pill'}
@@ -226,8 +263,9 @@ export default function RosterScreen({
 
         {ready && items.length === 0 && (
           <p className="muted roster-pad">
-            No roster loaded for this shoot. Upload one for this job (see README),
-            then retry.
+            {showSignups
+              ? 'No sign-ups on the roster yet. Tap “Get new sign-ups” to pull them from the booking calendar.'
+              : 'No roster loaded for this shoot. Upload one for this job (see README), then retry.'}
           </p>
         )}
 
@@ -249,7 +287,9 @@ export default function RosterScreen({
                       {m.is_coach ? <span className="tag">Coach</span> : null}
                     </div>
                     <div className="roster-row-meta">
-                      <span className="roster-team">{m.team}</span>
+                      <span className="roster-team">
+                        {m.team || (byBooking && m.booked_at ? formatSlot(m.booked_at) : '')}
+                      </span>
                       {/* Independent badges: a synced player with a queued retake
                           shows ✓ AND ↑ (pending/failed are mutually exclusive per
                           item, so at most one of those two ever shows). */}

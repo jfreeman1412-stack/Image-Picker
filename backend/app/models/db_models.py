@@ -342,6 +342,9 @@ class SytistFamily(Base):
     parent_last_name = Column(String, nullable=True)
     parent_email = Column(String, nullable=True)
     parent_phone = Column(String, nullable=True)
+    # 2026-10-09: booking-calendar slot ("YYYY-MM-DD HH:MM:SS") so the
+    # tablets can list sign-ups in booking order. NULL for pre-registrations.
+    booked_at = Column(String, nullable=True)
     synced_at = Column(DateTime, default=datetime.utcnow)
 
 
